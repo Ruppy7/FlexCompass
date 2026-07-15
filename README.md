@@ -89,7 +89,7 @@ npm run build
 - `frontend/`: public-data explorer and synthetic analysis interface.
 - `data/seed/`: conservative source metadata, empty normalised datasets, and
   synthetic examples.
-- `docs/`: data model, matching notes, public source register, and backlog.
+- `docs/`: public data model, postcode-matching notes, and source register.
 - `scripts/`: repository privacy and generated-artifact checks.
 
 ## Licence and source attribution

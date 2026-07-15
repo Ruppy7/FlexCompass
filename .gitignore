@@ -29,6 +29,9 @@ data/cache/
 data/snapshots/
 reports/
 
+# Local project planning and working notes
+project-plan/
+
 # Build and editor files
 dist/
 build/

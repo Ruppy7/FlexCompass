@@ -37,3 +37,20 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
 - Python uses type hints, PEP 8, and pytest. TypeScript uses strict mode and
   functional React components.
 - Add tests for behavioural changes and keep public-source documentation current.
+
+## Orchestration
+
+- The primary agent acts as project manager, orchestrator, and senior architect.
+  Material implementation, research, and independent review should be delegated
+  through Orca-managed worktrees and coordinated through the Orca bus.
+- Keep one implementation owner per worktree. Use a different worker for
+  independent review when a change is material or high risk.
+- Every worker inherits this file's Git identity, public-data, read-only portal,
+  provenance, and engineering rules. Task briefs must repeat the rules that are
+  most relevant to the assignment.
+- Worker routing and evaluation records are maintained locally under
+  `project-plan/delegation/`. Append an evaluation after every reviewed worker
+  attempt, including partial or failed attempts; do not select models by
+  sentiment alone once observed evidence exists.
+- The local worker roster is operator-controlled. Do not add a model, provider,
+  or delegation channel without explicit approval.
