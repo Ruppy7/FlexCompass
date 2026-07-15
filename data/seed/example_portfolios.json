@@ -1,0 +1,101 @@
+[
+  {
+    "portfolio_id": "portfolio_ev_domestic_001",
+    "portfolio_name": "Domestic EV Charger Portfolio",
+    "assets": [
+      {
+        "asset_type": "ev_charger",
+        "asset_count": 3000,
+        "rated_power_kw": 7,
+        "controllable_power_kw": 4.5,
+        "availability_percent": 0.03,
+        "response_reliability_percent": 0.85,
+        "supported_service_types": ["demand_turn_down", "demand_turn_up"],
+        "regional_distribution": {
+          "UKPN": 0.25,
+          "SPEN": 0.15,
+          "NGED": 0.3,
+          "ENWL": 0.1,
+          "NPG": 0.1,
+          "SSEN": 0.1
+        },
+        "postcode_distribution": {},
+        "baseline_assumption": "Synthetic portfolio-level availability assumption only.",
+        "metering_assumption": "Assume half-hourly settlement-grade metering is not yet validated.",
+        "operational_notes": [
+          "User override risk exists.",
+          "Availability depends on active charging sessions during flexibility windows."
+        ]
+      }
+    ]
+  },
+  {
+    "portfolio_id": "portfolio_mixed_der_001",
+    "portfolio_name": "Mixed DER Portfolio",
+    "assets": [
+      {
+        "asset_type": "ev_charger",
+        "asset_count": 1500,
+        "rated_power_kw": 7,
+        "controllable_power_kw": 4.5,
+        "availability_percent": 0.03,
+        "response_reliability_percent": 0.85,
+        "supported_service_types": ["demand_turn_down", "demand_turn_up"],
+        "regional_distribution": {
+          "UKPN": 0.3,
+          "SPEN": 0.2,
+          "NGED": 0.2,
+          "ENWL": 0.1,
+          "NPG": 0.1,
+          "SSEN": 0.1
+        },
+        "postcode_distribution": {},
+        "baseline_assumption": "Synthetic assumption.",
+        "metering_assumption": "Not validated.",
+        "operational_notes": ["User override risk."]
+      },
+      {
+        "asset_type": "battery",
+        "asset_count": 50,
+        "rated_power_kw": 10,
+        "controllable_power_kw": 6,
+        "availability_percent": 0.5,
+        "response_reliability_percent": 0.9,
+        "supported_service_types": ["demand_turn_down", "demand_turn_up", "generation_turn_up", "generation_turn_down"],
+        "regional_distribution": {
+          "UKPN": 0.4,
+          "SPEN": 0.2,
+          "NGED": 0.2,
+          "ENWL": 0.1,
+          "NPG": 0.05,
+          "SSEN": 0.05
+        },
+        "postcode_distribution": {},
+        "baseline_assumption": "Battery availability depends on SoC and operating mode.",
+        "metering_assumption": "Requires import/export metering validation.",
+        "operational_notes": ["SoC constraints not modelled in v0."]
+      },
+      {
+        "asset_type": "generator",
+        "asset_count": 10,
+        "rated_power_kw": 100,
+        "controllable_power_kw": 60,
+        "availability_percent": 0.4,
+        "response_reliability_percent": 0.9,
+        "supported_service_types": ["generation_turn_up", "generation_turn_down"],
+        "regional_distribution": {
+          "UKPN": 0.2,
+          "SPEN": 0.3,
+          "NGED": 0.2,
+          "ENWL": 0.1,
+          "NPG": 0.1,
+          "SSEN": 0.1
+        },
+        "postcode_distribution": {},
+        "baseline_assumption": "Synthetic dispatch availability.",
+        "metering_assumption": "Generation metering and settlement not validated.",
+        "operational_notes": ["Fuel, emissions, runtime, and ramp constraints not modelled in v0."]
+      }
+    ]
+  }
+]

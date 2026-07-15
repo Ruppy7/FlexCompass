@@ -1,0 +1,78 @@
+[
+  {
+    "source_id": "catalog_nged",
+    "owner": "National Grid Electricity Distribution",
+    "source_name": "Connected Data catalogue",
+    "source_type": "api",
+    "access_method": "OpenDataSoft catalogue API",
+    "original_reference": "https://connecteddata.nationalgrid.co.uk",
+    "live_or_curated": "live",
+    "date_accessed": "2026-07-15",
+    "represented_period": "Varies by dataset",
+    "licence_notes": "Dataset-specific licence and attribution must be verified before redistribution.",
+    "update_frequency": "Varies by dataset",
+    "data_quality_notes": [
+      "Catalogue metadata is public; individual dataset schemas require contract tests."
+    ],
+    "limitations": [
+      "No dataset is treated as a current flexibility signal until its schema and provenance are verified."
+    ]
+  },
+  {
+    "source_id": "catalog_spen",
+    "owner": "SP Energy Networks",
+    "source_name": "Open Data catalogue",
+    "source_type": "api",
+    "access_method": "OpenDataSoft catalogue API",
+    "original_reference": "https://spenergynetworks.opendatasoft.com",
+    "live_or_curated": "live",
+    "date_accessed": "2026-07-15",
+    "represented_period": "Varies by dataset",
+    "licence_notes": "Dataset-specific licence and attribution must be verified before redistribution.",
+    "update_frequency": "Varies by dataset",
+    "data_quality_notes": [
+      "Catalogue metadata is public; individual dataset schemas require contract tests."
+    ],
+    "limitations": [
+      "Authentication and download conditions can differ by dataset."
+    ]
+  },
+  {
+    "source_id": "catalog_enwl",
+    "owner": "Electricity North West",
+    "source_name": "Open Data catalogue",
+    "source_type": "api",
+    "access_method": "OpenDataSoft catalogue API",
+    "original_reference": "https://electricitynorthwest.opendatasoft.com",
+    "live_or_curated": "live",
+    "date_accessed": "2026-07-15",
+    "represented_period": "Varies by dataset",
+    "licence_notes": "Dataset-specific licence and attribution must be verified before redistribution.",
+    "update_frequency": "Varies by dataset",
+    "data_quality_notes": [
+      "Catalogue metadata is public; individual dataset schemas require contract tests."
+    ],
+    "limitations": [
+      "Some downloads may require a public portal account or API key."
+    ]
+  },
+  {
+    "source_id": "catalog_ssen",
+    "owner": "Scottish and Southern Electricity Networks",
+    "source_name": "Open Data catalogue",
+    "source_type": "api",
+    "access_method": "CKAN API",
+    "original_reference": "https://data.ssen.co.uk",
+    "live_or_curated": "live",
+    "date_accessed": "2026-07-15",
+    "represented_period": "Varies by dataset",
+    "licence_notes": "Dataset-specific licence and attribution must be verified before redistribution.",
+    "update_frequency": "Varies by dataset",
+    "data_quality_notes": [
+      "Catalogue metadata is public; individual resource formats require contract tests."
+    ],
+    "limitations": [
+      "Resource schemas and update schedules vary across the catalogue."
+    ]
+  }
+]

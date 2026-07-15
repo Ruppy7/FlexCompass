@@ -1,0 +1,50 @@
+[
+  {
+    "id": "catalog_nged",
+    "name": "NGED Connected Data catalogue",
+    "portal_url": "https://connecteddata.nationalgrid.co.uk",
+    "api_url": "https://connecteddata.nationalgrid.co.uk/api/v2/catalog/datasets",
+    "record_count": null,
+    "last_modified": null,
+    "licence": "Unknown until verified per dataset",
+    "fields": [],
+    "useful_for": ["Public dataset discovery", "Schema research"],
+    "limitations": ["This entry describes a catalogue, not a normalised flexibility dataset."]
+  },
+  {
+    "id": "catalog_spen",
+    "name": "SP Energy Networks Open Data catalogue",
+    "portal_url": "https://spenergynetworks.opendatasoft.com",
+    "api_url": "https://spenergynetworks.opendatasoft.com/api/v2/catalog/datasets",
+    "record_count": null,
+    "last_modified": null,
+    "licence": "Unknown until verified per dataset",
+    "fields": [],
+    "useful_for": ["Public dataset discovery", "Schema research"],
+    "limitations": ["This entry describes a catalogue, not a normalised flexibility dataset."]
+  },
+  {
+    "id": "catalog_enwl",
+    "name": "Electricity North West Open Data catalogue",
+    "portal_url": "https://electricitynorthwest.opendatasoft.com",
+    "api_url": "https://electricitynorthwest.opendatasoft.com/api/v2/catalog/datasets",
+    "record_count": null,
+    "last_modified": null,
+    "licence": "Unknown until verified per dataset",
+    "fields": [],
+    "useful_for": ["Public dataset discovery", "Schema research"],
+    "limitations": ["Some resources may require a public portal account or API key."]
+  },
+  {
+    "id": "catalog_ssen",
+    "name": "SSEN Open Data catalogue",
+    "portal_url": "https://data.ssen.co.uk",
+    "api_url": "https://data.ssen.co.uk/api/3/action",
+    "record_count": null,
+    "last_modified": null,
+    "licence": "Unknown until verified per dataset",
+    "fields": [],
+    "useful_for": ["Public dataset discovery", "Schema research"],
+    "limitations": ["This entry describes a CKAN catalogue whose resources have varying schemas."]
+  }
+]

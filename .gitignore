@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Local configuration and credentials
+.env
+.env.local
+.env.*.local
+!.env.example
+*.pem
+id_rsa*
+
+# Generated data and reports
+*.db
+*.sqlite
+*.sqlite3
+data/cache/
+data/snapshots/
+reports/
+
+# Build and editor files
+dist/
+build/
+*.log
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
