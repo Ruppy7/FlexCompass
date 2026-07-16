@@ -19,3 +19,75 @@ Anonymous catalogue access does not prove that every dataset resource is
 anonymous or redistributable. The repository stores curated catalogue metadata
 only. Downloaded portal responses, caches, generated inventories, and databases
 are local artifacts and must not be committed.
+
+## Catalogue intelligence workflow
+
+All commands run from the `backend/` working directory using the project venv.
+
+### Sync
+
+Fetch public metadata with anonymous read-only GET requests:
+
+```bash
+python -m app.catalogue_cli sync --portal all
+python -m app.catalogue_cli sync --portal nged
+```
+
+Outputs (all git-ignored): SQLite registry at
+`data/cache/catalogue/registry.sqlite3`, JSON snapshots at
+`data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
+`data/cache/catalogue/review-queue.json`. Snapshots are atomic and immutable;
+partial failures are isolated at the portal boundary, preserving last valid
+state.
+
+### Diff
+
+Compare two local snapshots:
+
+```bash
+python -m app.catalogue_cli diff \
+  --before data/snapshots/catalogues/20260715T120000.000000Z/nged.json \
+  --after  data/snapshots/catalogues/20260716T120000.000000Z/nged.json
+```
+
+Changes: `dataset_added`, `dataset_removed`, `metadata_changed`,
+`resources_replaced`, `access_changed`.
+
+### Review queue
+
+Print unresolved evidence items:
+
+```bash
+python -m app.catalogue_cli review-queue --format json
+```
+
+## Classification dimensions
+
+Each dataset is independently classified along four axes with evidence and
+confidence (`high`, `medium`, `low`, `unknown`). Unknown values are preserved.
+
+- **Lifecycle**: `active`, `historical_archive`, `superseded`, `retired`,
+  `unknown`.
+- **Publication pattern**: `continuous`, `periodic`, `event_driven`,
+  `static_reference`, `closed_period`, `unknown`.
+- **Access status**: `public`, `registered`, `restricted`, `unreachable`,
+  `unknown`.
+- **Maintenance state**: `on_schedule`, `possibly_overdue`, `stale`,
+  `expected_dormant`, `unknown`. Stale = active + periodic + cadence observed +
+  latest data age exceeds cadence x grace multiplier. Static, archive, and
+  event-driven datasets are `expected_dormant`.
+
+## Provenance and secret redaction
+
+Every record retains `source_dataset_id`, `raw_record`, and `observed_at`.
+Content hashes (SHA-256 of redacted snapshot) support deduplication. All
+artifacts are redacted of: authentication keys (`authorization`, `token`,
+`api_key`, `secret`, `password`, `credential`, `cookie`), inline credential
+patterns, private-host URLs, and credential-bearing URLs.
+
+## Limitations
+
+Catalogue metadata is not analytical ingestion, eligibility assessment,
+bidding/dispatch/asset-control advice, forecasting, or commercial advice.
+Counts and metadata are dated observations, not stable facts. Verify
+dataset-level licences before redistribution.

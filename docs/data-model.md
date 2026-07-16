@@ -37,3 +37,47 @@ measure of forecast accuracy.
 
 SQLite is used without an ORM. Structured lists and raw records are serialized
 as JSON text. Local databases are generated artifacts and are never committed.
+
+## Catalogue observation model
+
+The catalogue layer adds observation-based records for public portal metadata:
+
+- `CatalogueDataset`: one public dataset with `source_dataset_id`, `raw_record`,
+  `observed_at`, classification evidence, lifecycle, publication pattern, and
+  access status. Resources are nested.
+- `DatasetResource`: one downloadable resource with `source_dataset_id`,
+  `raw_record`, `observed_at`, URL, format, and size.
+- `ClassificationEvidence`: one piece of evidence supporting a non-factual
+  classification (lifecycle, pattern, access, maintenance) with confidence.
+
+### Observation identity
+
+Each sync run produces a deterministic observation key derived from portal ID,
+observation timestamp, and content hash. The content hash is SHA-256 of the
+redacted snapshot core (with FlexCompass-generated clocks stripped).
+
+### Atomic local artifacts
+
+Sync writes are atomic: a temporary file is written then renamed. If the
+snapshot already exists with identical content, no write occurs. Failed syncs
+do not publish partial artifacts; the previous valid state is preserved.
+
+### Secret redaction
+
+All persisted and printed artifacts pass through `redact()`, which recursively:
+- Replaces values of keys matching sensitive patterns (`authorization`,
+  `token`, `api_key`, `secret`, `password`, `credential`, `cookie`) with
+  `[REDACTED]`
+- Replaces inline `key=value` credential patterns with `key=[REDACTED]`
+- Replaces private-host and credential-bearing URLs with `[REDACTED_URL]`
+
+### Review queue
+
+The review queue tracks datasets with unknown classifications. Each item has a
+deterministic hash ID based on portal, dataset, dimension, and reason. The
+queue is replaceable (not immutable) and preserves items for failed portals.
+
+### Dated observations
+
+Catalogue counts, titles, and metadata are point-in-time observations, not
+stable facts. The `observed_at` timestamp records when FlexCompass fetched data.
