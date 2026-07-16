@@ -95,6 +95,23 @@ def test_resources_and_datasets_retain_raw_metadata(portal_id: str, fixture_name
     assert result.datasets[0].resources == list(result.resources)
 
 
+def test_ods_resource_maps_verified_public_fields_without_inventing_absent_facts():
+    record = fixture("ods_page.json")["results"][0]
+    client = FakeClient([ods_page(record, count=1)])
+
+    result = fetch_catalogue(CATALOGUE_PORTALS["spen"], client, OBSERVED_AT)
+
+    resource = result.resources[0]
+    assert resource.id == "spen:synthetic-attachment-one"
+    assert resource.name == "Synthetic attachment"
+    assert resource.media_type == "text/csv"
+    assert resource.url == "https://example.invalid/synthetic-attachment.csv"
+    assert resource.size_bytes is None
+    assert resource.source_created_at is None
+    assert resource.source_updated_at is None
+    assert resource.raw_record["source_only"] == "preserve me"
+
+
 @pytest.mark.parametrize("platform", [PortalPlatform.ckan, PortalPlatform.opendatasoft])
 def test_absent_counts_remain_unknown_and_incomplete(platform: PortalPlatform):
     registered = CATALOGUE_PORTALS["nged" if platform is PortalPlatform.ckan else "spen"]

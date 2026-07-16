@@ -7,6 +7,10 @@
       "visibility": "domain",
       "attachments": [
         {
+          "id": "synthetic-attachment-one",
+          "title": "Synthetic attachment",
+          "mimetype": "text/csv",
+          "url": "https://example.invalid/synthetic-attachment.csv",
           "source_only": "preserve me"
         }
       ],
