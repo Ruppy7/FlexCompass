@@ -61,6 +61,10 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
   sentiment alone once observed evidence exists.
 - The local worker roster is operator-controlled. Do not add a model, provider,
   or delegation channel without explicit approval.
+- Launch Orca workers in the harness's non-interactive full-auto/YOLO mode so
+  scoped implementation and test commands do not pause for local approvals.
+  This changes execution permissions only; it never broadens the task brief,
+  Git identity, public-data, read-only portal, credential, or safety boundaries.
 
 ## Orchestrator memory and project records
 
