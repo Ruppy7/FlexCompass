@@ -68,6 +68,10 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
 
 ## Orchestrator memory and project records
 
+- At the start of every primary-agent session, read `/memory/CURRENT.md` before
+  broad discovery or task execution. It is the canonical live handoff: verify
+  its stated Git/worktree facts, then continue from its `Next action` section.
+  If it is absent or stale, reconstruct and update it before delegating work.
 - The primary orchestrator maintains local continuity records under the
   Git-ignored `/memory/` directory. Each memory is a Markdown file and may be
   amended as understanding changes; it is a pointer and context layer, not a
@@ -78,6 +82,11 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
 - At the end of every substantive turn, the primary orchestrator reviews and,
   where the state changed, updates relevant `/memory/` files, `project-plan/`
   documents, decisions, backlog items, and delegation/evaluation records.
+- Before a session switch or after every material task gate, update
+  `/memory/CURRENT.md` with the public commit, active worktree paths and heads,
+  cleanliness, completed reviews, next task and model route, required context
+  files, and any blockers. Never store credentials or runtime-scoped terminal
+  handles there.
 - `/memory/` and `project-plan/` are local-only. Never stage or commit their
   contents, and do not promote them into public documentation without an
   explicit privacy, evidence, and relevance review.
