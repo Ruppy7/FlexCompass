@@ -71,6 +71,12 @@ def test_catalogue_portal_configuration_is_immutable():
     with pytest.raises(ValidationError):
         CATALOGUE_PORTALS["nged"].max_pages = 1
 
+    with pytest.raises(TypeError):
+        CATALOGUE_PORTALS["new"] = CATALOGUE_PORTALS["nged"]
+
+    with pytest.raises(TypeError):
+        CATALOGUE_PORTALS["nged"] = CATALOGUE_PORTALS["spen"]
+
 
 def test_legacy_portal_configuration_remains_available():
     assert config.portal("nged") is config.portals["nged"]
@@ -90,6 +96,9 @@ def test_canonical_classifications_default_to_unknown():
         observed_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
     )
     evidence = ClassificationEvidence(
+        id="nged:example:lifecycle-status",
+        portal_id="nged",
+        source_dataset_id="example",
         classification="lifecycle_status",
         evidence="No current status was published by the source.",
     )
@@ -105,13 +114,18 @@ def test_catalogue_records_preserve_source_provenance_and_evidence():
     raw_record = {"id": "source-id", "source_only_field": True}
     resource = DatasetResource(
         id="nged:resource-id",
+        portal_id="nged",
         source_dataset_id="source-id",
         raw_record=raw_record,
     )
     evidence = ClassificationEvidence(
+        id="nged:source-id:access-status",
+        portal_id="nged",
+        source_dataset_id="source-id",
         classification="access_status",
         evidence="The resource URL was returned by the public API.",
         confidence=EvidenceConfidence.high,
+        raw_record=raw_record,
     )
     dataset = CatalogueDataset(
         id="nged:source-id",
@@ -124,10 +138,73 @@ def test_catalogue_records_preserve_source_provenance_and_evidence():
     )
 
     assert dataset.raw_record == raw_record
+    assert dataset.resources[0].id == "nged:resource-id"
+    assert dataset.resources[0].portal_id == "nged"
     assert dataset.resources[0].source_dataset_id == "source-id"
+    assert dataset.resources[0].raw_record == raw_record
+    assert dataset.classification_evidence[0].id == "nged:source-id:access-status"
+    assert dataset.classification_evidence[0].portal_id == "nged"
+    assert dataset.classification_evidence[0].source_dataset_id == "source-id"
+    assert dataset.classification_evidence[0].raw_record == raw_record
     assert dataset.classification_evidence == [evidence]
     assert dataset.title is None
     assert dataset.source_updated_at is None
+
+
+@pytest.mark.parametrize(
+    ("record_type", "values", "missing_field"),
+    [
+        (
+            DatasetResource,
+            {
+                "id": "nged:resource-id",
+                "portal_id": "nged",
+                "source_dataset_id": "source-id",
+            },
+            "portal_id",
+        ),
+        (
+            ClassificationEvidence,
+            {
+                "id": "nged:source-id:access-status",
+                "portal_id": "nged",
+                "source_dataset_id": "source-id",
+                "classification": "access_status",
+                "evidence": "Published by the public source.",
+            },
+            "id",
+        ),
+        (
+            ClassificationEvidence,
+            {
+                "id": "nged:source-id:access-status",
+                "portal_id": "nged",
+                "source_dataset_id": "source-id",
+                "classification": "access_status",
+                "evidence": "Published by the public source.",
+            },
+            "portal_id",
+        ),
+        (
+            ClassificationEvidence,
+            {
+                "id": "nged:source-id:access-status",
+                "portal_id": "nged",
+                "source_dataset_id": "source-id",
+                "classification": "access_status",
+                "evidence": "Published by the public source.",
+            },
+            "source_dataset_id",
+        ),
+    ],
+)
+def test_nested_catalogue_provenance_fields_are_required(
+    record_type, values, missing_field
+):
+    values.pop(missing_field)
+
+    with pytest.raises(ValidationError):
+        record_type(**values)
 
 
 def test_observation_timestamps_are_normalised_to_utc():

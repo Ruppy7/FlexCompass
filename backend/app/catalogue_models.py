@@ -91,8 +91,9 @@ class _UtcTimestampModel(BaseModel):
 class ClassificationEvidence(_UtcTimestampModel):
     """Evidence supporting one non-factual catalogue classification."""
 
-    id: str | None = None
-    source_dataset_id: str | None = None
+    id: str
+    portal_id: str
+    source_dataset_id: str
     classification: str
     evidence: str
     confidence: EvidenceConfidence = EvidenceConfidence.unknown
@@ -106,6 +107,7 @@ class DatasetResource(_UtcTimestampModel):
     """A resource belonging to one portal dataset, with raw provenance."""
 
     id: str
+    portal_id: str
     source_dataset_id: str
     name: str | None = None
     description: str | None = None
