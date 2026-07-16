@@ -17,11 +17,14 @@ from app.catalogue_models import (
 from app.catalogue_store import (
     get_catalogue_dataset,
     latest_catalogue_observation,
+    list_catalogue_assessments,
+    list_catalogue_resources,
+    list_classification_evidence,
     observation_key,
     persist_catalogue_assessment,
     persist_catalogue_result,
 )
-from app.db import get_connection, run_migrations
+from app.db import MIGRATIONS, get_connection, run_migrations
 
 OBSERVED_AT = datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc)
 
@@ -129,6 +132,62 @@ def test_registry_migration_coexists_with_legacy_tables_and_has_foreign_keys_and
     } <= indexes
 
 
+def test_migration_four_upgrades_versioned_legacy_database_without_losing_data(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:3]:
+            legacy.executescript(ddl)
+            legacy.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        legacy.execute(
+            """INSERT INTO portal_datasets (id, name, portal_url)
+               VALUES ('legacy-dataset', 'Legacy public fixture', 'https://example.invalid/legacy')"""
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    assert run_migrations(db_path) == 4
+
+    with get_connection(db_path) as conn:
+        legacy_row = conn.execute(
+            "SELECT id, name, portal_url FROM portal_datasets WHERE id = 'legacy-dataset'"
+        ).fetchone()
+        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        foreign_keys = {
+            table: conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            for table in (
+                "catalogue_datasets",
+                "catalogue_resources",
+                "classification_evidence",
+                "catalogue_assessments",
+            )
+        }
+        indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+
+    assert tuple(legacy_row) == (
+        "legacy-dataset",
+        "Legacy public fixture",
+        "https://example.invalid/legacy",
+    )
+    assert version == 4
+    assert foreign_key_errors == []
+    assert {table: len(keys) for table, keys in foreign_keys.items()} == {
+        "catalogue_datasets": 1,
+        "catalogue_resources": 2,
+        "classification_evidence": 2,
+        "catalogue_assessments": 2,
+    }
+    assert {
+        "idx_catalogue_observations_portal_observed",
+        "idx_catalogue_datasets_portal_source",
+        "idx_catalogue_resources_dataset",
+        "idx_classification_evidence_dataset",
+        "idx_catalogue_assessments_dataset",
+    } <= indexes
+
+
 def test_observation_identity_is_deterministic_and_portal_scoped():
     first = observation_key("nged", OBSERVED_AT, "abc")
 
@@ -165,6 +224,41 @@ def test_persistence_rolls_back_every_table_when_a_resource_write_fails(conn):
     assert count_rows(conn, "catalogue_datasets") == 0
     assert count_rows(conn, "catalogue_resources") == 0
     assert count_rows(conn, "classification_evidence") == 0
+
+
+def test_failed_nested_persistence_preserves_caller_transaction_and_decision(conn):
+    conn.execute(
+        """INSERT INTO portal_datasets (id, name, portal_url)
+           VALUES ('outer-commit', 'Caller-owned work', 'https://example.invalid/outer')"""
+    )
+    conn.execute(
+        """CREATE TRIGGER reject_nested_resource BEFORE INSERT ON catalogue_resources
+           BEGIN SELECT RAISE(ABORT, 'synthetic nested failure'); END"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic nested failure"):
+        persist_catalogue_result(conn, make_result(), "snapshot.json", "abc")
+
+    assert conn.in_transaction is True
+    assert conn.execute(
+        "SELECT name FROM portal_datasets WHERE id = 'outer-commit'"
+    ).fetchone()[0] == "Caller-owned work"
+    assert count_rows(conn, "catalogue_observations") == 0
+    assert count_rows(conn, "catalogue_datasets") == 0
+    conn.commit()
+    assert conn.execute(
+        "SELECT name FROM portal_datasets WHERE id = 'outer-commit'"
+    ).fetchone()[0] == "Caller-owned work"
+
+    conn.execute(
+        """INSERT INTO portal_datasets (id, name, portal_url)
+           VALUES ('outer-rollback', 'Rollback work', 'https://example.invalid/rollback')"""
+    )
+    conn.rollback()
+
+    assert conn.execute(
+        "SELECT id FROM portal_datasets WHERE id = 'outer-rollback'"
+    ).fetchone() is None
 
 
 def test_incomplete_result_is_rejected_without_explicit_partial_status(conn):
@@ -279,3 +373,97 @@ def test_catalogue_assessment_persistence_is_idempotent_and_json_preserving(conn
     assert count_rows(conn, "catalogue_assessments") == 1
     assert json.loads(row[0]) == values["rationale"]
     assert json.loads(row[1]) == values["missing_evidence"]
+
+
+def test_catalogue_assessment_rejects_observation_from_another_portal(conn):
+    nged = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged.json",
+        "nged-hash",
+    )
+    spen = persist_catalogue_result(
+        conn,
+        make_result(portal_id="spen", source_dataset_id="dataset-b"),
+        "spen.json",
+        "spen-hash",
+    )
+
+    with pytest.raises(ValueError, match="portal"):
+        persist_catalogue_assessment(
+            conn,
+            assessment_id="nged:dataset-a:maintenance",
+            portal_id="nged",
+            source_dataset_id="dataset-a",
+            observation_id=spen.observation_id,
+            assessment_type="maintenance_state",
+            assessment_value="unknown",
+            confidence="unknown",
+            rationale=["No cross-portal evidence is valid."],
+            missing_evidence=[],
+            assessed_at=OBSERVED_AT,
+        )
+
+    assert nged.observation_id != spen.observation_id
+    assert count_rows(conn, "catalogue_assessments") == 0
+
+
+def test_list_catalogue_resources_is_portal_scoped_and_decodes_raw_provenance(conn):
+    persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "nged-hash")
+    persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "spen-hash")
+
+    resources = list_catalogue_resources(conn, "nged", "shared-source-id")
+
+    assert len(resources) == 1
+    assert resources[0]["portal_id"] == "nged"
+    assert resources[0]["raw_record"] == {"resource_source_only": True}
+    assert list_catalogue_resources(conn, "nged", "missing") == []
+
+
+def test_list_classification_evidence_is_portal_scoped_and_decodes_structured_values(conn):
+    persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "nged-hash")
+    persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "spen-hash")
+
+    evidence = list_classification_evidence(conn, "nged", "shared-source-id")
+
+    assert len(evidence) == 1
+    assert evidence[0]["portal_id"] == "nged"
+    assert evidence[0]["source_value"] == {"access": "public"}
+    assert evidence[0]["raw_record"] == {"evidence_source_only": ["preserve"]}
+    assert list_classification_evidence(conn, "nged", "missing") == []
+
+
+def test_list_classification_evidence_preserves_unknown_structured_value(conn):
+    result = make_result()
+    result.datasets[0].classification_evidence[0].source_value = None
+    persist_catalogue_result(conn, result, "nged.json", "nged-hash")
+
+    evidence = list_classification_evidence(conn, "nged", "shared-source-id")
+
+    assert evidence[0]["source_value"] is None
+
+
+def test_list_catalogue_assessments_is_portal_scoped_and_decodes_reasoning(conn):
+    nged = persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "nged-hash")
+    persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "spen-hash")
+    persist_catalogue_assessment(
+        conn,
+        assessment_id="nged:shared-source-id:maintenance",
+        portal_id="nged",
+        source_dataset_id="shared-source-id",
+        observation_id=nged.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="unknown",
+        confidence="unknown",
+        rationale=["Missing evidence; no schedule was inferred."],
+        missing_evidence=["published update schedule"],
+        assessed_at=OBSERVED_AT,
+    )
+
+    assessments = list_catalogue_assessments(conn, "nged", "shared-source-id")
+
+    assert len(assessments) == 1
+    assert assessments[0]["rationale"] == ["Missing evidence; no schedule was inferred."]
+    assert assessments[0]["missing_evidence"] == ["published update schedule"]
+    assert list_catalogue_assessments(conn, "spen", "shared-source-id") == []
+    assert list_catalogue_assessments(conn, "nged", "missing") == []

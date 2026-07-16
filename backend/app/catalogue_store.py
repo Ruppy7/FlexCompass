@@ -320,6 +320,12 @@ def persist_catalogue_assessment(
     assessed_at: datetime,
 ) -> None:
     """Idempotently store one evidence-led catalogue assessment."""
+    observation = conn.execute(
+        "SELECT portal_id FROM catalogue_observations WHERE observation_id = ?",
+        (observation_id,),
+    ).fetchone()
+    if observation is not None and observation[0] != portal_id:
+        raise ValueError("assessment observation portal does not match dataset portal")
     conn.execute(
         """INSERT INTO catalogue_assessments (
                assessment_id, dataset_key, observation_id, assessment_type,
@@ -354,7 +360,8 @@ def _decoded_row(row: sqlite3.Row | tuple[Any, ...] | None, columns: list[str]) 
     record = dict(row) if isinstance(row, sqlite3.Row) else dict(zip(columns, row, strict=True))
     for key in tuple(record):
         if key.endswith("_json"):
-            record[key.removesuffix("_json")] = json.loads(record.pop(key))
+            value = record.pop(key)
+            record[key.removesuffix("_json")] = None if value is None else json.loads(value)
     return record
 
 
@@ -380,6 +387,50 @@ def list_catalogue_datasets(
             "SELECT * FROM catalogue_datasets WHERE portal_id = ? ORDER BY source_dataset_id",
             (portal_id,),
         )
+    columns = [item[0] for item in cursor.description]
+    return [_decoded_row(row, columns) for row in cursor.fetchall()]
+
+
+def list_catalogue_resources(
+    conn: sqlite3.Connection, portal_id: str, source_dataset_id: str
+) -> list[dict[str, Any]]:
+    """Return a portal dataset's resources with raw provenance decoded."""
+    cursor = conn.execute(
+        """SELECT * FROM catalogue_resources
+           WHERE portal_id = ? AND source_dataset_id = ?
+           ORDER BY resource_key""",
+        (portal_id, source_dataset_id),
+    )
+    columns = [item[0] for item in cursor.description]
+    return [_decoded_row(row, columns) for row in cursor.fetchall()]
+
+
+def list_classification_evidence(
+    conn: sqlite3.Connection, portal_id: str, source_dataset_id: str
+) -> list[dict[str, Any]]:
+    """Return stored evidence for one portal dataset with JSON decoded."""
+    cursor = conn.execute(
+        """SELECT * FROM classification_evidence
+           WHERE portal_id = ? AND source_dataset_id = ?
+           ORDER BY evidence_key""",
+        (portal_id, source_dataset_id),
+    )
+    columns = [item[0] for item in cursor.description]
+    return [_decoded_row(row, columns) for row in cursor.fetchall()]
+
+
+def list_catalogue_assessments(
+    conn: sqlite3.Connection, portal_id: str, source_dataset_id: str
+) -> list[dict[str, Any]]:
+    """Return stored assessments for one portal dataset with JSON decoded."""
+    cursor = conn.execute(
+        """SELECT assessment.* FROM catalogue_assessments AS assessment
+           JOIN catalogue_datasets AS dataset
+             ON dataset.dataset_key = assessment.dataset_key
+           WHERE dataset.portal_id = ? AND dataset.source_dataset_id = ?
+           ORDER BY assessment.assessed_at, assessment.assessment_id""",
+        (portal_id, source_dataset_id),
+    )
     columns = [item[0] for item in cursor.description]
     return [_decoded_row(row, columns) for row in cursor.fetchall()]
 
