@@ -37,13 +37,15 @@ def _dataset(**overrides: Any) -> CatalogueDataset:
     return CatalogueDataset(**values)
 
 
-def _resource(updated_at: datetime | None) -> DatasetResource:
-    return DatasetResource(
-        id="portal:dataset-1:resource-1",
-        portal_id="portal",
-        source_dataset_id="dataset-1",
-        source_updated_at=updated_at,
-    )
+def _resource(updated_at: datetime | None, **overrides: Any) -> DatasetResource:
+    values: dict[str, Any] = {
+        "id": "portal:dataset-1:resource-1",
+        "portal_id": "portal",
+        "source_dataset_id": "dataset-1",
+        "source_updated_at": updated_at,
+    }
+    values.update(overrides)
+    return DatasetResource(**values)
 
 
 def _evidence(
@@ -52,17 +54,20 @@ def _evidence(
     *,
     confidence: EvidenceConfidence = EvidenceConfidence.high,
     evidence: str | None = None,
+    **overrides: Any,
 ) -> ClassificationEvidence:
-    return ClassificationEvidence(
-        id=f"portal:dataset-1:{classification}",
-        portal_id="portal",
-        source_dataset_id="dataset-1",
-        classification=classification,
-        evidence=evidence or f"Explicit {classification} evidence",
-        confidence=confidence,
-        source_value=source_value,
-        observed_at=NOW,
-    )
+    values: dict[str, Any] = {
+        "id": f"portal:dataset-1:{classification}",
+        "portal_id": "portal",
+        "source_dataset_id": "dataset-1",
+        "classification": classification,
+        "evidence": evidence or f"Explicit {classification} evidence",
+        "confidence": confidence,
+        "source_value": source_value,
+        "observed_at": NOW,
+    }
+    values.update(overrides)
+    return ClassificationEvidence(**values)
 
 
 @pytest.fixture
@@ -202,6 +207,74 @@ def test_explicit_publisher_schedule_precedes_portal_frequency(policy) -> None:
     assert "publisher_schedule" in assessment.maintenance_evidence[0].classification
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_contradictory_equal_precedence_cadence_is_order_invariant(
+    policy, reverse: bool
+) -> None:
+    schedules = [
+        _evidence("publisher_schedule", {"frequency": "weekly"}),
+        _evidence("publisher_schedule", {"frequency": "monthly"}),
+    ]
+    if reverse:
+        schedules.reverse()
+
+    assessment = classify_dataset(
+        _dataset(),
+        [_resource(NOW - timedelta(days=2))],
+        schedules
+        + [
+            _evidence("portal_update_frequency", "weekly"),
+            _evidence("description_supported_state", "static_reference"),
+        ],
+        policy,
+        NOW,
+    )
+
+    assert assessment.publication_pattern is PublicationPattern.unknown
+    assert assessment.maintenance_state is MaintenanceState.unknown
+    assert [item.source_value for item in assessment.pattern_evidence] == [
+        {"frequency": "monthly"},
+        {"frequency": "weekly"},
+    ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_contradictory_equal_precedence_enum_is_order_invariant(
+    policy, reverse: bool
+) -> None:
+    access_evidence = [
+        _evidence("access_status", "public"),
+        _evidence("access_status", "restricted"),
+        _evidence("access", "public"),
+    ]
+    if reverse:
+        access_evidence.reverse()
+
+    assessment = classify_dataset(_dataset(), [], access_evidence, policy, NOW)
+
+    assert assessment.access_status is AccessStatus.unknown
+    assert [item.source_value for item in assessment.access_evidence] == [
+        "public",
+        "restricted",
+    ]
+
+
+def test_identical_equal_precedence_duplicates_may_agree(policy) -> None:
+    assessment = classify_dataset(
+        _dataset(),
+        [],
+        [
+            _evidence("access_status", "public", id="evidence-1"),
+            _evidence("access_status", "public", id="evidence-2"),
+        ],
+        policy,
+        NOW,
+    )
+
+    assert assessment.access_status is AccessStatus.public
+    assert len(assessment.access_evidence) == 2
+
+
 def test_verified_timestamp_series_supplies_cadence_and_data_clock(policy) -> None:
     timestamps = [
         (NOW - timedelta(days=20)).isoformat(),
@@ -237,6 +310,73 @@ def test_catalogue_metadata_modification_is_not_used_as_the_data_clock(policy) -
     )
 
     assert assessment.maintenance_state is MaintenanceState.stale
+
+
+def test_foreign_resource_cannot_make_a_stale_dataset_current(policy) -> None:
+    evidence = [_evidence("portal_update_frequency", "weekly")]
+    resources = [
+        _resource(NOW - timedelta(days=30)),
+        _resource(
+            NOW,
+            id="other-portal:dataset-1:resource-1",
+            portal_id="other-portal",
+        ),
+        _resource(
+            NOW,
+            id="portal:other-dataset:resource-1",
+            source_dataset_id="other-dataset",
+        ),
+    ]
+
+    assessment = classify_dataset(_dataset(), resources, evidence, policy, NOW)
+
+    assert assessment.maintenance_state is MaintenanceState.stale
+
+
+def test_description_supported_pattern_below_minimum_remains_unknown(policy) -> None:
+    policy = policy.model_copy(
+        update={
+            "minimum_evidence_requirements": {
+                **policy.minimum_evidence_requirements,
+                "description_supported_state": 2,
+            }
+        }
+    )
+    evidence = [
+        _evidence("description_supported_state", "static_reference", id="local"),
+        _evidence(
+            "description_supported_state",
+            "static_reference",
+            id="foreign",
+            source_dataset_id="other-dataset",
+        ),
+        _evidence("description_supported_state", "not_a_pattern", id="invalid"),
+    ]
+
+    assessment = classify_dataset(_dataset(), [], evidence, policy, NOW)
+
+    assert assessment.publication_pattern is PublicationPattern.unknown
+    assert assessment.maintenance_state is MaintenanceState.unknown
+
+
+def test_description_supported_pattern_at_minimum_is_expected_dormant(policy) -> None:
+    policy = policy.model_copy(
+        update={
+            "minimum_evidence_requirements": {
+                **policy.minimum_evidence_requirements,
+                "description_supported_state": 2,
+            }
+        }
+    )
+    evidence = [
+        _evidence("description_supported_state", "static_reference", id="evidence-1"),
+        _evidence("description_supported_state", "static_reference", id="evidence-2"),
+    ]
+
+    assessment = classify_dataset(_dataset(), [], evidence, policy, NOW)
+
+    assert assessment.publication_pattern is PublicationPattern.static_reference
+    assert assessment.maintenance_state is MaintenanceState.expected_dormant
 
 
 def test_title_wording_alone_does_not_classify_dataset(policy) -> None:

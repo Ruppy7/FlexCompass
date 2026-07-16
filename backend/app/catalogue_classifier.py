@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import median
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -134,7 +134,7 @@ def classify_dataset(
         LifecycleStatus.unknown,
     )
     cadence = _select_cadence(relevant, policy)
-    pattern = _classify_pattern(relevant, cadence)
+    pattern = _classify_pattern(relevant, cadence, policy)
     access = _classify_enum(
         relevant,
         ("access_status", "access"),
@@ -142,7 +142,7 @@ def classify_dataset(
         AccessStatus.unknown,
     )
     maintenance = _classify_maintenance(
-        resources, cadence, lifecycle, pattern, policy, now
+        dataset, resources, cadence, lifecycle, pattern, policy, now
     )
 
     return DatasetAssessment(
@@ -166,28 +166,61 @@ def _classify_enum(
     classifications: tuple[str, ...],
     enum_type: type,
     unknown: Any,
+    minimum_evidence: int = 1,
 ) -> _Dimension:
-    for item in evidence:
-        if item.classification not in classifications:
+    for classification in classifications:
+        accepted: list[tuple[Any, ClassificationEvidence]] = []
+        for item in evidence:
+            if item.classification != classification:
+                continue
+            try:
+                value = enum_type(item.source_value)
+            except (TypeError, ValueError):
+                continue
+            accepted.append((value, item))
+        if not accepted:
             continue
-        try:
-            value = enum_type(item.source_value)
-        except (TypeError, ValueError):
-            continue
-        return _Dimension(value, (item,), item.confidence)
+
+        supporting_evidence = _ordered_evidence(item for _, item in accepted)
+        values = {value for value, _ in accepted}
+        if len(values) != 1 or len(supporting_evidence) < minimum_evidence:
+            return _Dimension(unknown, supporting_evidence)
+        return _Dimension(
+            accepted[0][0],
+            supporting_evidence,
+            _lowest_confidence(supporting_evidence),
+        )
     return _Dimension(unknown)
 
 
 def _classify_pattern(
-    evidence: Sequence[ClassificationEvidence], cadence: _Cadence
+    evidence: Sequence[ClassificationEvidence],
+    cadence: _Cadence,
+    policy: MaintenancePolicy,
 ) -> _Dimension:
     if cadence.pattern is not PublicationPattern.unknown:
         return _Dimension(cadence.pattern, cadence.evidence, cadence.confidence)
-    return _classify_enum(
+    if cadence.evidence:
+        return _Dimension(PublicationPattern.unknown, cadence.evidence)
+
+    explicit = _classify_enum(
         evidence,
-        ("publication_pattern", "pattern", "description_supported_state"),
+        ("publication_pattern", "pattern"),
         PublicationPattern,
         PublicationPattern.unknown,
+    )
+    if explicit.evidence:
+        return explicit
+
+    minimum = policy.minimum_evidence_requirements.get(
+        "description_supported_state", 1
+    )
+    return _classify_enum(
+        evidence,
+        ("description_supported_state",),
+        PublicationPattern,
+        PublicationPattern.unknown,
+        minimum,
     )
 
 
@@ -195,19 +228,36 @@ def _select_cadence(
     evidence: Sequence[ClassificationEvidence], policy: MaintenancePolicy
 ) -> _Cadence:
     for classification in ("publisher_schedule", "portal_update_frequency"):
+        candidates: list[_Cadence] = []
         for item in evidence:
             if item.classification != classification:
                 continue
             frequency = _frequency_value(item.source_value)
             if frequency in {"event_driven", "event-driven"}:
-                return _Cadence(
-                    None, PublicationPattern.event_driven, (item,), item.confidence
+                candidates.append(
+                    _Cadence(
+                        None,
+                        PublicationPattern.event_driven,
+                        (item,),
+                        item.confidence,
+                    )
                 )
+                continue
             days = _cadence_days(item.source_value, frequency, policy)
             if days is not None:
-                return _Cadence(days, PublicationPattern.periodic, (item,), item.confidence)
+                candidates.append(
+                    _Cadence(
+                        days,
+                        PublicationPattern.periodic,
+                        (item,),
+                        item.confidence,
+                    )
+                )
+        if candidates:
+            return _resolve_cadence(candidates)
 
     minimum = policy.minimum_evidence_requirements.get("verified_timestamp_series", 3)
+    candidates = []
     for item in evidence:
         if item.classification not in {
             "verified_timestamp_series",
@@ -223,15 +273,71 @@ def _select_cadence(
             if later > earlier
         ]
         if intervals:
-            return _Cadence(
-                median(intervals),
-                PublicationPattern.periodic,
-                (item,),
-                item.confidence,
-                timestamps[-1],
+            candidates.append(
+                _Cadence(
+                    median(intervals),
+                    PublicationPattern.periodic,
+                    (item,),
+                    item.confidence,
+                    timestamps[-1],
+                )
             )
+    if candidates:
+        return _resolve_cadence(candidates)
     return _Cadence(
         None, PublicationPattern.unknown, (), EvidenceConfidence.unknown
+    )
+
+
+def _resolve_cadence(candidates: Sequence[_Cadence]) -> _Cadence:
+    evidence = _ordered_evidence(
+        item for candidate in candidates for item in candidate.evidence
+    )
+    values = {
+        (candidate.days, candidate.pattern, candidate.latest_data_at)
+        for candidate in candidates
+    }
+    if len(values) != 1:
+        return _Cadence(
+            None,
+            PublicationPattern.unknown,
+            evidence,
+            EvidenceConfidence.unknown,
+        )
+    selected = candidates[0]
+    return _Cadence(
+        selected.days,
+        selected.pattern,
+        evidence,
+        _lowest_confidence(evidence),
+        selected.latest_data_at,
+    )
+
+
+def _lowest_confidence(
+    evidence: Sequence[ClassificationEvidence],
+) -> EvidenceConfidence:
+    ranks = {
+        EvidenceConfidence.unknown: 0,
+        EvidenceConfidence.low: 1,
+        EvidenceConfidence.medium: 2,
+        EvidenceConfidence.high: 3,
+    }
+    return min((item.confidence for item in evidence), key=ranks.__getitem__)
+
+
+def _ordered_evidence(
+    evidence: Iterable[ClassificationEvidence],
+) -> tuple[ClassificationEvidence, ...]:
+    return tuple(
+        sorted(
+            evidence,
+            key=lambda item: (
+                item.classification,
+                item.id,
+                json.dumps(item.source_value, sort_keys=True, default=repr),
+            ),
+        )
     )
 
 
@@ -278,6 +384,7 @@ def _timestamp_values(value: Any) -> list[datetime]:
 
 
 def _classify_maintenance(
+    dataset: CatalogueDataset,
     resources: Sequence[DatasetResource],
     cadence: _Cadence,
     lifecycle: _Dimension,
@@ -308,7 +415,9 @@ def _classify_maintenance(
     if cadence.days is None:
         return _Dimension(MaintenanceState.unknown)
 
-    latest_data_at = cadence.latest_data_at or _latest_resource_timestamp(resources)
+    latest_data_at = cadence.latest_data_at or _latest_resource_timestamp(
+        dataset, resources
+    )
     if latest_data_at is None:
         return _Dimension(MaintenanceState.unknown)
     age_days = max(0.0, (now - latest_data_at).total_seconds() / 86400)
@@ -324,11 +433,14 @@ def _classify_maintenance(
 
 
 def _latest_resource_timestamp(
+    dataset: CatalogueDataset,
     resources: Sequence[DatasetResource],
 ) -> datetime | None:
     timestamps = [
         resource.source_updated_at
         for resource in resources
-        if resource.source_updated_at is not None
+        if resource.portal_id == dataset.portal_id
+        and resource.source_dataset_id == dataset.source_dataset_id
+        and resource.source_updated_at is not None
     ]
     return max(timestamps, default=None)
