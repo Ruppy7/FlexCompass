@@ -305,6 +305,123 @@ CREATE INDEX IF NOT EXISTS idx_drift_snapshots_portal
 CREATE INDEX IF NOT EXISTS idx_drift_alerts_unack
     ON drift_alerts(acknowledged, detected_at);
 """),
+    # -- Migration 4: Public catalogue registry --
+    (4, """
+CREATE TABLE IF NOT EXISTS catalogue_observations (
+    observation_id     TEXT PRIMARY KEY,
+    portal_id          TEXT NOT NULL,
+    observed_at        TEXT NOT NULL,
+    content_hash       TEXT NOT NULL,
+    snapshot_path      TEXT NOT NULL,
+    status             TEXT NOT NULL CHECK (status IN ('complete', 'partial', 'failed')),
+    expected_count     INTEGER,
+    dataset_count      INTEGER NOT NULL,
+    resource_count     INTEGER NOT NULL,
+    warnings_json      TEXT NOT NULL DEFAULT '[]',
+    raw_pages_json     TEXT NOT NULL DEFAULT '[]',
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (portal_id, observed_at, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS catalogue_datasets (
+    dataset_key         TEXT PRIMARY KEY,
+    portal_id           TEXT NOT NULL,
+    source_dataset_id   TEXT NOT NULL,
+    source_record_id    TEXT NOT NULL,
+    title               TEXT,
+    description         TEXT,
+    publisher           TEXT,
+    licence             TEXT,
+    portal_url          TEXT,
+    api_url             TEXT,
+    source_created_at   TEXT,
+    source_updated_at   TEXT,
+    lifecycle_status    TEXT NOT NULL DEFAULT 'unknown',
+    publication_pattern TEXT NOT NULL DEFAULT 'unknown',
+    access_status       TEXT NOT NULL DEFAULT 'unknown',
+    tags_json           TEXT NOT NULL DEFAULT '[]',
+    raw_record_json     TEXT NOT NULL DEFAULT '{}',
+    first_seen_at       TEXT NOT NULL,
+    last_seen_at        TEXT NOT NULL,
+    last_observation_id TEXT NOT NULL,
+    UNIQUE (portal_id, source_dataset_id),
+    FOREIGN KEY (last_observation_id)
+        REFERENCES catalogue_observations(observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS catalogue_resources (
+    resource_key        TEXT PRIMARY KEY,
+    dataset_key         TEXT NOT NULL,
+    portal_id           TEXT NOT NULL,
+    source_dataset_id   TEXT NOT NULL,
+    source_resource_id  TEXT NOT NULL,
+    name                 TEXT,
+    description          TEXT,
+    url                  TEXT,
+    format               TEXT,
+    media_type           TEXT,
+    size_bytes           INTEGER,
+    source_created_at    TEXT,
+    source_updated_at    TEXT,
+    raw_record_json      TEXT NOT NULL DEFAULT '{}',
+    first_seen_at        TEXT NOT NULL,
+    last_seen_at         TEXT NOT NULL,
+    last_observation_id  TEXT NOT NULL,
+    UNIQUE (portal_id, source_dataset_id, source_resource_id),
+    FOREIGN KEY (dataset_key) REFERENCES catalogue_datasets(dataset_key),
+    FOREIGN KEY (last_observation_id)
+        REFERENCES catalogue_observations(observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS classification_evidence (
+    evidence_key        TEXT PRIMARY KEY,
+    dataset_key         TEXT NOT NULL,
+    portal_id           TEXT NOT NULL,
+    source_dataset_id   TEXT NOT NULL,
+    source_evidence_id  TEXT NOT NULL,
+    classification      TEXT NOT NULL,
+    evidence             TEXT NOT NULL,
+    confidence           TEXT NOT NULL DEFAULT 'unknown',
+    source_value_json    TEXT,
+    source_url           TEXT,
+    observed_at          TEXT,
+    raw_record_json      TEXT NOT NULL DEFAULT '{}',
+    last_observation_id  TEXT NOT NULL,
+    UNIQUE (portal_id, source_dataset_id, source_evidence_id),
+    FOREIGN KEY (dataset_key) REFERENCES catalogue_datasets(dataset_key),
+    FOREIGN KEY (last_observation_id)
+        REFERENCES catalogue_observations(observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS catalogue_assessments (
+    assessment_id       TEXT PRIMARY KEY,
+    dataset_key         TEXT NOT NULL,
+    observation_id      TEXT NOT NULL,
+    assessment_type     TEXT NOT NULL,
+    assessment_value    TEXT NOT NULL,
+    confidence          TEXT NOT NULL DEFAULT 'unknown',
+    rationale_json      TEXT NOT NULL DEFAULT '[]',
+    missing_evidence_json TEXT NOT NULL DEFAULT '[]',
+    assessed_at         TEXT NOT NULL,
+    UNIQUE (dataset_key, observation_id, assessment_type),
+    FOREIGN KEY (dataset_key) REFERENCES catalogue_datasets(dataset_key),
+    FOREIGN KEY (observation_id)
+        REFERENCES catalogue_observations(observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalogue_observations_portal_observed
+    ON catalogue_observations(portal_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_catalogue_datasets_portal_source
+    ON catalogue_datasets(portal_id, source_dataset_id);
+CREATE INDEX IF NOT EXISTS idx_catalogue_datasets_last_seen
+    ON catalogue_datasets(portal_id, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_catalogue_resources_dataset
+    ON catalogue_resources(dataset_key);
+CREATE INDEX IF NOT EXISTS idx_classification_evidence_dataset
+    ON classification_evidence(dataset_key, classification);
+CREATE INDEX IF NOT EXISTS idx_catalogue_assessments_dataset
+    ON catalogue_assessments(dataset_key, assessed_at DESC);
+"""),
 ]
 
 
