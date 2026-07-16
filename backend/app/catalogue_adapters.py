@@ -16,7 +16,7 @@ from app.catalogue_models import (
     PortalPlatform,
 )
 
-PAGE_SIZE = 1
+PAGE_SIZE = 100
 
 
 @dataclass(frozen=True)

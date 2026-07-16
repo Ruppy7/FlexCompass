@@ -55,15 +55,16 @@ def ods_page(*records: dict[str, Any], count: int | None = 2) -> dict[str, Any]:
 
 
 def test_ckan_follows_result_count_until_complete():
-    records = fixture("ckan_page.json")["result"]["results"]
-    client = FakeClient([ckan_page(records[0]), ckan_page(records[1])])
+    records = [{"name": f"dataset-{index}"} for index in range(101)]
+    client = FakeClient([ckan_page(*records[:100], count=101), ckan_page(records[100], count=101)])
 
     result = fetch_catalogue(CATALOGUE_PORTALS["nged"], client, OBSERVED_AT)
 
     assert result.complete is True
-    assert result.expected_count == 2
-    assert [item.source_dataset_id for item in result.datasets] == ["one", "two"]
-    assert [request[2]["start"] for request in client.requests] == [0, 1]
+    assert result.expected_count == 101
+    assert len(result.datasets) == 101
+    assert result.datasets[-1].source_dataset_id == "dataset-100"
+    assert [request[2]["start"] for request in client.requests] == [0, 100]
     assert all(request[0] == "GET" for request in client.requests)
 
 
@@ -75,7 +76,7 @@ def test_ods_marks_short_pagination_as_incomplete():
 
     assert result.complete is False
     assert "pagination" in " ".join(result.warnings).casefold()
-    assert [request[2]["offset"] for request in client.requests] == [0, 1]
+    assert [request[2]["offset"] for request in client.requests] == [0, 100]
     assert all(request[0] == "GET" for request in client.requests)
 
 
