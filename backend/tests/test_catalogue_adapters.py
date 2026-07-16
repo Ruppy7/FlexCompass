@@ -112,6 +112,37 @@ def test_ods_resource_maps_verified_public_fields_without_inventing_absent_facts
     assert resource.raw_record["source_only"] == "preserve me"
 
 
+def test_ckan_timezone_less_dataset_and_resource_timestamps_remain_unknown():
+    record = fixture("ckan_page.json")["result"]["results"][0]
+    record["resources"][0]["last_modified"] = "2026-01-03T12:00:00.000000"
+    client = FakeClient([ckan_page(record, count=1)])
+
+    result = fetch_catalogue(CATALOGUE_PORTALS["nged"], client, OBSERVED_AT)
+
+    dataset = result.datasets[0]
+    resource = result.resources[0]
+    assert dataset.source_created_at is None
+    assert dataset.source_updated_at is None
+    assert resource.source_created_at is None
+    assert resource.source_updated_at is None
+    assert dataset.raw_record["metadata_created"] == "2026-01-01T10:00:00.000000"
+    assert dataset.raw_record["metadata_modified"] == "2026-01-02T11:00:00.000000"
+    assert resource.raw_record["created"] == "2026-01-01T10:00:00.000000"
+    assert resource.raw_record["last_modified"] == "2026-01-03T12:00:00.000000"
+
+
+def test_ckan_offset_aware_timestamps_are_normalised_to_utc():
+    record = fixture("ckan_page.json")["result"]["results"][0]
+    record["metadata_modified"] = "2026-01-02T11:00:00+05:30"
+    record["resources"][0]["last_modified"] = "2026-01-03T12:00:00-04:00"
+    client = FakeClient([ckan_page(record, count=1)])
+
+    result = fetch_catalogue(CATALOGUE_PORTALS["nged"], client, OBSERVED_AT)
+
+    assert result.datasets[0].source_updated_at == datetime(2026, 1, 2, 5, 30, tzinfo=timezone.utc)
+    assert result.resources[0].source_updated_at == datetime(2026, 1, 3, 16, 0, tzinfo=timezone.utc)
+
+
 @pytest.mark.parametrize("platform", [PortalPlatform.ckan, PortalPlatform.opendatasoft])
 def test_absent_counts_remain_unknown_and_incomplete(platform: PortalPlatform):
     registered = CATALOGUE_PORTALS["nged" if platform is PortalPlatform.ckan else "spen"]
