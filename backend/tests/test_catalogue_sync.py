@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import app.catalogue_sync as catalogue_sync
 import pytest
 from app.catalogue_adapters import CatalogueFetchResult
 from app.catalogue_models import (
@@ -222,6 +224,30 @@ def test_content_hash_ignores_observation_clock_for_identical_source_content(tmp
     assert first.portals["nged"].content_hash == second.portals["nged"].content_hash
 
 
+def test_content_hash_preserves_source_observation_clocks_in_raw_provenance(tmp_path: Path):
+    first = run_sync(
+        tmp_path,
+        {"nged": make_result("nged", raw_record={"name": "public-dataset", "observed_at": "source-one"})},
+    )
+    later = NOW + timedelta(minutes=5)
+    changed_source = make_result(
+        "nged",
+        raw_record={"name": "public-dataset", "observed_at": "source-two"},
+    )
+    second = sync_catalogues(
+        ["nged"],
+        lambda portal: FakeClient("nged", {"nged": changed_source}),
+        tmp_path / "catalogue.sqlite3",
+        tmp_path / "snapshots",
+        later,
+        fetcher=fake_fetch,
+        review_queue_path=tmp_path / "cache" / "review-queue.json",
+        policy_path=Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json",
+    )
+
+    assert first.portals["nged"].content_hash != second.portals["nged"].content_hash
+
+
 def write_snapshot(path: Path, *datasets: CatalogueDataset) -> Path:
     path.write_text(
         json.dumps(
@@ -258,6 +284,26 @@ def test_diff_reports_dataset_metadata_resource_and_access_changes(tmp_path: Pat
     assert diff_snapshots(after, after).changes == ()
 
 
+def test_diff_ignores_generated_resource_observation_clocks(tmp_path: Path):
+    before_dataset = make_result("nged").datasets[0]
+    later = NOW + timedelta(minutes=5)
+    later_resources = [resource.model_copy(update={"observed_at": later}) for resource in before_dataset.resources]
+    after_dataset = before_dataset.model_copy(update={"observed_at": later, "resources": later_resources})
+
+    before = write_snapshot(tmp_path / "before.json", before_dataset)
+    after = write_snapshot(tmp_path / "after.json", after_dataset)
+
+    assert diff_snapshots(before, after).changes == ()
+
+
+def test_diff_rejects_snapshots_from_different_portals(tmp_path: Path):
+    before = write_snapshot(tmp_path / "before.json", make_result("nged").datasets[0])
+    after = write_snapshot(tmp_path / "after.json", make_result("spen").datasets[0])
+
+    with pytest.raises(ValueError, match="different portals"):
+        diff_snapshots(before, after)
+
+
 def test_review_queue_contains_only_stable_evidence_led_unresolved_cases(tmp_path: Path):
     summary = run_sync(tmp_path, {"nged": make_result("nged")})
     queue = json.loads(summary.review_queue_path.read_text(encoding="utf-8"))
@@ -269,6 +315,79 @@ def test_review_queue_contains_only_stable_evidence_led_unresolved_cases(tmp_pat
     assert all("synthetic-secret" not in json.dumps(item) for item in queue)
 
 
+def test_failed_portal_retains_only_valid_queue_items_and_derives_missing_id(tmp_path: Path):
+    queue_path = tmp_path / "cache" / "review-queue.json"
+    queue_path.parent.mkdir(parents=True)
+    queue_path.write_text(
+        json.dumps(
+            [
+                {
+                    "portal_id": "nged",
+                    "source_dataset_id": "public-dataset",
+                    "dimension": "access",
+                    "reason": "missing_evidence",
+                    "evidence_ids": [],
+                },
+                {"portal_id": "nged", "dimension": "access"},
+                "not-a-queue-item",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    first = run_sync(tmp_path, {"nged": RuntimeError("offline")})
+    first_bytes = first.review_queue_path.read_bytes()
+    second = run_sync(tmp_path, {"nged": RuntimeError("still offline")})
+    queue = json.loads(second.review_queue_path.read_text(encoding="utf-8"))
+
+    assert len(queue) == 1
+    assert queue[0]["source_dataset_id"] == "public-dataset"
+    assert isinstance(queue[0]["id"], str)
+    assert second.review_queue_path.read_bytes() == first_bytes
+
+
+def test_persistence_failure_rolls_back_registry_without_publishing_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    initial = run_sync(tmp_path, {"nged": make_result("nged", title="Last valid title")})
+    original_snapshot = initial.portals["nged"].snapshot_path
+    original_snapshot_bytes = original_snapshot.read_bytes()
+    original_queue_bytes = initial.review_queue_path.read_bytes()
+    persist = catalogue_sync.persist_catalogue_result
+
+    def fail_after_persist(*args, **kwargs):
+        persist(*args, **kwargs)
+        raise sqlite3.OperationalError("synthetic persistence failure")
+
+    monkeypatch.setattr(catalogue_sync, "persist_catalogue_result", fail_after_persist)
+    later = NOW + timedelta(minutes=5)
+    summary = sync_catalogues(
+        ["nged"],
+        lambda portal: FakeClient("nged", {"nged": make_result("nged", title="Uncommitted title")}),
+        tmp_path / "catalogue.sqlite3",
+        tmp_path / "snapshots",
+        later,
+        fetcher=fake_fetch,
+        review_queue_path=tmp_path / "cache" / "review-queue.json",
+        policy_path=Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json",
+    )
+
+    assert summary.status == "failed"
+    with get_connection(tmp_path / "catalogue.sqlite3") as conn:
+        row = conn.execute(
+            "SELECT title, last_observation_id FROM catalogue_datasets WHERE portal_id = 'nged'"
+        ).fetchone()
+        observation_count = conn.execute(
+            "SELECT COUNT(*) FROM catalogue_observations WHERE portal_id = 'nged'"
+        ).fetchone()[0]
+    assert row["title"] == "Last valid title"
+    assert observation_count == 1
+    assert original_snapshot.read_bytes() == original_snapshot_bytes
+    assert initial.review_queue_path.read_bytes() == original_queue_bytes
+    assert list((tmp_path / "snapshots").rglob("nged.json")) == [original_snapshot]
+
+
 def test_cli_parser_rejects_unknown_portal_and_has_only_read_only_commands():
     from app.catalogue_cli import build_parser
 
@@ -277,3 +396,27 @@ def test_cli_parser_rejects_unknown_portal_and_has_only_read_only_commands():
     with pytest.raises(SystemExit) as error:
         parser.parse_args(["sync", "--portal", "not-approved"])
     assert error.value.code == 1
+
+
+def test_cli_missing_subcommand_exits_one():
+    from app.catalogue_cli import main
+
+    with pytest.raises(SystemExit) as error:
+        main([])
+
+    assert error.value.code == 1
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed"])
+def test_cli_invalid_diff_inputs_exit_one_safely(tmp_path: Path, failure: str, capsys: pytest.CaptureFixture[str]):
+    from app.catalogue_cli import main
+
+    before = tmp_path / "before.json"
+    after = tmp_path / "after.json"
+    after.write_text("{}", encoding="utf-8")
+    if failure == "malformed":
+        before.write_text("{not-json", encoding="utf-8")
+
+    assert main(["diff", "--before", str(before), "--after", str(after)]) == 1
+    output = capsys.readouterr().out
+    assert json.loads(output)["status"] == "failed"

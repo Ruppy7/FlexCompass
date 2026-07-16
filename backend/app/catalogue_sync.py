@@ -149,16 +149,30 @@ def _snapshot_core(result: CatalogueFetchResult) -> dict[str, Any]:
     )
 
 
-def _without_observation_clock(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            key: _without_observation_clock(item)
-            for key, item in value.items()
-            if key != "observed_at"
-        }
-    if isinstance(value, list):
-        return [_without_observation_clock(item) for item in value]
-    return value
+def _without_model_observation_clock(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip generated model clocks without changing embedded source provenance."""
+    cleaned = {key: item for key, item in value.items() if key != "observed_at"}
+    for nested_field in ("resources", "classification_evidence"):
+        nested = cleaned.get(nested_field)
+        if isinstance(nested, list):
+            cleaned[nested_field] = [
+                _without_model_observation_clock(item) if isinstance(item, Mapping) else item
+                for item in nested
+            ]
+    return cleaned
+
+
+def _snapshot_identity(core: Mapping[str, Any]) -> dict[str, Any]:
+    """Return hash input with only FlexCompass-generated clocks removed."""
+    identity = dict(core)
+    for model_collection in ("datasets", "resources"):
+        values = identity.get(model_collection)
+        if isinstance(values, list):
+            identity[model_collection] = [
+                _without_model_observation_clock(item) if isinstance(item, Mapping) else item
+                for item in values
+            ]
+    return identity
 
 
 def _redacted_result(result: CatalogueFetchResult, core: Mapping[str, Any]) -> CatalogueFetchResult:
@@ -311,7 +325,7 @@ def _sync_one(
         raise ValueError("adapter result portal does not match requested portal")
     assessments = _classify(result, policy, now)
     core = _snapshot_core(result)
-    content_hash = hashlib.sha256(_canonical_json(_without_observation_clock(core))).hexdigest()
+    content_hash = hashlib.sha256(_canonical_json(_snapshot_identity(core))).hexdigest()
     snapshot_path = output_dir / _timestamp_directory(now) / f"{portal_id}.json"
     status: SyncStatus = "complete" if result.complete else "partial"
     manifest = {
@@ -328,16 +342,23 @@ def _sync_one(
         "snapshot_path": snapshot_path.as_posix(),
         "content_hash": content_hash,
     }
-    _write_json_atomic(snapshot_path, {"manifest": manifest, **core})
-    with get_connection(db_path) as conn:
-        persisted = persist_catalogue_result(
-            conn,
-            _redacted_result(result, core),
-            snapshot_path.as_posix(),
-            content_hash,
-            status=status,
-        )
-        _persist_assessments(conn, persisted.observation_id, assessments, now)
+    snapshot_existed = snapshot_path.exists()
+    try:
+        with get_connection(db_path) as conn:
+            conn.execute("BEGIN")
+            persisted = persist_catalogue_result(
+                conn,
+                _redacted_result(result, core),
+                snapshot_path.as_posix(),
+                content_hash,
+                status=status,
+            )
+            _persist_assessments(conn, persisted.observation_id, assessments, now)
+            _write_json_atomic(snapshot_path, {"manifest": manifest, **core})
+    except Exception:
+        if not snapshot_existed:
+            snapshot_path.unlink(missing_ok=True)
+        raise
     return (
         PortalSyncOutcome(
             portal_id=portal_id,
@@ -420,7 +441,11 @@ def sync_catalogues(
                 for item in previous_queue
                 if isinstance(item, dict) and item.get("portal_id") in failed_portals
             ]
-    merged = {item["id"]: item for item in [*retained, *review_items]}
+    merged: dict[str, dict[str, Any]] = {}
+    for item in [*retained, *review_items]:
+        normalised = _normalise_review_item(item)
+        if normalised is not None:
+            merged[normalised["id"]] = normalised
     _write_replaceable_json(queue_path, sorted(merged.values(), key=lambda item: item["id"]))
     return SyncRunSummary(run_status, outcomes, queue_path)
 
@@ -435,6 +460,23 @@ def _write_replaceable_json(path: Path, payload: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _normalise_review_item(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    stable_fields = ("portal_id", "source_dataset_id", "dimension", "reason")
+    if not all(isinstance(value.get(field), str) and value[field] for field in stable_fields):
+        return None
+    evidence_ids = value.get("evidence_ids", [])
+    if not isinstance(evidence_ids, list) or not all(isinstance(item, str) for item in evidence_ids):
+        return None
+    item = dict(value)
+    item["evidence_ids"] = sorted(set(evidence_ids))
+    if not isinstance(item.get("id"), str) or not item["id"]:
+        stable = "\n".join(str(item[field]) for field in stable_fields)
+        item["id"] = hashlib.sha256(stable.encode()).hexdigest()
+    return item
+
+
 def _dataset_map(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     datasets = payload.get("datasets", [])
     return {
@@ -444,11 +486,32 @@ def _dataset_map(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     }
 
 
+def _snapshot_portal(payload: Any) -> str:
+    if not isinstance(payload, Mapping):
+        raise ValueError("snapshot must be a JSON object")
+    manifest = payload.get("manifest")
+    portal_id = manifest.get("portal_id") if isinstance(manifest, Mapping) else None
+    if not isinstance(portal_id, str) or not portal_id:
+        raise ValueError("snapshot manifest must contain portal_id")
+    return portal_id
+
+
+def _comparable_resources(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    return [
+        _without_model_observation_clock(item) if isinstance(item, Mapping) else item
+        for item in value
+    ]
+
+
 def diff_snapshots(before: str | Path, after: str | Path) -> SnapshotDiff:
     """Return deterministic, evidence-only changes between two local snapshots."""
     before_path, after_path = Path(before), Path(after)
     before_data = json.loads(before_path.read_text(encoding="utf-8"))
     after_data = json.loads(after_path.read_text(encoding="utf-8"))
+    if _snapshot_portal(before_data) != _snapshot_portal(after_data):
+        raise ValueError("cannot diff snapshots from different portals")
     old, new = _dataset_map(before_data), _dataset_map(after_data)
     changes: list[SnapshotChange] = []
     for source_id in sorted(new.keys() - old.keys()):
@@ -462,13 +525,15 @@ def diff_snapshots(before: str | Path, after: str | Path) -> SnapshotDiff:
         after_metadata = {field: current.get(field) for field in metadata_fields}
         if before_metadata != after_metadata:
             changes.append(SnapshotChange("metadata_changed", source_id, before_metadata, after_metadata))
-        if previous.get("resources", []) != current.get("resources", []):
+        previous_resources = previous.get("resources", [])
+        current_resources = current.get("resources", [])
+        if _comparable_resources(previous_resources) != _comparable_resources(current_resources):
             changes.append(
                 SnapshotChange(
                     "resources_replaced",
                     source_id,
-                    previous.get("resources", []),
-                    current.get("resources", []),
+                    previous_resources,
+                    current_resources,
                 )
             )
         if previous.get("access_status") != current.get("access_status"):
