@@ -31,6 +31,8 @@ reports/
 
 # Local project planning and working notes
 project-plan/
+/memory/
+/.superpowers/
 
 # Build and editor files
 dist/
