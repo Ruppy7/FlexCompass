@@ -320,6 +320,13 @@ def persist_catalogue_assessment(
     assessed_at: datetime,
 ) -> None:
     """Idempotently store one evidence-led catalogue assessment."""
+    dataset_key = _dataset_key(portal_id, source_dataset_id)
+    existing = conn.execute(
+        "SELECT dataset_key FROM catalogue_assessments WHERE assessment_id = ?",
+        (assessment_id,),
+    ).fetchone()
+    if existing is not None and existing[0] != dataset_key:
+        raise ValueError("assessment_id is already associated with another dataset")
     observation = conn.execute(
         "SELECT portal_id FROM catalogue_observations WHERE observation_id = ?",
         (observation_id,),
@@ -342,7 +349,7 @@ def persist_catalogue_assessment(
                assessed_at = excluded.assessed_at""",
         (
             assessment_id,
-            _dataset_key(portal_id, source_dataset_id),
+            dataset_key,
             observation_id,
             assessment_type,
             assessment_value,

@@ -375,6 +375,125 @@ def test_catalogue_assessment_persistence_is_idempotent_and_json_preserving(conn
     assert json.loads(row[1]) == values["missing_evidence"]
 
 
+@pytest.mark.parametrize(
+    ("replacement_portal", "replacement_dataset"),
+    (("spen", "dataset-b"), ("nged", "dataset-b")),
+)
+def test_catalogue_assessment_id_cannot_be_reused_for_another_dataset(
+    conn, replacement_portal, replacement_dataset
+):
+    original = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged-a.json",
+        "nged-a-hash",
+    )
+    replacement = persist_catalogue_result(
+        conn,
+        make_result(portal_id=replacement_portal, source_dataset_id=replacement_dataset),
+        "replacement.json",
+        "replacement-hash",
+    )
+    assessment_id = "shared-assessment-id"
+    persist_catalogue_assessment(
+        conn,
+        assessment_id=assessment_id,
+        portal_id="nged",
+        source_dataset_id="dataset-a",
+        observation_id=original.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="unknown",
+        confidence="unknown",
+        rationale=["Original public-safe synthetic assessment."],
+        missing_evidence=["published update schedule"],
+        assessed_at=OBSERVED_AT,
+    )
+    original_row = conn.execute(
+        "SELECT * FROM catalogue_assessments WHERE assessment_id = ?",
+        (assessment_id,),
+    ).fetchone()
+
+    with pytest.raises(ValueError, match="dataset"):
+        persist_catalogue_assessment(
+            conn,
+            assessment_id=assessment_id,
+            portal_id=replacement_portal,
+            source_dataset_id=replacement_dataset,
+            observation_id=replacement.observation_id,
+            assessment_type="maintenance_state",
+            assessment_value="possible fit",
+            confidence="unknown",
+            rationale=["Replacement assessment must not overwrite the original."],
+            missing_evidence=[],
+            assessed_at=datetime(2026, 7, 16, 9, 30, tzinfo=timezone.utc),
+        )
+
+    stored_row = conn.execute(
+        "SELECT * FROM catalogue_assessments WHERE assessment_id = ?",
+        (assessment_id,),
+    ).fetchone()
+    assert tuple(stored_row) == tuple(original_row)
+
+
+def test_catalogue_assessment_id_allows_update_for_same_dataset(conn):
+    first = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged-a-first.json",
+        "nged-a-first-hash",
+    )
+    later = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged-a-later.json",
+        "nged-a-later-hash",
+    )
+    assessment_id = "shared-assessment-id"
+    persist_catalogue_assessment(
+        conn,
+        assessment_id=assessment_id,
+        portal_id="nged",
+        source_dataset_id="dataset-a",
+        observation_id=first.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="unknown",
+        confidence="unknown",
+        rationale=["Initial assessment."],
+        missing_evidence=["published update schedule"],
+        assessed_at=OBSERVED_AT,
+    )
+
+    later_assessed_at = datetime(2026, 7, 16, 9, 30, tzinfo=timezone.utc)
+    persist_catalogue_assessment(
+        conn,
+        assessment_id=assessment_id,
+        portal_id="nged",
+        source_dataset_id="dataset-a",
+        observation_id=later.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="worth investigating",
+        confidence="unknown",
+        rationale=["Later valid observation for the same dataset."],
+        missing_evidence=[],
+        assessed_at=later_assessed_at,
+    )
+
+    row = conn.execute(
+        """SELECT dataset_key, observation_id, assessment_value, rationale_json,
+                  missing_evidence_json, assessed_at
+           FROM catalogue_assessments WHERE assessment_id = ?""",
+        (assessment_id,),
+    ).fetchone()
+    assert tuple(row) == (
+        "nged:dataset-a",
+        later.observation_id,
+        "worth investigating",
+        '["Later valid observation for the same dataset."]',
+        "[]",
+        later_assessed_at.isoformat(),
+    )
+
+
 def test_catalogue_assessment_rejects_observation_from_another_portal(conn):
     nged = persist_catalogue_result(
         conn,
