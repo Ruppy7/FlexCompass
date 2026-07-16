@@ -1,0 +1,334 @@
+"""Pure, evidence-led classification for public catalogue datasets."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from statistics import median
+from typing import Any, Mapping, Sequence
+
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+from app.catalogue_models import (
+    AccessStatus,
+    CatalogueDataset,
+    ClassificationEvidence,
+    DatasetResource,
+    EvidenceConfidence,
+    LifecycleStatus,
+    MaintenanceState,
+    PublicationPattern,
+)
+
+
+class GraceMultipliers(BaseModel):
+    """Thresholds expressed as multiples of the expected cadence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    possibly_overdue: float
+    stale: float
+
+    @field_validator("possibly_overdue", "stale")
+    @classmethod
+    def require_positive_multiplier(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("grace multipliers must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def require_ordered_thresholds(self) -> GraceMultipliers:
+        if self.stale <= self.possibly_overdue:
+            raise ValueError("stale multiplier must exceed possibly-overdue multiplier")
+        return self
+
+
+class MaintenancePolicy(BaseModel):
+    """Versioned generic rules for cadence-based maintenance assessment."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: int
+    publisher_frequencies: Mapping[str, float]
+    grace_multipliers: GraceMultipliers
+    minimum_evidence_requirements: Mapping[str, int]
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> MaintenancePolicy:
+        if self.schema_version != 1:
+            raise ValueError("unsupported maintenance policy schema version")
+        if not self.publisher_frequencies:
+            raise ValueError("publisher frequencies must not be empty")
+        if any(days <= 0 for days in self.publisher_frequencies.values()):
+            raise ValueError("publisher frequency intervals must be positive")
+        if any(count <= 0 for count in self.minimum_evidence_requirements.values()):
+            raise ValueError("minimum evidence requirements must be positive")
+        return self
+
+
+@dataclass(frozen=True)
+class DatasetAssessment:
+    """Independent dimensions and the evidence supporting each conclusion."""
+
+    lifecycle: LifecycleStatus
+    publication_pattern: PublicationPattern
+    access_status: AccessStatus
+    maintenance_state: MaintenanceState
+    lifecycle_evidence: tuple[ClassificationEvidence, ...]
+    lifecycle_confidence: EvidenceConfidence
+    pattern_evidence: tuple[ClassificationEvidence, ...]
+    pattern_confidence: EvidenceConfidence
+    access_evidence: tuple[ClassificationEvidence, ...]
+    access_confidence: EvidenceConfidence
+    maintenance_evidence: tuple[ClassificationEvidence, ...]
+    maintenance_confidence: EvidenceConfidence
+
+
+@dataclass(frozen=True)
+class _Dimension:
+    value: Any
+    evidence: tuple[ClassificationEvidence, ...] = ()
+    confidence: EvidenceConfidence = EvidenceConfidence.unknown
+
+
+@dataclass(frozen=True)
+class _Cadence:
+    days: float | None
+    pattern: PublicationPattern
+    evidence: tuple[ClassificationEvidence, ...]
+    confidence: EvidenceConfidence
+    latest_data_at: datetime | None = None
+
+
+def load_policy(path: str | Path) -> MaintenancePolicy:
+    """Load and validate a versioned maintenance policy from JSON."""
+
+    with Path(path).open(encoding="utf-8") as policy_file:
+        return MaintenancePolicy.model_validate(json.load(policy_file))
+
+
+def classify_dataset(
+    dataset: CatalogueDataset,
+    resources: Sequence[DatasetResource],
+    evidence: Sequence[ClassificationEvidence],
+    policy: MaintenancePolicy,
+    now: datetime,
+) -> DatasetAssessment:
+    """Classify one dataset deterministically from supplied public evidence."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must include a timezone")
+
+    relevant = tuple(
+        item
+        for item in evidence
+        if item.portal_id == dataset.portal_id
+        and item.source_dataset_id == dataset.source_dataset_id
+    )
+    lifecycle = _classify_enum(
+        relevant,
+        ("lifecycle_status", "lifecycle"),
+        LifecycleStatus,
+        LifecycleStatus.unknown,
+    )
+    cadence = _select_cadence(relevant, policy)
+    pattern = _classify_pattern(relevant, cadence)
+    access = _classify_enum(
+        relevant,
+        ("access_status", "access"),
+        AccessStatus,
+        AccessStatus.unknown,
+    )
+    maintenance = _classify_maintenance(
+        resources, cadence, lifecycle, pattern, policy, now
+    )
+
+    return DatasetAssessment(
+        lifecycle=lifecycle.value,
+        publication_pattern=pattern.value,
+        access_status=access.value,
+        maintenance_state=maintenance.value,
+        lifecycle_evidence=lifecycle.evidence,
+        lifecycle_confidence=lifecycle.confidence,
+        pattern_evidence=pattern.evidence,
+        pattern_confidence=pattern.confidence,
+        access_evidence=access.evidence,
+        access_confidence=access.confidence,
+        maintenance_evidence=maintenance.evidence,
+        maintenance_confidence=maintenance.confidence,
+    )
+
+
+def _classify_enum(
+    evidence: Sequence[ClassificationEvidence],
+    classifications: tuple[str, ...],
+    enum_type: type,
+    unknown: Any,
+) -> _Dimension:
+    for item in evidence:
+        if item.classification not in classifications:
+            continue
+        try:
+            value = enum_type(item.source_value)
+        except (TypeError, ValueError):
+            continue
+        return _Dimension(value, (item,), item.confidence)
+    return _Dimension(unknown)
+
+
+def _classify_pattern(
+    evidence: Sequence[ClassificationEvidence], cadence: _Cadence
+) -> _Dimension:
+    if cadence.pattern is not PublicationPattern.unknown:
+        return _Dimension(cadence.pattern, cadence.evidence, cadence.confidence)
+    return _classify_enum(
+        evidence,
+        ("publication_pattern", "pattern", "description_supported_state"),
+        PublicationPattern,
+        PublicationPattern.unknown,
+    )
+
+
+def _select_cadence(
+    evidence: Sequence[ClassificationEvidence], policy: MaintenancePolicy
+) -> _Cadence:
+    for classification in ("publisher_schedule", "portal_update_frequency"):
+        for item in evidence:
+            if item.classification != classification:
+                continue
+            frequency = _frequency_value(item.source_value)
+            if frequency in {"event_driven", "event-driven"}:
+                return _Cadence(
+                    None, PublicationPattern.event_driven, (item,), item.confidence
+                )
+            days = _cadence_days(item.source_value, frequency, policy)
+            if days is not None:
+                return _Cadence(days, PublicationPattern.periodic, (item,), item.confidence)
+
+    minimum = policy.minimum_evidence_requirements.get("verified_timestamp_series", 3)
+    for item in evidence:
+        if item.classification not in {
+            "verified_timestamp_series",
+            "timestamp_series",
+        }:
+            continue
+        timestamps = _timestamp_values(item.source_value)
+        if len(timestamps) < minimum:
+            continue
+        intervals = [
+            (later - earlier).total_seconds() / 86400
+            for earlier, later in zip(timestamps, timestamps[1:])
+            if later > earlier
+        ]
+        if intervals:
+            return _Cadence(
+                median(intervals),
+                PublicationPattern.periodic,
+                (item,),
+                item.confidence,
+                timestamps[-1],
+            )
+    return _Cadence(
+        None, PublicationPattern.unknown, (), EvidenceConfidence.unknown
+    )
+
+
+def _frequency_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, Mapping):
+        frequency = value.get("frequency")
+        if isinstance(frequency, str):
+            return frequency.strip().lower()
+    return None
+
+
+def _cadence_days(
+    value: Any, frequency: str | None, policy: MaintenancePolicy
+) -> float | None:
+    if isinstance(value, Mapping):
+        days = value.get("cadence_days")
+        if isinstance(days, (int, float)) and not isinstance(days, bool) and days > 0:
+            return float(days)
+    if frequency is None:
+        return None
+    days = policy.publisher_frequencies.get(frequency)
+    return float(days) if days is not None else None
+
+
+def _timestamp_values(value: Any) -> list[datetime]:
+    if not isinstance(value, list):
+        return []
+    timestamps: list[datetime] = []
+    for raw_timestamp in value:
+        if isinstance(raw_timestamp, datetime):
+            timestamp = raw_timestamp
+        elif isinstance(raw_timestamp, str):
+            try:
+                timestamp = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        else:
+            continue
+        if timestamp.tzinfo is not None and timestamp.utcoffset() is not None:
+            timestamps.append(timestamp)
+    return sorted(set(timestamps))
+
+
+def _classify_maintenance(
+    resources: Sequence[DatasetResource],
+    cadence: _Cadence,
+    lifecycle: _Dimension,
+    pattern: _Dimension,
+    policy: MaintenancePolicy,
+    now: datetime,
+) -> _Dimension:
+    if lifecycle.value in {
+        LifecycleStatus.historical_archive,
+        LifecycleStatus.superseded,
+        LifecycleStatus.retired,
+    }:
+        return _Dimension(
+            MaintenanceState.expected_dormant,
+            lifecycle.evidence,
+            lifecycle.confidence,
+        )
+    if pattern.value in {
+        PublicationPattern.event_driven,
+        PublicationPattern.static_reference,
+        PublicationPattern.closed_period,
+    }:
+        return _Dimension(
+            MaintenanceState.expected_dormant,
+            pattern.evidence,
+            pattern.confidence,
+        )
+    if cadence.days is None:
+        return _Dimension(MaintenanceState.unknown)
+
+    latest_data_at = cadence.latest_data_at or _latest_resource_timestamp(resources)
+    if latest_data_at is None:
+        return _Dimension(MaintenanceState.unknown)
+    age_days = max(0.0, (now - latest_data_at).total_seconds() / 86400)
+    stale_after = cadence.days * policy.grace_multipliers.stale
+    overdue_after = cadence.days * policy.grace_multipliers.possibly_overdue
+    if age_days > stale_after:
+        state = MaintenanceState.stale
+    elif age_days > overdue_after:
+        state = MaintenanceState.possibly_overdue
+    else:
+        state = MaintenanceState.on_schedule
+    return _Dimension(state, cadence.evidence, cadence.confidence)
+
+
+def _latest_resource_timestamp(
+    resources: Sequence[DatasetResource],
+) -> datetime | None:
+    timestamps = [
+        resource.source_updated_at
+        for resource in resources
+        if resource.source_updated_at is not None
+    ]
+    return max(timestamps, default=None)

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "publisher_frequencies": {
+    "daily": 1,
+    "weekly": 7,
+    "fortnightly": 14,
+    "monthly": 30,
+    "quarterly": 91,
+    "biannually": 183,
+    "annually": 365,
+    "annual": 365,
+    "yearly": 365
+  },
+  "grace_multipliers": {
+    "possibly_overdue": 1.0,
+    "stale": 2.0
+  },
+  "minimum_evidence_requirements": {
+    "verified_timestamp_series": 3,
+    "description_supported_state": 1
+  }
+}
