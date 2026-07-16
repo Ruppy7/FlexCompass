@@ -81,3 +81,38 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
 - `/memory/` and `project-plan/` are local-only. Never stage or commit their
   contents, and do not promote them into public documentation without an
   explicit privacy, evidence, and relevance review.
+
+## Efficiency and continuity
+
+- Start from continuity, not rediscovery. Read `AGENTS.md`, the relevant
+  `/memory/` pointers, the active implementation plan, and the model/evaluation
+  log before broad repository searches. Re-scan only evidence that is missing,
+  stale, or needed for the current decision.
+- Use the recorded Orca wrapper and command recipes under
+  `project-plan/delegation/`. Do not repeatedly reconstruct `PATH`, rediscover
+  known CLI syntax, or probe runtime state after it has already been verified
+  healthy unless a command actually fails.
+- Monitor workers through one event-driven Orca bus wait filtered to
+  `worker_done` and `escalation`. Do not poll at short intervals or repeatedly
+  read terminal output; inspect a terminal only for a failure, escalation,
+  missing completion event, or explicit debugging need.
+- Use Orca worktree comments and workspace status at meaningful phase changes
+  (`in-progress`, `in-review`, `completed`). Read the current comment before
+  updating it so user context is not overwritten.
+- Treat terminal handles as runtime-scoped and ephemeral. Reacquire them after
+  an Orca restart instead of persisting stale handles as durable project state.
+- Manual task creation, explicit model routing, and event-driven completion are
+  the default for implementation and review. Trial `orchestration run` only for
+  multiple independent, low-risk tasks after recording the experiment; do not
+  use its coordinator loop to obscure review ownership or model selection.
+- Batch independent read-only inspections and verification commands where that
+  keeps output clear. Avoid repeating a check whose result is already current
+  and recorded unless the relevant state changed.
+- Route workers from the approved roster using the evaluation log and the
+  task's lane. Deliberately gather evidence for underused approved routes; do
+  not default every implementation or review to the most familiar model.
+- Close each task gate before opening the next: verify the implementation,
+  obtain the required independent verdicts, preserve useful reports, append
+  worker evaluations, update continuity records, close terminals, and clean up
+  task-only worktrees. Record these checkpoints immediately so session
+  compaction or handoff does not force reconstruction.
