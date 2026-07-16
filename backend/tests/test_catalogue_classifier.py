@@ -275,6 +275,39 @@ def test_identical_equal_precedence_duplicates_may_agree(policy) -> None:
     assert len(assessment.access_evidence) == 2
 
 
+def test_tied_evidence_order_uses_complete_record_content(policy) -> None:
+    tied_evidence = [
+        _evidence(
+            "access_status",
+            "public",
+            id="same-evidence-id",
+            confidence=EvidenceConfidence.low,
+            evidence="Zulu evidence text",
+            source_url="https://example.test/zulu",
+            observed_at=NOW - timedelta(days=1),
+            raw_record={"nested": {"value": 2}},
+        ),
+        _evidence(
+            "access_status",
+            "public",
+            id="same-evidence-id",
+            confidence=EvidenceConfidence.high,
+            evidence="Alpha evidence text",
+            source_url="https://example.test/alpha",
+            observed_at=NOW,
+            raw_record={"nested": {"value": 1}},
+        ),
+    ]
+    for evidence_order in (tied_evidence, list(reversed(tied_evidence))):
+        assessment = classify_dataset(_dataset(), [], evidence_order, policy, NOW)
+
+        assert assessment.access_status is AccessStatus.public
+        assert [item.source_url for item in assessment.access_evidence] == [
+            "https://example.test/alpha",
+            "https://example.test/zulu",
+        ]
+
+
 def test_verified_timestamp_series_supplies_cadence_and_data_clock(policy) -> None:
     timestamps = [
         (NOW - timedelta(days=20)).isoformat(),

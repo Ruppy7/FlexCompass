@@ -332,10 +332,11 @@ def _ordered_evidence(
     return tuple(
         sorted(
             evidence,
-            key=lambda item: (
-                item.classification,
-                item.id,
-                json.dumps(item.source_value, sort_keys=True, default=repr),
+            key=lambda item: json.dumps(
+                item.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
             ),
         )
     )
