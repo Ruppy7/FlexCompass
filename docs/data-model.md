@@ -59,6 +59,8 @@ The catalogue layer adds observation-based records for public portal metadata:
 Each sync run produces a deterministic observation key derived from portal ID,
 observation timestamp, and content hash. The content hash is SHA-256 of the
 redacted source snapshot core (with FlexCompass-generated clocks stripped).
+Known set-like source collections are normalised only in the hash projection;
+their original order remains intact in `raw_record` and raw-page provenance.
 Classifier assessments are persisted separately and do not affect immutable
 source snapshot identity.
 
@@ -66,8 +68,10 @@ source snapshot identity.
 
 Sync writes are atomic: a temporary file is written then renamed. If the
 snapshot already exists with identical content, no write occurs. Failed portals
-do not alter the registry. Partial observations update conservatively without
-erasing known source facts.
+do not alter the current registry. Partial observations update conservatively
+without erasing missing source facts or removing unseen children. Complete
+observations are authoritative for datasets they contain: removed nullable/list
+facts become unknown and obsolete current resources/evidence are reconciled.
 
 ### Secret redaction
 
@@ -77,8 +81,8 @@ All persisted and printed artifacts pass through `redact()`, which recursively:
   `[REDACTED]`
 - Replaces inline `key=value` credential patterns with `key=[REDACTED]`
 - Replaces private-host and credential-bearing URLs with `[REDACTED_URL]`
-- Removes sensitive query parameters while retaining benign parameters needed
-  by public download URLs
+- Removes signed-URL credentials, signatures, and security-token parameters
+  while retaining benign query parameters and fragments needed by public URLs
 
 ### Review queue
 
@@ -95,8 +99,17 @@ stable facts. The `observed_at` timestamp records when FlexCompass fetched data.
 Refresh cadence and stale classification are evidence-backed and preserve
 unknowns rather than inferred from absent evidence.
 
+A non-unknown periodic maintenance result requires explicit evidence that the
+dataset lifecycle is active and a defensible freshness clock. Resource
+`last_modified` can supply that clock when its exact source field is retained;
+generic resource `metadata_modified` is catalogue-edit metadata and is not used
+as a data/release clock. Maintenance rationale records the selected clock and
+its field-level provenance. Adapters do not invent lifecycle or access evidence.
+
 ## Testing boundaries
 
 Live portal tests are opt-in via `FLEXCOMPASS_LIVE_PORTAL_TESTS=1`; seven
-parametrized cases are skipped by default with zero network calls. Licence and
-attribution must be verified before redistributing source data.
+parametrized cases are skipped by default with zero network calls. When enabled,
+each case requires a complete snapshot whose unique usable dataset count matches
+the portal's reported count. Licence and attribution must be verified before
+redistributing source data.

@@ -307,6 +307,7 @@ CREATE INDEX IF NOT EXISTS idx_drift_alerts_unack
 """),
     # -- Migration 4: Public catalogue registry --
     (4, """
+BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS catalogue_observations (
     observation_id     TEXT PRIMARY KEY,
     portal_id          TEXT NOT NULL,
@@ -421,6 +422,8 @@ CREATE INDEX IF NOT EXISTS idx_classification_evidence_dataset
     ON classification_evidence(dataset_key, classification);
 CREATE INDEX IF NOT EXISTS idx_catalogue_assessments_dataset
     ON catalogue_assessments(dataset_key, assessed_at DESC);
+INSERT OR IGNORE INTO schema_version (version) VALUES (4);
+COMMIT;
 """),
     # -- Migration 5: Additive canonical metadata and cadence fields --
     (5, """

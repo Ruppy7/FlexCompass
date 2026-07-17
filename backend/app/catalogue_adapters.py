@@ -24,6 +24,26 @@ from app.catalogue_models import (
 
 PAGE_SIZE = 100
 
+_FREQUENCY_ALIASES = {
+    "daily": "daily",
+    "weekly": "weekly",
+    "fortnightly": "fortnightly",
+    "monthly": "monthly",
+    "quarterly": "quarterly",
+    "biannually": "biannually",
+    "semiannually": "biannually",
+    "annual": "annually",
+    "annually": "annually",
+    "yearly": "annually",
+    "continuous": "continuous",
+    "realtime": "continuous",
+    "real_time": "continuous",
+    "event_driven": "event_driven",
+    "on_event": "event_driven",
+    "irregular": "irregular",
+    "as_needed": "irregular",
+}
+
 
 @dataclass(frozen=True)
 class CatalogueFetchResult:
@@ -73,6 +93,8 @@ def fetch_ckan_catalogue(
     expected_count: int | None = None
     observed_record_count = 0
     seen_pages: set[tuple[str, ...]] = set()
+    seen_dataset_ids: set[str] = set()
+    duplicate_dataset_id = False
     interval = 1.0 / portal.rate_limit_rps if portal.rate_limit_rps > 0 else 0.0
 
     for page_number in range(portal.max_pages):
@@ -117,7 +139,27 @@ def fetch_ckan_catalogue(
                 warnings.append("Malformed CKAN record skipped: record is not a mapping")
                 continue
             try:
-                dataset, dataset_resources = _map_ckan_dataset(portal_id, record, observed_at)
+                source_id = _source_id(record, "name", "id")
+                if source_id in seen_dataset_ids:
+                    duplicate_dataset_id = True
+                    warnings.append(
+                        "Duplicate CKAN source dataset identifier skipped: "
+                        f"{source_id}"
+                    )
+                    continue
+                resource_records, resource_warnings = _validated_resource_items(
+                    record,
+                    ("resources",),
+                    "CKAN",
+                )
+                dataset, dataset_resources = _map_ckan_dataset(
+                    portal_id,
+                    record,
+                    observed_at,
+                    resource_records,
+                )
+                seen_dataset_ids.add(source_id)
+                warnings.extend(resource_warnings)
                 datasets.append(dataset)
                 resources.extend(dataset_resources)
             except (TypeError, ValueError) as exc:
@@ -128,7 +170,17 @@ def fetch_ckan_catalogue(
     else:
         warnings.append("Pagination reached max_pages before completion.")
 
-    complete = expected_count is not None and observed_record_count >= expected_count
+    usable_count = len(seen_dataset_ids)
+    complete = (
+        expected_count is not None
+        and usable_count == expected_count
+        and not duplicate_dataset_id
+    )
+    if expected_count is not None and usable_count != expected_count:
+        warnings.append(
+            "Unique usable dataset count does not match the reported count: "
+            f"expected {expected_count}, observed {usable_count}."
+        )
     if not complete and len(pages) >= portal.max_pages and not any("max_pages" in warning for warning in warnings):
         warnings.append("Pagination reached max_pages before completion.")
     if any("Malformed" in w for w in warnings):
@@ -161,6 +213,8 @@ def fetch_ods_catalogue(
     expected_count: int | None = None
     observed_record_count = 0
     seen_pages: set[tuple[str, ...]] = set()
+    seen_dataset_ids: set[str] = set()
+    duplicate_dataset_id = False
     interval = 1.0 / portal.rate_limit_rps if portal.rate_limit_rps > 0 else 0.0
 
     for page_number in range(portal.max_pages):
@@ -206,7 +260,27 @@ def fetch_ods_catalogue(
                 warnings.append("Malformed ODS record skipped: record is not a mapping")
                 continue
             try:
-                dataset, dataset_resources = _map_ods_dataset(portal_id, record, observed_at)
+                source_id = _source_id(record, "dataset_id", "dataset_uid")
+                if source_id in seen_dataset_ids:
+                    duplicate_dataset_id = True
+                    warnings.append(
+                        "Duplicate ODS source dataset identifier skipped: "
+                        f"{source_id}"
+                    )
+                    continue
+                resource_records, resource_warnings = _validated_resource_items(
+                    record,
+                    ("attachments", "alternative_exports"),
+                    "ODS",
+                )
+                dataset, dataset_resources = _map_ods_dataset(
+                    portal_id,
+                    record,
+                    observed_at,
+                    resource_records,
+                )
+                seen_dataset_ids.add(source_id)
+                warnings.extend(resource_warnings)
                 datasets.append(dataset)
                 resources.extend(dataset_resources)
             except (TypeError, ValueError) as exc:
@@ -217,7 +291,17 @@ def fetch_ods_catalogue(
     else:
         warnings.append("Pagination reached max_pages before completion.")
 
-    complete = expected_count is not None and observed_record_count >= expected_count
+    usable_count = len(seen_dataset_ids)
+    complete = (
+        expected_count is not None
+        and usable_count == expected_count
+        and not duplicate_dataset_id
+    )
+    if expected_count is not None and usable_count != expected_count:
+        warnings.append(
+            "Unique usable dataset count does not match the reported count: "
+            f"expected {expected_count}, observed {usable_count}."
+        )
     if not complete and len(pages) >= portal.max_pages and not any("max_pages" in warning for warning in warnings):
         warnings.append("Pagination reached max_pages before completion.")
     if any("Malformed" in w for w in warnings):
@@ -247,11 +331,12 @@ def _map_ckan_dataset(
     portal_id: str,
     record: dict[str, Any],
     observed_at: datetime,
+    resource_records: Sequence[dict[str, Any]],
 ) -> tuple[CatalogueDataset, list[DatasetResource]]:
     source_id = _source_id(record, "name", "id")
     mapped_resources = [
         _map_resource(portal_id, source_id, item, observed_at)
-        for item in _dict_items(record.get("resources"))
+        for item in resource_records
     ]
     organization = record.get("organization")
     publisher = None
@@ -310,12 +395,12 @@ def _map_ods_dataset(
     portal_id: str,
     record: dict[str, Any],
     observed_at: datetime,
+    resource_records: Sequence[dict[str, Any]],
 ) -> tuple[CatalogueDataset, list[DatasetResource]]:
     source_id = _source_id(record, "dataset_id", "dataset_uid")
     metas = record.get("metas")
     default = metas.get("default") if isinstance(metas, dict) else None
     default = default if isinstance(default, dict) else {}
-    resource_records = _dict_items(record.get("attachments")) + _dict_items(record.get("alternative_exports"))
     mapped_resources = [
         _map_resource(portal_id, source_id, item, observed_at)
         for item in resource_records
@@ -389,7 +474,7 @@ def _map_resource(
         media_type=_optional_str(record.get("mimetype")),
         size_bytes=_optional_nonnegative_int(record.get("size")),
         source_created_at=_parse_source_datetime(record.get("created")),
-        source_updated_at=_parse_source_datetime(record.get("last_modified") or record.get("metadata_modified")),
+        source_updated_at=_parse_source_datetime(record.get("last_modified")),
         observed_at=observed_at,
         raw_record=record,
     )
@@ -408,6 +493,35 @@ def _dict_items(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _validated_resource_items(
+    record: dict[str, Any],
+    fields: Sequence[str],
+    platform_name: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Retain valid nested resources and report every dropped schema value."""
+    resources: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for field in fields:
+        if field not in record:
+            continue
+        value = record[field]
+        if not isinstance(value, list):
+            warnings.append(
+                f"Malformed {platform_name} resource collection {field!r} "
+                "skipped: expected a list."
+            )
+            continue
+        valid_items = [item for item in value if isinstance(item, dict)]
+        dropped_count = len(value) - len(valid_items)
+        if dropped_count:
+            warnings.append(
+                f"Malformed {platform_name} resource item(s) in {field!r} "
+                f"skipped: {dropped_count} item(s) were not mappings."
+            )
+        resources.extend(valid_items)
+    return resources, warnings
 
 
 def _optional_str(value: Any) -> str | None:
@@ -542,23 +656,7 @@ def _normalise_frequency(value: str | None) -> str | None:
     """Normalise a raw frequency string to a canonical form, or None if ambiguous."""
     if value is None:
         return None
-    lowered = value.strip().lower()
-    if not lowered:
+    normalised = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if not normalised:
         return None
-    mapping = {
-        "daily": "daily",
-        "weekly": "weekly",
-        "fortnightly": "fortnightly",
-        "monthly": "monthly",
-        "quarterly": "quarterly",
-        "biannually": "biannually",
-        "semiannually": "biannually",
-        "annually": "annually",
-        "yearly": "annually",
-        "continuous": "continuous",
-        "realtime": "continuous",
-        "real-time": "continuous",
-        "irregular": "irregular",
-        "as_needed": "irregular",
-    }
-    return mapping.get(lowered, None)
+    return _FREQUENCY_ALIASES.get(normalised)

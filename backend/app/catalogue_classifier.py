@@ -22,6 +22,13 @@ from app.catalogue_models import (
     PublicationPattern,
 )
 
+_DECLARED_PUBLICATION_PATTERNS = {
+    "continuous": PublicationPattern.continuous,
+    "realtime": PublicationPattern.continuous,
+    "real_time": PublicationPattern.continuous,
+    "event_driven": PublicationPattern.event_driven,
+}
+
 
 class GraceMultipliers(BaseModel):
     """Thresholds expressed as multiples of the expected cadence."""
@@ -100,6 +107,12 @@ class _Cadence:
     evidence: tuple[ClassificationEvidence, ...]
     confidence: EvidenceConfidence
     latest_data_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class _FreshnessClock:
+    value: datetime
+    evidence: tuple[ClassificationEvidence, ...]
 
 
 def load_policy(path: str | Path) -> MaintenancePolicy:
@@ -233,11 +246,12 @@ def _select_cadence(
             if item.classification != classification:
                 continue
             frequency = _frequency_value(item.source_value)
-            if frequency in {"event_driven", "event-driven"}:
+            pattern = _DECLARED_PUBLICATION_PATTERNS.get(frequency)
+            if pattern is not None:
                 candidates.append(
                     _Cadence(
                         None,
-                        PublicationPattern.event_driven,
+                        pattern,
                         (item,),
                         item.confidence,
                     )
@@ -344,12 +358,16 @@ def _ordered_evidence(
 
 def _frequency_value(value: Any) -> str | None:
     if isinstance(value, str):
-        return value.strip().lower()
+        return _normalise_frequency_key(value)
     if isinstance(value, Mapping):
         frequency = value.get("frequency")
         if isinstance(frequency, str):
-            return frequency.strip().lower()
+            return _normalise_frequency_key(frequency)
     return None
+
+
+def _normalise_frequency_key(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def _cadence_days(
@@ -418,11 +436,13 @@ def _classify_maintenance(
     if cadence.days is None:
         return _Dimension(MaintenanceState.unknown)
 
-    latest_data_at = cadence.latest_data_at or _latest_resource_timestamp(
-        dataset, resources
-    )
-    if latest_data_at is None:
+    if cadence.latest_data_at is not None:
+        freshness = _FreshnessClock(cadence.latest_data_at, ())
+    else:
+        freshness = _latest_resource_clock(dataset, resources)
+    if freshness is None:
         return _Dimension(MaintenanceState.unknown)
+    latest_data_at = freshness.value
     age_days = max(0.0, (now - latest_data_at).total_seconds() / 86400)
     stale_after = cadence.days * policy.grace_multipliers.stale
     overdue_after = cadence.days * policy.grace_multipliers.possibly_overdue
@@ -432,18 +452,55 @@ def _classify_maintenance(
         state = MaintenanceState.possibly_overdue
     else:
         state = MaintenanceState.on_schedule
-    return _Dimension(state, cadence.evidence, cadence.confidence)
+    maintenance_evidence = _ordered_evidence(
+        (*cadence.evidence, *freshness.evidence)
+    )
+    return _Dimension(
+        state,
+        maintenance_evidence,
+        _lowest_confidence(maintenance_evidence),
+    )
 
 
-def _latest_resource_timestamp(
+def _latest_resource_clock(
     dataset: CatalogueDataset,
     resources: Sequence[DatasetResource],
-) -> datetime | None:
-    timestamps = [
-        resource.source_updated_at
-        for resource in resources
-        if resource.portal_id == dataset.portal_id
-        and resource.source_dataset_id == dataset.source_dataset_id
-        and resource.source_updated_at is not None
-    ]
-    return max(timestamps, default=None)
+) -> _FreshnessClock | None:
+    candidates: list[tuple[datetime, str, ClassificationEvidence]] = []
+    for resource in resources:
+        if (
+            resource.portal_id != dataset.portal_id
+            or resource.source_dataset_id != dataset.source_dataset_id
+            or resource.source_updated_at is None
+        ):
+            continue
+        raw_timestamp = resource.raw_record.get("last_modified")
+        parsed_values = _timestamp_values([raw_timestamp])
+        if (
+            len(parsed_values) != 1
+            or parsed_values[0] != resource.source_updated_at
+        ):
+            continue
+        evidence = ClassificationEvidence(
+            id=(
+                f"{dataset.portal_id}:{dataset.source_dataset_id}:"
+                f"resource-data-updated:{resource.id}"
+            ),
+            portal_id=dataset.portal_id,
+            source_dataset_id=dataset.source_dataset_id,
+            classification="resource_data_updated_at",
+            evidence=(
+                "Freshness clock uses the public resource field "
+                f"last_modified for resource {resource.id}."
+            ),
+            confidence=EvidenceConfidence.high,
+            source_value=resource.source_updated_at.isoformat(),
+            source_url=resource.url,
+            observed_at=resource.observed_at,
+            raw_record={"field": "last_modified", "value": raw_timestamp},
+        )
+        candidates.append((resource.source_updated_at, resource.id, evidence))
+    if not candidates:
+        return None
+    timestamp, _, evidence = max(candidates, key=lambda item: (item[0], item[1]))
+    return _FreshnessClock(timestamp, (evidence,))

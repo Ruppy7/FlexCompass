@@ -76,6 +76,11 @@ python -m app.catalogue_cli diff --before ../data/snapshots/catalogues/20260715T
 python -m app.catalogue_cli review-queue --format json
 ```
 
+Maintenance remains unknown unless public evidence explicitly establishes an
+active lifecycle and a defensible freshness clock. Catalogue-edit timestamps do
+not stand in for data/release freshness, and the adapters do not infer missing
+lifecycle or access facts.
+
 See [public data sources](docs/public-data-sources.md) for portal-specific scope,
 licence cautions, and limitations.
 

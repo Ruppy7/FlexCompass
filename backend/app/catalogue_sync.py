@@ -85,15 +85,30 @@ def _canonical_json(value: Any) -> bytes:
 
 _SENSITIVE_KEY = re.compile(
     r"^(?:authorization|auth|cookie|credential|password|secret|token|"
-    r"api[_-]?key|access[_-]?token|client[_-]?secret)$",
+    r"api[_-]?key|access[_-]?token|client[_-]?secret|signature|sig|"
+    r"security[_-]?token|x[_-]amz[_-](?:credential|signature|security[_-]?token)|"
+    r"x[_-]goog[_-](?:credential|signature)|awsaccesskeyid|googleaccessid|"
+    r"key[_-]?pair[_-]?id)$",
     re.IGNORECASE,
 )
 _URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _KEY_VALUE_SECRET = re.compile(
-    r"(?i)(authorization|password|secret|token|api[_-]?key)\s*[=:]\s*[^\s,;&]+"
+    r"(?i)\b(password|secret|token|api[_-]?key|access[_-]?token|"
+    r"client[_-]?secret)\s*[=:]\s*[^\s,;&]+"
+)
+_AUTHORIZATION_SECRET = re.compile(
+    r"(?i)\b(authorization)\s*[=:]\s*[^,;\r\n]+"
+)
+_COOKIE_SECRET = re.compile(r"(?i)\b(cookie)\s*[=:]\s*[^,\r\n]+")
+_AUTH_SCHEME_SECRET = re.compile(
+    r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+"
 )
 _SENSITIVE_QUERY_PARAM = re.compile(
-    r"^(?:authorization|cookie|credential|password|secret|token|api[_-]?key|apikey|access_token|client_secret)$",
+    r"^(?:authorization|cookie|credential|password|secret|token|api[_-]?key|"
+    r"access[_-]?token|client[_-]?secret|signature|sig|security[_-]?token|"
+    r"x-amz-(?:credential|signature|security-token)|"
+    r"x-goog-(?:credential|signature)|awsaccesskeyid|googleaccessid|"
+    r"key-pair-id)$",
     re.IGNORECASE,
 )
 
@@ -120,7 +135,10 @@ def _safe_url(value: str) -> str:
         return "[REDACTED_URL]"
     # Preserve benign query parameters; remove only sensitive ones.
     safe_query = _filter_sensitive_query(parsed.query)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, safe_query, ""))
+    safe_fragment = _filter_sensitive_fragment(parsed.fragment)
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, safe_query, safe_fragment)
+    )
 
 
 def _filter_sensitive_query(query: str) -> str:
@@ -134,9 +152,40 @@ def _filter_sensitive_query(query: str) -> str:
     return urlencode(safe_pairs)
 
 
+def _filter_sensitive_fragment(fragment: str) -> str:
+    """Preserve public fragments while removing credential-bearing pairs."""
+    if not fragment:
+        return ""
+    prefix, separator, query = fragment.partition("?")
+    if separator:
+        safe_query = _filter_sensitive_query(query)
+        safe_prefix = _redact_non_url_text(prefix)
+        return f"{safe_prefix}?{safe_query}" if safe_query else safe_prefix
+
+    from urllib.parse import parse_qsl
+
+    pairs = parse_qsl(fragment, keep_blank_values=True)
+    if any(_SENSITIVE_QUERY_PARAM.match(key) for key, _ in pairs):
+        return _filter_sensitive_query(fragment)
+    return _redact_non_url_text(fragment)
+
+
+def _redact_non_url_text(value: str) -> str:
+    text = _AUTHORIZATION_SECRET.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]", value
+    )
+    text = _COOKIE_SECRET.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]", text
+    )
+    text = _KEY_VALUE_SECRET.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]", text
+    )
+    return _AUTH_SCHEME_SECRET.sub("[REDACTED]", text)
+
+
 def _safe_text(value: str) -> str:
-    text = _KEY_VALUE_SECRET.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
-    return _URL.sub(lambda match: _safe_url(match.group(0)), text)
+    urls_redacted = _URL.sub(lambda match: _safe_url(match.group(0)), value)
+    return _redact_non_url_text(urls_redacted)
 
 
 def safe_error(error: Exception) -> str:
@@ -191,7 +240,70 @@ def _snapshot_identity(core: Mapping[str, Any]) -> dict[str, Any]:
                 _without_model_observation_clock(item) if isinstance(item, Mapping) else item
                 for item in values
             ]
-    return identity
+    normalised = _normalise_semantically_unordered(identity)
+    if not isinstance(normalised, dict):
+        raise ValueError("snapshot identity must be a JSON object")
+    return normalised
+
+
+_UNORDERED_SOURCE_LIST_KEYS = frozenset(
+    {
+        "attachments",
+        "alternative_exports",
+        "classification_evidence",
+        "datasets",
+        "groups",
+        "resources",
+        "results",
+        "tags",
+        "themes",
+    }
+)
+_UNORDERED_IDENTITY_FIELDS = {
+    "attachments": ("id", "url", "name", "title"),
+    "alternative_exports": ("id", "url", "name", "title"),
+    "classification_evidence": ("id",),
+    "datasets": ("source_dataset_id", "id"),
+    "groups": ("id", "name", "title"),
+    "resources": ("id", "source_resource_id", "url", "name", "title"),
+    "results": ("name", "id", "dataset_id", "dataset_uid"),
+}
+
+
+def _unordered_source_item_key(
+    field_name: str | None,
+    value: Any,
+) -> tuple[str, bytes]:
+    if isinstance(value, Mapping):
+        for identity_field in _UNORDERED_IDENTITY_FIELDS.get(field_name or "", ()):
+            identity = value.get(identity_field)
+            if isinstance(identity, str) and identity:
+                return identity, _canonical_json(value)
+    return "", _canonical_json(value)
+
+
+def _normalise_semantically_unordered(
+    value: Any,
+    field_name: str | None = None,
+) -> Any:
+    """Normalise known set-like source arrays without mutating raw provenance."""
+    if isinstance(value, Mapping):
+        return {
+            key: _normalise_semantically_unordered(item, str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        items = [
+            _normalise_semantically_unordered(item)
+            for item in value
+        ]
+        if field_name in _UNORDERED_SOURCE_LIST_KEYS:
+            return sorted(
+                items,
+                key=lambda item: _unordered_source_item_key(field_name, item),
+            )
+        return items
+    return value
 
 
 def _redacted_result(result: CatalogueFetchResult, core: Mapping[str, Any]) -> CatalogueFetchResult:
@@ -341,7 +453,8 @@ def _sync_one(
         raise ValueError("adapter result portal does not match requested portal")
     core = _snapshot_core(result)
     content_hash = hashlib.sha256(_canonical_json(_snapshot_identity(core))).hexdigest()
-    assessments = _classify(result, policy, now)
+    redacted_result = _redacted_result(result, core)
+    assessments = _classify(redacted_result, policy, now)
     snapshot_path = output_dir / _timestamp_directory(now) / f"{portal_id}.json"
     status: SyncStatus = "complete" if result.complete else "partial"
     manifest = {
@@ -364,7 +477,7 @@ def _sync_one(
             conn.execute("BEGIN")
             persisted = persist_catalogue_result(
                 conn,
-                _redacted_result(result, core),
+                redacted_result,
                 snapshot_path.as_posix(),
                 content_hash,
                 status=status,
@@ -496,15 +609,6 @@ def _normalise_review_item(value: Any) -> dict[str, Any] | None:
     return item
 
 
-def _dataset_map(payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    datasets = payload.get("datasets", [])
-    return {
-        item["source_dataset_id"]: item
-        for item in datasets
-        if isinstance(item, Mapping) and isinstance(item.get("source_dataset_id"), str)
-    }
-
-
 def _snapshot_portal(payload: Any) -> str:
     if not isinstance(payload, Mapping):
         raise ValueError("snapshot must be a JSON object")
@@ -515,13 +619,147 @@ def _snapshot_portal(payload: Any) -> str:
     return portal_id
 
 
+@dataclass(frozen=True)
+class _ValidatedSnapshot:
+    portal_id: str
+    complete: bool
+    datasets: Mapping[str, Mapping[str, Any]]
+
+
+def _validated_snapshot(payload: Any) -> _ValidatedSnapshot:
+    """Validate manifest, provenance graph, and content identity for a snapshot."""
+    portal_id = _snapshot_portal(payload)
+    manifest = payload["manifest"]
+    if manifest.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError("unsupported snapshot schema version")
+    status = manifest.get("portal_status")
+    complete = manifest.get("complete")
+    if status not in {"complete", "partial"} or not isinstance(complete, bool):
+        raise ValueError("snapshot manifest has invalid completeness semantics")
+    if complete != (status == "complete"):
+        raise ValueError("snapshot manifest has inconsistent completeness semantics")
+
+    collections: dict[str, list[Any]] = {}
+    for field in ("datasets", "resources", "raw_pages"):
+        value = payload.get(field)
+        if not isinstance(value, list):
+            raise ValueError(f"snapshot {field} must be a list")
+        collections[field] = value
+    datasets = collections["datasets"]
+    resources = collections["resources"]
+    if manifest.get("dataset_count") != len(datasets):
+        raise ValueError("snapshot manifest dataset count is inconsistent")
+    if manifest.get("resource_count") != len(resources):
+        raise ValueError("snapshot manifest resource count is inconsistent")
+
+    dataset_map: dict[str, Mapping[str, Any]] = {}
+    nested_resources: list[Any] = []
+    for dataset in datasets:
+        if not isinstance(dataset, Mapping):
+            raise ValueError("snapshot dataset must be a JSON object")
+        source_id = dataset.get("source_dataset_id")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("snapshot dataset must contain source_dataset_id")
+        if dataset.get("portal_id") != portal_id:
+            raise ValueError("snapshot dataset portal association is invalid")
+        if source_id in dataset_map:
+            raise ValueError("snapshot dataset identifiers must be unique")
+        dataset_map[source_id] = dataset
+        dataset_resources = dataset.get("resources")
+        if not isinstance(dataset_resources, list):
+            raise ValueError("snapshot nested resources must be a list")
+        nested_resources.extend(dataset_resources)
+
+    for resource in resources:
+        if not isinstance(resource, Mapping):
+            raise ValueError("snapshot resource must be a JSON object")
+        if resource.get("portal_id") != portal_id:
+            raise ValueError("snapshot resource portal association is invalid")
+        if resource.get("source_dataset_id") not in dataset_map:
+            raise ValueError("snapshot resource dataset association is invalid")
+    if _comparable_resources(nested_resources) != _comparable_resources(resources):
+        raise ValueError("snapshot nested and top-level resources are inconsistent")
+
+    expected_count = manifest.get("expected_count")
+    if complete and (
+        not isinstance(expected_count, int)
+        or isinstance(expected_count, bool)
+        or expected_count < 0
+        or len(dataset_map) != expected_count
+    ):
+        raise ValueError(
+            "complete snapshot must match its expected unique usable dataset count"
+        )
+
+    core = {field: collections[field] for field in collections}
+    expected_hash = hashlib.sha256(
+        _canonical_json(_snapshot_identity(core))
+    ).hexdigest()
+    if manifest.get("content_hash") != expected_hash:
+        raise ValueError("snapshot content hash does not match its source state")
+    return _ValidatedSnapshot(portal_id, complete, dataset_map)
+
+
 def _comparable_resources(value: Any) -> Any:
     if not isinstance(value, list):
         return value
-    return [
+    resources = [
         _without_model_observation_clock(item) if isinstance(item, Mapping) else item
         for item in value
     ]
+    return _normalise_semantically_unordered(resources, "resources")
+
+
+_SOURCE_METADATA_FIELDS = (
+    "title",
+    "description",
+    "publisher",
+    "licence",
+    "licence_identifier",
+    "licence_title",
+    "licence_url",
+    "attribution",
+    "themes",
+    "catalogue_page_url",
+    "metadata_api_url",
+    "declared_update_frequency",
+    "declared_update_frequency_text",
+    "portal_url",
+    "api_url",
+    "source_created_at",
+    "source_updated_at",
+    "lifecycle_status",
+    "publication_pattern",
+    "tags",
+)
+
+
+def _source_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        field: _normalise_semantically_unordered(value.get(field), field)
+        for field in _SOURCE_METADATA_FIELDS
+    }
+
+
+def _source_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = value.get("classification_evidence", [])
+    if isinstance(evidence, list):
+        evidence = [
+            _without_model_observation_clock(item)
+            if isinstance(item, Mapping)
+            else item
+            for item in evidence
+        ]
+    return {
+        "classification_evidence": _normalise_semantically_unordered(
+            evidence,
+            "classification_evidence",
+        ),
+        "raw_record": _normalise_semantically_unordered(
+            value.get("raw_record", {}),
+            "raw_record",
+        ),
+    }
 
 
 def diff_snapshots(before: str | Path, after: str | Path) -> SnapshotDiff:
@@ -529,21 +767,36 @@ def diff_snapshots(before: str | Path, after: str | Path) -> SnapshotDiff:
     before_path, after_path = Path(before), Path(after)
     before_data = json.loads(before_path.read_text(encoding="utf-8"))
     after_data = json.loads(after_path.read_text(encoding="utf-8"))
-    if _snapshot_portal(before_data) != _snapshot_portal(after_data):
+    before_snapshot = _validated_snapshot(before_data)
+    after_snapshot = _validated_snapshot(after_data)
+    if before_snapshot.portal_id != after_snapshot.portal_id:
         raise ValueError("cannot diff snapshots from different portals")
-    old, new = _dataset_map(before_data), _dataset_map(after_data)
+    old, new = before_snapshot.datasets, after_snapshot.datasets
     changes: list[SnapshotChange] = []
     for source_id in sorted(new.keys() - old.keys()):
         changes.append(SnapshotChange("dataset_added", source_id, after=new[source_id]))
-    for source_id in sorted(old.keys() - new.keys()):
-        changes.append(SnapshotChange("dataset_removed", source_id, before=old[source_id]))
-    metadata_fields = ("title", "description", "publisher", "licence", "portal_url", "api_url", "tags")
+    if before_snapshot.complete and after_snapshot.complete:
+        for source_id in sorted(old.keys() - new.keys()):
+            changes.append(
+                SnapshotChange("dataset_removed", source_id, before=old[source_id])
+            )
     for source_id in sorted(old.keys() & new.keys()):
         previous, current = old[source_id], new[source_id]
-        before_metadata = {field: previous.get(field) for field in metadata_fields}
-        after_metadata = {field: current.get(field) for field in metadata_fields}
+        before_metadata = _source_metadata(previous)
+        after_metadata = _source_metadata(current)
         if before_metadata != after_metadata:
             changes.append(SnapshotChange("metadata_changed", source_id, before_metadata, after_metadata))
+        before_evidence = _source_evidence(previous)
+        after_evidence = _source_evidence(current)
+        if before_evidence != after_evidence:
+            changes.append(
+                SnapshotChange(
+                    "source_evidence_changed",
+                    source_id,
+                    before_evidence,
+                    after_evidence,
+                )
+            )
         previous_resources = previous.get("resources", [])
         current_resources = current.get("resources", [])
         if _comparable_resources(previous_resources) != _comparable_resources(current_resources):

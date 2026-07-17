@@ -43,6 +43,11 @@ def _resource(updated_at: datetime | None, **overrides: Any) -> DatasetResource:
         "portal_id": "portal",
         "source_dataset_id": "dataset-1",
         "source_updated_at": updated_at,
+        "raw_record": (
+            {"last_modified": updated_at.isoformat()}
+            if updated_at is not None
+            else {}
+        ),
     }
     values.update(overrides)
     return DatasetResource(**values)
@@ -328,7 +333,7 @@ def test_verified_timestamp_series_supplies_cadence_and_data_clock(policy) -> No
     assert assessment.maintenance_confidence is EvidenceConfidence.medium
 
 
-def test_catalogue_metadata_modification_is_not_used_as_the_data_clock(policy) -> None:
+def test_verified_resource_last_modified_is_used_as_the_data_clock(policy) -> None:
     evidence = [
         _evidence("lifecycle_status", "active"),
         _evidence("portal_update_frequency", "weekly"),
@@ -343,6 +348,40 @@ def test_catalogue_metadata_modification_is_not_used_as_the_data_clock(policy) -
     )
 
     assert assessment.maintenance_state is MaintenanceState.stale
+    assert any(
+        item.classification == "resource_data_updated_at"
+        and "last_modified" in item.evidence
+        for item in assessment.maintenance_evidence
+    )
+
+
+def test_generic_resource_metadata_modified_is_not_a_defensible_data_clock(
+    policy,
+) -> None:
+    evidence = [
+        _evidence("lifecycle_status", "active"),
+        _evidence("portal_update_frequency", "weekly"),
+    ]
+    timestamp = NOW - timedelta(days=30)
+    resource = _resource(
+        timestamp,
+        raw_record={"metadata_modified": timestamp.isoformat()},
+    )
+
+    assessment = classify_dataset(
+        _dataset(),
+        [resource],
+        evidence,
+        policy,
+        NOW,
+    )
+
+    assert assessment.publication_pattern is PublicationPattern.periodic
+    assert assessment.maintenance_state is MaintenanceState.unknown
+    assert not any(
+        item.classification == "resource_data_updated_at"
+        for item in assessment.maintenance_evidence
+    )
 
 
 def test_foreign_resource_cannot_make_a_stale_dataset_current(policy) -> None:

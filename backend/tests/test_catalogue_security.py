@@ -29,11 +29,12 @@ NOW = datetime(2026, 7, 16, 12, 0, 0, tzinfo=timezone.utc)
 SYNTHETIC_SECRET = "sk-fake-7a9b3c4d5e6f-SECRET"
 SYNTHETIC_TOKEN = "Bearer eyJhbGciOiJub25lIn0.secret-token-value"
 SYNTHETIC_API_KEY = "apikey=AKIAIOSFODNN7SECRET"
+EXACT_CREDENTIAL_MARKER = "EXACT-CREDENTIAL-MARKER-4f91c7"
 PRIVATE_HOST_URL = "https://192.168.1.100/internal/admin"
 CREDENTIAL_URL = "https://user:password@internal.example.com/data"
 UNSAFE_MARKERS = [
     SYNTHETIC_SECRET, SYNTHETIC_TOKEN, "secret-token-value",
-    "AKIAIOSFODNN7SECRET",
+    "AKIAIOSFODNN7SECRET", EXACT_CREDENTIAL_MARKER,
     PRIVATE_HOST_URL, "192.168.1.100", "user:password",
 ]
 
@@ -265,6 +266,24 @@ class TestRedactFunction:
         assert SYNTHETIC_TOKEN not in r
         assert "[REDACTED]" in r
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            f"Authorization: Bearer {EXACT_CREDENTIAL_MARKER}",
+            f"Authorization=Basic {EXACT_CREDENTIAL_MARKER}",
+            f"Cookie: session={EXACT_CREDENTIAL_MARKER}",
+            f"access-token={EXACT_CREDENTIAL_MARKER}",
+            f"client-secret={EXACT_CREDENTIAL_MARKER}",
+            f"Bearer {EXACT_CREDENTIAL_MARKER}",
+            f"Basic {EXACT_CREDENTIAL_MARKER}",
+        ],
+    )
+    def test_complete_common_credential_value_is_removed(self, value):
+        redacted = redact(value)
+
+        assert EXACT_CREDENTIAL_MARKER not in redacted
+        assert "[REDACTED]" in redacted
+
     @pytest.mark.parametrize("key", ["access_token", "client_secret"])
     def test_inline_actual_credential_names(self, key):
         r = redact(f"use {key}={SYNTHETIC_SECRET} now")
@@ -403,6 +422,31 @@ class TestS4ProvenanceSafeRedaction:
         assert "AKIAIOSFODNN7SECRET" not in _serialise(result)
         assert "format=csv" in result["url"]
 
+    def test_signed_url_credentials_are_removed_but_public_parts_survive(self):
+        url = (
+            "https://example.invalid/data.csv?format=csv&"
+            f"X-Amz-Credential={EXACT_CREDENTIAL_MARKER}&"
+            f"X-Amz-Signature={EXACT_CREDENTIAL_MARKER}&"
+            f"X-Amz-Security-Token={EXACT_CREDENTIAL_MARKER}#downloads"
+        )
+
+        result = redact({"url": url})["url"]
+
+        assert EXACT_CREDENTIAL_MARKER not in result
+        assert "format=csv" in result
+        assert result.endswith("#downloads")
+
+    def test_sensitive_fragment_pair_is_removed_without_losing_benign_fragment_state(self):
+        url = (
+            "https://example.invalid/public#"
+            f"access_token={EXACT_CREDENTIAL_MARKER}&state=public"
+        )
+
+        result = redact({"url": url})["url"]
+
+        assert EXACT_CREDENTIAL_MARKER not in result
+        assert result.endswith("#state=public")
+
     @pytest.mark.parametrize("key", ["access_token", "client_secret"])
     def test_actual_credential_mapping_names_are_redacted(self, key):
         assert redact({key: SYNTHETIC_SECRET})[key] == "[REDACTED]"
@@ -460,6 +504,92 @@ class TestS4ProvenanceSafeRedaction:
         _assert_no_secrets(_serialise(snapshot["manifest"]), context="manifest")
         _assert_no_secrets(
             _serialise(summary_as_json(summary)), context="summary"
+        )
+
+
+def test_exact_credential_marker_is_absent_from_every_sync_surface(tmp_path):
+    raw_record = _ckan_record_with_secret()
+    raw_record["notes"] = (
+        f"Authorization: Bearer {EXACT_CREDENTIAL_MARKER}"
+    )
+    raw_record["resources"][0]["url"] = (
+        "https://example.invalid/data.csv?download=true&"
+        f"X-Amz-Signature={EXACT_CREDENTIAL_MARKER}#downloads"
+    )
+    dataset, resources = _build_ds_secrets("nged", raw_record)
+    dataset.title = f"client-secret={EXACT_CREDENTIAL_MARKER}"
+    resources[0].description = f"Cookie: session={EXACT_CREDENTIAL_MARKER}"
+    dataset.resources = resources
+    dataset.classification_evidence = [
+        ClassificationEvidence(
+            id="nged:secret-dataset:lifecycle",
+            portal_id="nged",
+            source_dataset_id="secret-dataset",
+            classification="lifecycle_status",
+            evidence=f"access-token={EXACT_CREDENTIAL_MARKER}",
+            confidence=EvidenceConfidence.high,
+            source_value="active",
+            observed_at=NOW,
+            raw_record={"cookie": f"session={EXACT_CREDENTIAL_MARKER}"},
+        )
+    ]
+    result = CatalogueFetchResult(
+        portal_id="nged",
+        observed_at=NOW,
+        datasets=[dataset],
+        resources=resources,
+        expected_count=1,
+        complete=True,
+        warnings=[f"Authorization: Basic {EXACT_CREDENTIAL_MARKER}"],
+        raw_pages=[{"raw": raw_record}],
+    )
+
+    def fake_fetch(portal, client, observed_at):
+        return result
+
+    db = tmp_path / "catalogue.sqlite3"
+    snapshot_dir = tmp_path / "snapshots"
+    queue = tmp_path / "cache" / "review-queue.json"
+    policy = Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json"
+    summary = sync_catalogues(
+        ["nged"],
+        lambda portal: _SyncClient("nged"),
+        db,
+        snapshot_dir,
+        NOW,
+        fetcher=fake_fetch,
+        review_queue_path=queue,
+        policy_path=policy,
+    )
+
+    surfaces = {
+        "snapshot": summary.portals["nged"].snapshot_path.read_text("utf-8"),
+        "manifest": _serialise(
+            json.loads(
+                summary.portals["nged"].snapshot_path.read_text("utf-8")
+            )["manifest"]
+        ),
+        "summary": _serialise(summary_as_json(summary)),
+        "queue": queue.read_text("utf-8"),
+    }
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        for table in (
+            "catalogue_observations",
+            "catalogue_datasets",
+            "catalogue_resources",
+            "classification_evidence",
+            "catalogue_assessments",
+        ):
+            surfaces[f"database:{table}"] = _serialise(
+                [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]
+            )
+
+    for name, text in surfaces.items():
+        assert EXACT_CREDENTIAL_MARKER not in text, (
+            f"exact credential marker leaked through {name}"
         )
 
 
@@ -571,11 +701,19 @@ def test_live_portal(portal_id):
     finally:
         client.close()
     assert result.portal_id == portal_id
-    assert len(result.datasets) >= 0
-    assert len(result.resources) >= 0
-    if result.expected_count is not None:
-        assert result.expected_count >= 0
-    assert isinstance(result.complete, bool)
-    if result.complete:
-        assert result.expected_count is not None
-        assert len(result.datasets) >= result.expected_count
+    assert result.complete is True, (
+        f"{portal_id} catalogue was partial; warnings={list(result.warnings)!r}"
+    )
+    assert result.expected_count is not None, (
+        f"{portal_id} complete result omitted expected_count; "
+        f"warnings={list(result.warnings)!r}"
+    )
+    usable_ids = [dataset.source_dataset_id for dataset in result.datasets]
+    assert len(usable_ids) == len(set(usable_ids)), (
+        f"{portal_id} returned duplicate usable dataset IDs; "
+        f"warnings={list(result.warnings)!r}"
+    )
+    assert len(usable_ids) == result.expected_count, (
+        f"{portal_id} unique usable count {len(usable_ids)} did not match "
+        f"expected_count {result.expected_count}; warnings={list(result.warnings)!r}"
+    )

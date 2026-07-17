@@ -101,8 +101,61 @@ def _upsert_dataset(
 ) -> None:
     dataset_key = _dataset_key(dataset.portal_id, dataset.source_dataset_id)
     observed_at = _timestamp(dataset.observed_at)
+    nullable_fields = (
+        "title",
+        "description",
+        "publisher",
+        "licence",
+        "portal_url",
+        "api_url",
+        "source_created_at",
+        "source_updated_at",
+        "licence_identifier",
+        "licence_title",
+        "licence_url",
+        "attribution",
+        "catalogue_page_url",
+        "metadata_api_url",
+        "declared_update_frequency",
+        "declared_update_frequency_text",
+    )
+    nullable_updates = ",\n               ".join(
+        f"{field} = "
+        + (
+            f"COALESCE(excluded.{field}, {field})"
+            if preserve_missing
+            else f"excluded.{field}"
+        )
+        for field in nullable_fields
+    )
+    if preserve_missing:
+        state_updates = """lifecycle_status = CASE
+                   WHEN excluded.lifecycle_status = 'unknown' THEN lifecycle_status
+                   ELSE excluded.lifecycle_status END,
+               publication_pattern = CASE
+                   WHEN excluded.publication_pattern = 'unknown' THEN publication_pattern
+                   ELSE excluded.publication_pattern END,
+               access_status = CASE
+                   WHEN excluded.access_status = 'unknown' THEN access_status
+                   ELSE excluded.access_status END,
+               tags_json = CASE
+                   WHEN excluded.tags_json = '[]' THEN tags_json
+                   ELSE excluded.tags_json END,
+               raw_record_json = CASE
+                   WHEN excluded.raw_record_json = '{}' THEN raw_record_json
+                   ELSE excluded.raw_record_json END,
+               themes_json = CASE
+                   WHEN excluded.themes_json = '[]' THEN themes_json
+                   ELSE excluded.themes_json END"""
+    else:
+        state_updates = """lifecycle_status = excluded.lifecycle_status,
+               publication_pattern = excluded.publication_pattern,
+               access_status = excluded.access_status,
+               tags_json = excluded.tags_json,
+               raw_record_json = excluded.raw_record_json,
+               themes_json = excluded.themes_json"""
     conn.execute(
-        """INSERT INTO catalogue_datasets (
+        f"""INSERT INTO catalogue_datasets (
                dataset_key, portal_id, source_dataset_id, source_record_id, title,
                description, publisher, licence, portal_url, api_url,
                source_created_at, source_updated_at, lifecycle_status,
@@ -114,40 +167,8 @@ def _upsert_dataset(
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(dataset_key) DO UPDATE SET
                source_record_id = excluded.source_record_id,
-               title = COALESCE(excluded.title, title),
-               description = COALESCE(excluded.description, description),
-               publisher = COALESCE(excluded.publisher, publisher),
-               licence = COALESCE(excluded.licence, licence),
-               portal_url = COALESCE(excluded.portal_url, portal_url),
-               api_url = COALESCE(excluded.api_url, api_url),
-               source_created_at = COALESCE(excluded.source_created_at, source_created_at),
-               source_updated_at = COALESCE(excluded.source_updated_at, source_updated_at),
-               lifecycle_status = CASE
-                   WHEN ? AND excluded.lifecycle_status = 'unknown' THEN lifecycle_status
-                   ELSE excluded.lifecycle_status END,
-               publication_pattern = CASE
-                   WHEN ? AND excluded.publication_pattern = 'unknown' THEN publication_pattern
-                   ELSE excluded.publication_pattern END,
-               access_status = CASE
-                   WHEN ? AND excluded.access_status = 'unknown' THEN access_status
-                   ELSE excluded.access_status END,
-               tags_json = CASE
-                   WHEN ? AND excluded.tags_json = '[]' THEN tags_json
-                   ELSE excluded.tags_json END,
-               raw_record_json = CASE
-                   WHEN ? AND excluded.raw_record_json = '{}' THEN raw_record_json
-                   ELSE excluded.raw_record_json END,
-               licence_identifier = COALESCE(excluded.licence_identifier, licence_identifier),
-               licence_title = COALESCE(excluded.licence_title, licence_title),
-               licence_url = COALESCE(excluded.licence_url, licence_url),
-               attribution = COALESCE(excluded.attribution, attribution),
-               themes_json = CASE
-                   WHEN ? AND excluded.themes_json = '[]' THEN themes_json
-                   ELSE excluded.themes_json END,
-               catalogue_page_url = COALESCE(excluded.catalogue_page_url, catalogue_page_url),
-               metadata_api_url = COALESCE(excluded.metadata_api_url, metadata_api_url),
-               declared_update_frequency = COALESCE(excluded.declared_update_frequency, declared_update_frequency),
-               declared_update_frequency_text = COALESCE(excluded.declared_update_frequency_text, declared_update_frequency_text),
+               {nullable_updates},
+               {state_updates},
                last_seen_at = excluded.last_seen_at,
                last_observation_id = excluded.last_observation_id""",
         (
@@ -180,12 +201,6 @@ def _upsert_dataset(
             dataset.metadata_api_url,
             dataset.declared_update_frequency,
             dataset.declared_update_frequency_text,
-            preserve_missing,
-            preserve_missing,
-            preserve_missing,
-            preserve_missing,
-            preserve_missing,
-            preserve_missing,
         ),
     )
 
@@ -198,8 +213,33 @@ def _upsert_resource(
     preserve_missing: bool,
 ) -> None:
     seen_at = _timestamp(resource.observed_at or observed_at)
+    nullable_fields = (
+        "name",
+        "description",
+        "url",
+        "format",
+        "media_type",
+        "size_bytes",
+        "source_created_at",
+        "source_updated_at",
+    )
+    nullable_updates = ",\n               ".join(
+        f"{field} = "
+        + (
+            f"COALESCE(excluded.{field}, {field})"
+            if preserve_missing
+            else f"excluded.{field}"
+        )
+        for field in nullable_fields
+    )
+    raw_update = (
+        "CASE WHEN excluded.raw_record_json = '{}' "
+        "THEN raw_record_json ELSE excluded.raw_record_json END"
+        if preserve_missing
+        else "excluded.raw_record_json"
+    )
     conn.execute(
-        """INSERT INTO catalogue_resources (
+        f"""INSERT INTO catalogue_resources (
                resource_key, dataset_key, portal_id, source_dataset_id,
                source_resource_id, name, description, url, format, media_type,
                size_bytes, source_created_at, source_updated_at, raw_record_json,
@@ -207,17 +247,8 @@ def _upsert_resource(
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(resource_key) DO UPDATE SET
                source_resource_id = excluded.source_resource_id,
-               name = COALESCE(excluded.name, name),
-               description = COALESCE(excluded.description, description),
-               url = COALESCE(excluded.url, url),
-               format = COALESCE(excluded.format, format),
-               media_type = COALESCE(excluded.media_type, media_type),
-               size_bytes = COALESCE(excluded.size_bytes, size_bytes),
-               source_created_at = COALESCE(excluded.source_created_at, source_created_at),
-               source_updated_at = COALESCE(excluded.source_updated_at, source_updated_at),
-               raw_record_json = CASE
-                   WHEN ? AND excluded.raw_record_json = '{}' THEN raw_record_json
-                   ELSE excluded.raw_record_json END,
+               {nullable_updates},
+               raw_record_json = {raw_update},
                last_seen_at = excluded.last_seen_at,
                last_observation_id = excluded.last_observation_id""",
         (
@@ -238,7 +269,6 @@ def _upsert_resource(
             seen_at,
             seen_at,
             observation_id,
-            preserve_missing,
         ),
     )
 
@@ -250,8 +280,24 @@ def _upsert_evidence(
     preserve_missing: bool,
 ) -> None:
     source_value_json = None if evidence.source_value is None else _json(evidence.source_value)
+    if preserve_missing:
+        evidence_updates = """confidence = CASE
+                   WHEN excluded.confidence = 'unknown' THEN confidence
+                   ELSE excluded.confidence END,
+               source_value_json = COALESCE(excluded.source_value_json, source_value_json),
+               source_url = COALESCE(excluded.source_url, source_url),
+               observed_at = COALESCE(excluded.observed_at, observed_at),
+               raw_record_json = CASE
+                   WHEN excluded.raw_record_json = '{}' THEN raw_record_json
+                   ELSE excluded.raw_record_json END"""
+    else:
+        evidence_updates = """confidence = excluded.confidence,
+               source_value_json = excluded.source_value_json,
+               source_url = excluded.source_url,
+               observed_at = excluded.observed_at,
+               raw_record_json = excluded.raw_record_json"""
     conn.execute(
-        """INSERT INTO classification_evidence (
+        f"""INSERT INTO classification_evidence (
                evidence_key, dataset_key, portal_id, source_dataset_id,
                source_evidence_id, classification, evidence, confidence,
                source_value_json, source_url, observed_at, raw_record_json,
@@ -260,15 +306,7 @@ def _upsert_evidence(
            ON CONFLICT(evidence_key) DO UPDATE SET
                classification = excluded.classification,
                evidence = excluded.evidence,
-               confidence = CASE
-                   WHEN ? AND excluded.confidence = 'unknown' THEN confidence
-                   ELSE excluded.confidence END,
-               source_value_json = COALESCE(excluded.source_value_json, source_value_json),
-               source_url = COALESCE(excluded.source_url, source_url),
-               observed_at = COALESCE(excluded.observed_at, observed_at),
-               raw_record_json = CASE
-                   WHEN ? AND excluded.raw_record_json = '{}' THEN raw_record_json
-                   ELSE excluded.raw_record_json END,
+               {evidence_updates},
                last_observation_id = excluded.last_observation_id""",
         (
             _evidence_key(evidence),
@@ -284,10 +322,54 @@ def _upsert_evidence(
             _timestamp(evidence.observed_at),
             _json(evidence.raw_record),
             observation_id,
-            preserve_missing,
-            preserve_missing,
         ),
     )
+
+
+def _validate_result_associations(result: CatalogueFetchResult) -> None:
+    """Validate the complete nested provenance graph before any database write."""
+    datasets: dict[str, CatalogueDataset] = {}
+    nested_resource_keys: set[str] = set()
+    for dataset in result.datasets:
+        if dataset.portal_id != result.portal_id:
+            raise ValueError("dataset association portal does not match fetch result")
+        if dataset.source_dataset_id in datasets:
+            raise ValueError("duplicate dataset association in fetch result")
+        datasets[dataset.source_dataset_id] = dataset
+        seen_evidence: set[str] = set()
+        for resource in dataset.resources:
+            if (
+                resource.portal_id != dataset.portal_id
+                or resource.source_dataset_id != dataset.source_dataset_id
+            ):
+                raise ValueError("nested resource association does not match parent dataset")
+            key = _resource_key(resource)
+            if key in nested_resource_keys:
+                raise ValueError("duplicate nested resource association in fetch result")
+            nested_resource_keys.add(key)
+        for evidence in dataset.classification_evidence:
+            if (
+                evidence.portal_id != dataset.portal_id
+                or evidence.source_dataset_id != dataset.source_dataset_id
+            ):
+                raise ValueError("nested evidence association does not match parent dataset")
+            key = _evidence_key(evidence)
+            if key in seen_evidence:
+                raise ValueError("duplicate nested evidence association in fetch result")
+            seen_evidence.add(key)
+
+    top_level_resource_keys: set[str] = set()
+    for resource in result.resources:
+        if resource.portal_id != result.portal_id:
+            raise ValueError("resource association portal does not match fetch result")
+        if resource.source_dataset_id not in datasets:
+            raise ValueError("resource must belong to a dataset in the same fetch result")
+        key = _resource_key(resource)
+        if key in top_level_resource_keys:
+            raise ValueError("duplicate top-level resource association in fetch result")
+        top_level_resource_keys.add(key)
+    if nested_resource_keys != top_level_resource_keys:
+        raise ValueError("nested and top-level resource associations must match")
 
 
 def persist_catalogue_result(
@@ -305,22 +387,42 @@ def persist_catalogue_result(
     if effective_status not in {"complete", "partial", "failed"}:
         raise ValueError(f"unsupported catalogue observation status: {effective_status}")
 
+    _validate_result_associations(result)
     observation_id = observation_key(result.portal_id, result.observed_at, content_hash)
-    preserve_missing = effective_status != "complete"
+    preserve_missing = effective_status == "partial"
     conn.execute("SAVEPOINT persist_catalogue_result")
     try:
         _upsert_observation(conn, observation_id, result, snapshot_path, content_hash, effective_status)
+        if effective_status == "failed":
+            conn.execute("RELEASE SAVEPOINT persist_catalogue_result")
+            return PersistResult(
+                observation_id,
+                len(result.datasets),
+                len(result.resources),
+            )
         for dataset in result.datasets:
-            if dataset.portal_id != result.portal_id:
-                raise ValueError("dataset portal_id does not match fetch result")
             _upsert_dataset(conn, observation_id, dataset, preserve_missing)
         for resource in result.resources:
-            if resource.portal_id != result.portal_id:
-                raise ValueError("resource portal_id does not match fetch result")
             _upsert_resource(conn, observation_id, resource, result.observed_at, preserve_missing)
         for dataset in result.datasets:
             for evidence in dataset.classification_evidence:
                 _upsert_evidence(conn, observation_id, evidence, preserve_missing)
+        if effective_status == "complete":
+            for dataset in result.datasets:
+                dataset_key = _dataset_key(
+                    dataset.portal_id,
+                    dataset.source_dataset_id,
+                )
+                conn.execute(
+                    """DELETE FROM catalogue_resources
+                       WHERE dataset_key = ? AND last_observation_id <> ?""",
+                    (dataset_key, observation_id),
+                )
+                conn.execute(
+                    """DELETE FROM classification_evidence
+                       WHERE dataset_key = ? AND last_observation_id <> ?""",
+                    (dataset_key, observation_id),
+                )
     except Exception:
         conn.execute("ROLLBACK TO SAVEPOINT persist_catalogue_result")
         conn.execute("RELEASE SAVEPOINT persist_catalogue_result")

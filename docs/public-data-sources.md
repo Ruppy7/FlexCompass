@@ -38,7 +38,9 @@ Outputs (all git-ignored): SQLite registry at
 `../data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
 `../data/cache/catalogue/review-queue.json`. Snapshots are atomic and immutable.
 Failed portals do not alter the registry. Partial observations update the
-registry conservatively without erasing known source facts.
+registry conservatively without erasing missing source facts. Complete
+observations clear withdrawn current facts and reconcile obsolete resources and
+classification evidence for the datasets they contain.
 
 ### Diff
 
@@ -51,7 +53,10 @@ python -m app.catalogue_cli diff \
 ```
 
 Changes: `dataset_added`, `dataset_removed`, `metadata_changed`,
-`resources_replaced`, `access_changed`.
+`source_evidence_changed`, `resources_replaced`, `access_changed`. Snapshot
+schema, manifest semantics, unique usable counts, and content hashes are
+validated before comparison. A partial snapshot never produces a definitive
+dataset-removal claim.
 
 ### Review queue
 
@@ -74,11 +79,13 @@ confidence (`high`, `medium`, `low`, `unknown`). Unknown values are preserved.
   `unknown`.
 - **Maintenance state**: `on_schedule`, `possibly_overdue`, `stale`,
   `expected_dormant`, `unknown`. Stale = active + periodic + cadence observed +
-  latest data age exceeds cadence x grace multiplier. Static, archive, and
-  event-driven datasets with compatible lifecycle evidence are
-  `expected_dormant`. Refresh cadence and stale
-  classification are evidence-backed and preserve unknowns rather than inferred
-  from absent evidence.
+  defensible latest data age exceeds cadence x grace multiplier. A non-unknown
+  periodic maintenance result requires explicit active-lifecycle evidence plus
+  a freshness clock with field-level provenance. A resource `last_modified`
+  value can be such a clock; generic resource `metadata_modified` cannot.
+  Static, archive, and event-driven datasets with compatible lifecycle evidence
+  are `expected_dormant`. Adapters preserve unknown lifecycle/access when no
+  explicit verified evidence is available.
 
 ## Provenance and secret redaction
 
@@ -88,7 +95,9 @@ classifier assessments) support deduplication. Benign public URL query
 parameters are retained. All
 artifacts are redacted of: authentication keys (`authorization`, `token`,
 `api_key`, `secret`, `password`, `credential`, `cookie`), inline credential
-patterns, private-host URLs, and credential-bearing URLs.
+patterns, Basic/Bearer values, private-host URLs, credential-bearing URLs, and
+common signed-URL credentials/signatures/security tokens. Benign URL fragments
+are retained; credential-bearing fragment pairs are removed selectively.
 
 ## Limitations
 
@@ -98,4 +107,6 @@ Counts and metadata are dated observations, not stable facts. Licence and
 attribution must be verified before redistributing source data.
 
 Live portal tests are opt-in via `FLEXCOMPASS_LIVE_PORTAL_TESTS=1`; seven
-parametrized cases are skipped by default with zero network calls.
+parametrized cases are skipped by default with zero network calls. Enabled cases
+require complete observations and an exact match between expected count and
+unique usable dataset IDs.

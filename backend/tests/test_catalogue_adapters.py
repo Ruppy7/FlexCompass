@@ -9,10 +9,22 @@ from typing import Any
 
 import pytest
 from app.catalogue_adapters import fetch_catalogue
-from app.catalogue_models import CATALOGUE_PORTALS, CataloguePortalConfig, PortalPlatform
+from app.catalogue_classifier import classify_dataset, load_policy
+from app.catalogue_models import (
+    CATALOGUE_PORTALS,
+    AccessStatus,
+    CataloguePortalConfig,
+    ClassificationEvidence,
+    EvidenceConfidence,
+    LifecycleStatus,
+    MaintenanceState,
+    PortalPlatform,
+    PublicationPattern,
+)
 
 OBSERVED_AT = datetime(2026, 7, 16, tzinfo=timezone.utc)
 FIXTURES = Path(__file__).parent / "fixtures" / "catalogue"
+POLICY_PATH = Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json"
 
 
 class FakeResponse:
@@ -169,6 +181,106 @@ def test_repeated_page_is_incomplete_and_bounded():
     assert result.complete is False
     assert len(client.requests) == 2
     assert "repeated" in " ".join(result.warnings).casefold()
+
+
+@pytest.mark.parametrize(
+    ("portal_id", "page_factory", "id_field"),
+    [
+        ("nged", ckan_page, "name"),
+        ("spen", ods_page, "dataset_id"),
+    ],
+)
+def test_duplicate_dataset_ids_are_retained_once_and_mark_result_partial(
+    portal_id: str,
+    page_factory,
+    id_field: str,
+):
+    first = {id_field: "duplicate-id"}
+    second = {id_field: "duplicate-id"}
+
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS[portal_id],
+        FakeClient([page_factory(first, second, count=2)]),
+        OBSERVED_AT,
+    )
+
+    assert [item.source_dataset_id for item in result.datasets] == ["duplicate-id"]
+    assert result.complete is False
+    assert any("duplicate" in warning.casefold() for warning in result.warnings)
+
+
+def test_unique_usable_dataset_count_must_exactly_match_reported_count():
+    records = [{"name": f"dataset-{index}"} for index in range(3)]
+
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS["nged"],
+        FakeClient([ckan_page(*records, count=2)]),
+        OBSERVED_AT,
+    )
+
+    assert len(result.datasets) == 3
+    assert result.complete is False
+    assert any("unique usable" in warning.casefold() for warning in result.warnings)
+
+
+@pytest.mark.parametrize(
+    ("portal_id", "fixture_name", "page_factory", "resource_field"),
+    [
+        ("nged", "ckan_page.json", ckan_page, "resources"),
+        ("spen", "ods_page.json", ods_page, "attachments"),
+    ],
+)
+def test_malformed_resource_collection_keeps_dataset_but_marks_result_partial(
+    portal_id: str,
+    fixture_name: str,
+    page_factory,
+    resource_field: str,
+):
+    payload = fixture(fixture_name)
+    record = payload.get("results", payload.get("result", {}).get("results"))[0]
+    record[resource_field] = {"not": "a list"}
+
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS[portal_id],
+        FakeClient([page_factory(record, count=1)]),
+        OBSERVED_AT,
+    )
+
+    assert len(result.datasets) == 1
+    assert result.resources == []
+    assert result.complete is False
+    assert any("resource" in warning.casefold() for warning in result.warnings)
+
+
+@pytest.mark.parametrize(
+    ("portal_id", "fixture_name", "page_factory", "resource_field"),
+    [
+        ("nged", "ckan_page.json", ckan_page, "resources"),
+        ("spen", "ods_page.json", ods_page, "attachments"),
+    ],
+)
+def test_malformed_resource_item_is_dropped_with_valid_sibling_retained(
+    portal_id: str,
+    fixture_name: str,
+    page_factory,
+    resource_field: str,
+):
+    payload = fixture(fixture_name)
+    record = payload.get("results", payload.get("result", {}).get("results"))[0]
+    valid_resource = record[resource_field][0]
+    record[resource_field] = [valid_resource, "not-a-resource-mapping"]
+
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS[portal_id],
+        FakeClient([page_factory(record, count=1)]),
+        OBSERVED_AT,
+    )
+
+    assert len(result.datasets) == 1
+    assert len(result.resources) == 1
+    assert result.resources[0].raw_record == valid_resource
+    assert result.complete is False
+    assert any("resource" in warning.casefold() for warning in result.warnings)
 
 
 def test_max_pages_is_incomplete_and_bounded():
@@ -449,6 +561,104 @@ def test_s5_ambiguous_frequency_preserves_text_without_canonical_evidence():
     assert dataset.declared_update_frequency is None
     assert dataset.declared_update_frequency_text == "Biweekly"
     assert dataset.classification_evidence == []
+
+
+@pytest.mark.parametrize(
+    ("declared", "canonical", "expected_pattern"),
+    [
+        ("continuous", "continuous", PublicationPattern.continuous),
+        ("realtime", "continuous", PublicationPattern.continuous),
+        ("real-time", "continuous", PublicationPattern.continuous),
+        ("event-driven", "event_driven", PublicationPattern.event_driven),
+        ("event driven", "event_driven", PublicationPattern.event_driven),
+        ("Annual", "annually", PublicationPattern.periodic),
+    ],
+)
+def test_declared_frequency_vocabulary_reaches_classifier_without_invented_facts(
+    declared: str,
+    canonical: str,
+    expected_pattern: PublicationPattern,
+):
+    record = fixture("ckan_page.json")["result"]["results"][0]
+    record["frequency"] = declared
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS["nged"],
+        FakeClient([ckan_page(record, count=1)]),
+        OBSERVED_AT,
+    )
+    dataset = result.datasets[0]
+
+    assessment = classify_dataset(
+        dataset,
+        result.resources,
+        dataset.classification_evidence,
+        load_policy(POLICY_PATH),
+        OBSERVED_AT,
+    )
+
+    assert dataset.declared_update_frequency == canonical
+    assert assessment.publication_pattern is expected_pattern
+    assert assessment.lifecycle is LifecycleStatus.unknown
+    assert assessment.access_status is AccessStatus.unknown
+    assert assessment.maintenance_state is MaintenanceState.unknown
+
+
+def test_adapter_clock_requires_last_modified_not_generic_metadata_modified():
+    record = fixture("ckan_page.json")["result"]["results"][0]
+    record["resources"][0].pop("last_modified", None)
+    record["resources"][0]["metadata_modified"] = "2026-01-03T12:00:00+00:00"
+
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS["nged"],
+        FakeClient([ckan_page(record, count=1)]),
+        OBSERVED_AT,
+    )
+
+    assert result.resources[0].source_updated_at is None
+
+
+def test_adapter_to_classifier_uses_explicit_lifecycle_and_provenanced_clock():
+    record = fixture("ckan_page.json")["result"]["results"][0]
+    record["frequency"] = "Weekly"
+    record["resources"][0]["last_modified"] = "2026-06-01T00:00:00+00:00"
+    result = fetch_catalogue(
+        CATALOGUE_PORTALS["nged"],
+        FakeClient([ckan_page(record, count=1)]),
+        OBSERVED_AT,
+    )
+    dataset = result.datasets[0]
+    lifecycle = ClassificationEvidence(
+        id="nged:one:verified-lifecycle",
+        portal_id="nged",
+        source_dataset_id="one",
+        classification="lifecycle_status",
+        evidence="The public source explicitly marks the dataset active.",
+        confidence=EvidenceConfidence.high,
+        source_value="active",
+        observed_at=OBSERVED_AT,
+    )
+
+    assessment = classify_dataset(
+        dataset,
+        result.resources,
+        [*dataset.classification_evidence, lifecycle],
+        load_policy(POLICY_PATH),
+        OBSERVED_AT,
+    )
+
+    assert assessment.lifecycle is LifecycleStatus.active
+    assert assessment.maintenance_state is MaintenanceState.stale
+    clock_evidence = [
+        item
+        for item in assessment.maintenance_evidence
+        if item.classification == "resource_data_updated_at"
+    ]
+    assert len(clock_evidence) == 1
+    assert "last_modified" in clock_evidence[0].evidence
+    assert clock_evidence[0].raw_record == {
+        "field": "last_modified",
+        "value": "2026-06-01T00:00:00+00:00",
+    }
 
 
 def test_s10_ods_rate_limit_pacing_between_pages_not_first():

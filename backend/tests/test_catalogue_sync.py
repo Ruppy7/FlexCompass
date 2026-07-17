@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -248,12 +249,45 @@ def test_content_hash_preserves_source_observation_clocks_in_raw_provenance(tmp_
     assert first.portals["nged"].content_hash != second.portals["nged"].content_hash
 
 
-def write_snapshot(path: Path, *datasets: CatalogueDataset) -> Path:
+def write_snapshot(
+    path: Path,
+    *datasets: CatalogueDataset,
+    portal_id: str | None = None,
+    complete: bool = True,
+) -> Path:
+    resolved_portal = portal_id or (
+        datasets[0].portal_id if datasets else "nged"
+    )
+    resources = [
+        resource.model_dump(mode="json")
+        for dataset in datasets
+        for resource in dataset.resources
+    ]
+    core = {
+        "datasets": [item.model_dump(mode="json") for item in datasets],
+        "resources": resources,
+        "raw_pages": [],
+    }
+    content_hash = hashlib.sha256(
+        catalogue_sync._canonical_json(
+            catalogue_sync._snapshot_identity(core)
+        )
+    ).hexdigest()
     path.write_text(
         json.dumps(
             {
-                "manifest": {"portal_id": datasets[0].portal_id if datasets else "nged"},
-                "datasets": [item.model_dump(mode="json") for item in datasets],
+                "manifest": {
+                    "adapter_version": "1",
+                    "schema_version": 1,
+                    "portal_id": resolved_portal,
+                    "portal_status": "complete" if complete else "partial",
+                    "dataset_count": len(datasets),
+                    "resource_count": len(resources),
+                    "expected_count": len(datasets) if complete else len(datasets) + 1,
+                    "complete": complete,
+                    "content_hash": content_hash,
+                },
+                **core,
             },
             sort_keys=True,
         ),
@@ -278,6 +312,7 @@ def test_diff_reports_dataset_metadata_resource_and_access_changes(tmp_path: Pat
         ("dataset_added", "added"),
         ("dataset_removed", "removed"),
         ("metadata_changed", "public-dataset"),
+        ("source_evidence_changed", "public-dataset"),
         ("resources_replaced", "public-dataset"),
         ("access_changed", "public-dataset"),
     }
@@ -301,6 +336,142 @@ def test_diff_rejects_snapshots_from_different_portals(tmp_path: Path):
     after = write_snapshot(tmp_path / "after.json", make_result("spen").datasets[0])
 
     with pytest.raises(ValueError, match="different portals"):
+        diff_snapshots(before, after)
+
+
+def test_diff_compares_complete_canonical_metadata_and_raw_schema_evidence(
+    tmp_path: Path,
+):
+    before_dataset = make_result("nged").datasets[0]
+    before_dataset.licence_identifier = "old-id"
+    before_dataset.licence_title = "Old licence"
+    before_dataset.licence_url = "https://example.invalid/old-licence"
+    before_dataset.attribution = "Old attribution"
+    before_dataset.themes = ["old-theme"]
+    before_dataset.catalogue_page_url = "https://example.invalid/old-page"
+    before_dataset.metadata_api_url = "https://example.invalid/old-api"
+    before_dataset.declared_update_frequency = "weekly"
+    before_dataset.declared_update_frequency_text = "Weekly"
+    before_dataset.source_updated_at = NOW - timedelta(days=1)
+    before_dataset.raw_record = {"schema": {"fields": ["old-field"]}}
+    after_dataset = before_dataset.model_copy(deep=True)
+    after_dataset.licence_identifier = "new-id"
+    after_dataset.licence_title = "New licence"
+    after_dataset.licence_url = "https://example.invalid/new-licence"
+    after_dataset.attribution = "New attribution"
+    after_dataset.themes = ["new-theme"]
+    after_dataset.catalogue_page_url = "https://example.invalid/new-page"
+    after_dataset.metadata_api_url = "https://example.invalid/new-api"
+    after_dataset.declared_update_frequency = "annual"
+    after_dataset.declared_update_frequency_text = "Annual"
+    after_dataset.source_updated_at = NOW
+    after_dataset.raw_record = {"schema": {"fields": ["new-field"]}}
+
+    result = diff_snapshots(
+        write_snapshot(tmp_path / "before.json", before_dataset),
+        write_snapshot(tmp_path / "after.json", after_dataset),
+    )
+
+    changes = {change.kind: change for change in result.changes}
+    assert {"metadata_changed", "source_evidence_changed"} <= changes.keys()
+    assert set(changes["metadata_changed"].before) == {
+        "title",
+        "description",
+        "publisher",
+        "licence",
+        "licence_identifier",
+        "licence_title",
+        "licence_url",
+        "attribution",
+        "themes",
+        "catalogue_page_url",
+        "metadata_api_url",
+        "declared_update_frequency",
+        "declared_update_frequency_text",
+        "portal_url",
+        "api_url",
+        "source_created_at",
+        "source_updated_at",
+        "lifecycle_status",
+        "publication_pattern",
+        "tags",
+    }
+    assert changes["source_evidence_changed"].before["raw_record"] == {
+        "schema": {"fields": ["old-field"]}
+    }
+
+
+def test_diff_does_not_report_definitive_removal_from_partial_snapshot(
+    tmp_path: Path,
+):
+    before = write_snapshot(
+        tmp_path / "before.json",
+        make_result("nged", source_id="possibly-present").datasets[0],
+    )
+    after = write_snapshot(
+        tmp_path / "after.json",
+        portal_id="nged",
+        complete=False,
+    )
+
+    result = diff_snapshots(before, after)
+
+    assert not any(change.kind == "dataset_removed" for change in result.changes)
+
+
+def test_diff_compares_resources_and_evidence_order_insensitively(tmp_path: Path):
+    first = make_result("nged").datasets[0]
+    second_resource = first.resources[0].model_copy(
+        update={
+            "id": "nged:resource-two",
+            "name": "JSON",
+            "url": "https://example.invalid/public.json",
+            "format": "JSON",
+        }
+    )
+    first.resources.append(second_resource)
+    second_evidence = first.classification_evidence[0].model_copy(
+        update={"id": "nged:public-dataset:access-two"}
+    )
+    first.classification_evidence.append(second_evidence)
+    reordered = first.model_copy(deep=True)
+    reordered.resources.reverse()
+    reordered.classification_evidence.reverse()
+
+    result = diff_snapshots(
+        write_snapshot(tmp_path / "before.json", first),
+        write_snapshot(tmp_path / "after.json", reordered),
+    )
+
+    assert result.changes == ()
+
+
+@pytest.mark.parametrize(
+    ("manifest_field", "invalid_value", "message"),
+    [
+        ("schema_version", 999, "schema version"),
+        ("content_hash", "not-the-content-hash", "content hash"),
+    ],
+)
+def test_diff_rejects_invalid_snapshot_semantics(
+    tmp_path: Path,
+    manifest_field: str,
+    invalid_value,
+    message: str,
+):
+    before = write_snapshot(
+        tmp_path / "before.json",
+        make_result("nged").datasets[0],
+    )
+    after = write_snapshot(
+        tmp_path / "after.json",
+        make_result("nged").datasets[0],
+    )
+    payload = json.loads(after.read_text(encoding="utf-8"))
+    payload["manifest"][manifest_field] = invalid_value
+    after.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
         diff_snapshots(before, after)
 
 
