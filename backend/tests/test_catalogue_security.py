@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 from app.catalogue_adapters import CatalogueFetchResult, fetch_catalogue
 from app.catalogue_cli import build_parser
-from app.catalogue_cli import main as cli_main
 from app.catalogue_models import (
     CATALOGUE_PORTALS,
     CatalogueDataset,
@@ -158,13 +157,17 @@ class _RecClient:
 
 
 def _build_ds_secrets(portal_id, raw_record):
+    candidates = raw_record.get("resources") or raw_record.get("attachments") or []
+    resource_raw = dict(candidates[0]) if candidates and isinstance(candidates[0], dict) else {}
+    resource_url = resource_raw.get("url") or f"https://example.invalid/data.csv?{SYNTHETIC_API_KEY}"
+    resource_raw.setdefault("url", resource_url)
+    resource_raw.setdefault("token", SYNTHETIC_TOKEN)
     res = DatasetResource(
         id=f"{portal_id}:secret-resource", portal_id=portal_id,
         source_dataset_id="secret-dataset", name="CSV",
-        url=f"https://example.invalid/data.csv?{SYNTHETIC_API_KEY}",
+        url=resource_url,
         format="CSV", observed_at=NOW,
-        raw_record={"url": f"https://example.invalid/data.csv?{SYNTHETIC_API_KEY}",
-                     "token": SYNTHETIC_TOKEN})
+        raw_record=resource_raw)
     ev = ClassificationEvidence(
         id=f"{portal_id}:secret-dataset:access", portal_id=portal_id,
         source_dataset_id="secret-dataset", classification="access_status",
@@ -240,7 +243,11 @@ class TestRedactFunction:
         assert redact({"secret": SYNTHETIC_SECRET})["secret"] == "[REDACTED]"
 
     def test_credential_key(self):
-        assert redact({"credential_data": SYNTHETIC_SECRET})["credential_data"] == "[REDACTED]"
+        assert redact({"credential": SYNTHETIC_SECRET})["credential"] == "[REDACTED]"
+
+    def test_credential_substring_key_is_not_redacted(self):
+        # S4: sensitive key matching must not match substrings like 'credential_data'
+        assert redact({"credential_data": "benign value"})["credential_data"] == "benign value"
 
     def test_password_key(self):
         assert redact({"password": SYNTHETIC_SECRET})["password"] == "[REDACTED]"
@@ -258,6 +265,12 @@ class TestRedactFunction:
         assert SYNTHETIC_TOKEN not in r
         assert "[REDACTED]" in r
 
+    @pytest.mark.parametrize("key", ["access_token", "client_secret"])
+    def test_inline_actual_credential_names(self, key):
+        r = redact(f"use {key}={SYNTHETIC_SECRET} now")
+        assert SYNTHETIC_SECRET not in r
+        assert f"{key}=[REDACTED]" in r
+
     def test_private_host_url(self):
         _assert_no_secrets(redact(f"at {PRIVATE_HOST_URL}"), context="private host")
 
@@ -269,31 +282,6 @@ class TestRedactFunction:
         assert r["a"]["authorization"] == "[REDACTED]"
         assert r["a"]["b"][0]["token"] == "[REDACTED]"
         assert r["a"]["b"][0]["ok"] == "v"
-
-
-class TestCLIRedaction:
-    def test_cli_sync_json_no_secrets(self, tmp_path, capsys):
-        ds, resources = _build_ds_secrets("nged", _ckan_record_with_secret())
-        result = CatalogueFetchResult(
-            portal_id="nged", observed_at=NOW, datasets=[ds],
-            resources=resources, expected_count=1, complete=True,
-            warnings=[], raw_pages=[{"raw": _ckan_record_with_secret()}])
-        import app.catalogue_cli as cc
-        import app.catalogue_sync as cs
-        orig_sync, orig_fac = cs.sync_catalogues, cc._client_factory
-        def ps(pids, cf, db, out, now, **kw):
-            return orig_sync(pids, cf, db, out, now, fetcher=lambda p, c, t: result, **kw)
-        def ff(portal): return _SyncClient("nged")
-        cc._client_factory = ff
-        try:
-            cli_main(["sync", "--portal", "nged",
-                "--db-path", str(tmp_path / "c.sqlite3"),
-                "--output-dir", str(tmp_path / "s"),
-                "--review-queue-path", str(tmp_path / "q.json"),
-                "--policy-path", str(Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json")])
-        finally:
-            cc._client_factory = orig_fac
-        _assert_no_secrets(capsys.readouterr().out, context="CLI JSON")
 
 
 class TestSummaryJSONRedaction:
@@ -364,28 +352,6 @@ class TestCLIReadOnly:
     def test_subcommands(self):
         assert set(build_parser()._subparsers._group_actions[0].choices) == {"sync", "diff", "review-queue"}
 
-    def test_sync_read_only_help(self):
-        # The sync subparser help text is set via add_parser(help=...)
-        # Check that it mentions read-only or anonymous access
-        import contextlib
-        import io
-        parser = build_parser()
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try:
-                parser.parse_args(["--help"])
-            except SystemExit:
-                pass
-        output = buf.getvalue().lower()
-        # Check sync subparser is present and has read-only language
-        assert "sync" in output
-        # Alternative: check the subparser's help attribute directly
-        sync_action = parser._subparsers._group_actions[0]
-        sync_parser = sync_action.choices["sync"]
-        # Just verify the subparser exists and is functional
-        assert sync_parser is not None
-
-
 class TestDBRedaction:
     def test_observations_no_secrets(self, tmp_path):
         import sqlite3
@@ -408,6 +374,186 @@ class TestDBRedaction:
                 _assert_no_secrets(_serialise(dict(row)), context="ds row")
         finally:
             conn.close()
+
+
+class TestS4ProvenanceSafeRedaction:
+    """S4: Provenance-safe redaction tests."""
+
+    def test_secretariat_key_is_not_redacted(self):
+        """S4: 'secretariat' is not a credential name; should not be redacted."""
+        result = redact({"secretariat": "public body name"})
+        assert result["secretariat"] == "public body name"
+
+    def test_tokenized_fields_key_is_not_redacted(self):
+        """S4: 'tokenized_fields' is not a credential name; should not be redacted."""
+        result = redact({"tokenized_fields": ["field1", "field2"]})
+        assert result["tokenized_fields"] == ["field1", "field2"]
+
+    def test_benign_url_query_params_preserved(self):
+        """S4: Benign query parameters in public download URLs are preserved."""
+        url = "https://example.invalid/data.csv?format=csv&download=true"
+        result = redact({"url": url})
+        assert "format=csv" in result["url"]
+        assert "download=true" in result["url"]
+
+    def test_sensitive_url_query_params_removed(self):
+        """S4: Sensitive query parameters are removed from URLs."""
+        url = f"https://example.invalid/data.csv?{SYNTHETIC_API_KEY}&format=csv"
+        result = redact({"url": url})
+        assert "AKIAIOSFODNN7SECRET" not in _serialise(result)
+        assert "format=csv" in result["url"]
+
+    @pytest.mark.parametrize("key", ["access_token", "client_secret"])
+    def test_actual_credential_mapping_names_are_redacted(self, key):
+        assert redact({key: SYNTHETIC_SECRET})[key] == "[REDACTED]"
+
+    def test_snapshot_preserves_benign_raw_record(self, tmp_path):
+        """S4: Snapshot preserves benign raw_record fields."""
+        record = _ckan_record_with_secret()
+        record["secretariat"] = "public body"
+        record["tokenized_fields"] = ["field1"]
+        summary, db, q = _run_sync(tmp_path, "nged", record)
+        snapshot = summary.portals["nged"].snapshot_path
+        data = json.loads(snapshot.read_text(encoding="utf-8"))
+        dataset = data["datasets"][0]
+        raw = dataset["raw_record"]
+        assert raw.get("secretariat") == "public body"
+        assert raw.get("tokenized_fields") == ["field1"]
+
+    def test_pipeline_preserves_benign_query_and_redacts_sensitive_query(self, tmp_path):
+        """S4: Snapshot and SQLite retain usable public URL provenance only."""
+        from urllib.parse import parse_qs, urlsplit
+
+        record = _ckan_record_with_secret()
+        public_url = (
+            "https://example.invalid/data.csv?delimiter=%3B&download=true&"
+            f"{SYNTHETIC_API_KEY}"
+        )
+        record["resources"][0]["url"] = public_url
+        record["secretariat"] = "public body"
+        record["tokenized_fields"] = ["field1"]
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot = json.loads(
+            summary.portals["nged"].snapshot_path.read_text(encoding="utf-8")
+        )
+        snapshot_url = snapshot["resources"][0]["url"]
+        snapshot_query = parse_qs(urlsplit(snapshot_url).query)
+        assert snapshot_query == {"delimiter": [";"], "download": ["true"]}
+        assert snapshot["datasets"][0]["raw_record"]["secretariat"] == "public body"
+        assert snapshot["datasets"][0]["raw_record"]["tokenized_fields"] == ["field1"]
+
+        import sqlite3
+
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+        assert parse_qs(urlsplit(stored_url).query) == {
+            "delimiter": [";"],
+            "download": ["true"],
+        }
+        assert parse_qs(urlsplit(json.loads(raw_json)["url"]).query) == {
+            "delimiter": [";"],
+            "download": ["true"],
+        }
+        _assert_no_secrets(_serialise(snapshot["manifest"]), context="manifest")
+        _assert_no_secrets(
+            _serialise(summary_as_json(summary)), context="summary"
+        )
+
+
+class TestQ1CLISecurityPath:
+    """Q1: CLI security path - secret-bearing result flows through CLI sync seam."""
+
+    def test_cli_sync_secret_result_is_redacted(self, tmp_path, capsys, monkeypatch):
+        """Q1: Secret-bearing fake result flows through CLI, exit 0, output redacted."""
+        db = tmp_path / "catalogue.sqlite3"
+        out = tmp_path / "snapshots"
+        q = tmp_path / "queue.json"
+        pol = Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json"
+
+        record = _ckan_record_with_secret()
+        result = CatalogueFetchResult(
+            portal_id="nged",
+            observed_at=NOW,
+            datasets=[
+                CatalogueDataset(
+                    id="nged:secret-dataset",
+                    portal_id="nged",
+                    source_dataset_id="secret-dataset",
+                    title="Public network dataset",
+                    observed_at=NOW,
+                    raw_record=record,
+                )
+            ],
+            resources=[],
+            expected_count=1,
+            complete=True,
+            warnings=[],
+            raw_pages=[record],
+        )
+
+        import app.catalogue_cli as catalogue_cli
+
+        consumed = False
+        real_sync = sync_catalogues
+
+        def fake_cli_sync(portal_ids, client_factory, db_path, output_dir, now, **kwargs):
+            nonlocal consumed
+
+            def fake_fetch(portal, client, observed_at):
+                nonlocal consumed
+                consumed = True
+                return result
+
+            return real_sync(
+                portal_ids,
+                client_factory,
+                db_path,
+                output_dir,
+                now,
+                fetcher=fake_fetch,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(catalogue_cli, "sync_catalogues", fake_cli_sync)
+        monkeypatch.setattr(
+            catalogue_cli, "_client_factory", lambda portal: _SyncClient("nged")
+        )
+        exit_code = catalogue_cli.main(
+            [
+                "sync",
+                "--portal",
+                "nged",
+                "--db-path",
+                str(db),
+                "--output-dir",
+                str(out),
+                "--review-queue-path",
+                str(q),
+                "--policy-path",
+                str(pol),
+            ]
+        )
+        text = capsys.readouterr().out
+        output = json.loads(text)
+        assert consumed is True
+        assert exit_code == 0
+        assert output["status"] == "complete"
+        assert output["portals"]["nged"]["status"] == "complete"
+        _assert_no_secrets(text, context="Q1 CLI summary")
+
+
+class TestQ2HelpTest:
+    """Q2: CLI help contains meaningful anonymous/read-only wording."""
+
+    def test_sync_help_mentions_read_only(self):
+        from app.catalogue_cli import build_parser
+        parser = build_parser()
+        sync_parser = parser._subparsers._group_actions[0].choices["sync"]
+        help_text = sync_parser.format_help().lower()
+        assert "read-only" in help_text or "anonymous" in help_text or "get" in help_text
 
 
 def _live_enabled():

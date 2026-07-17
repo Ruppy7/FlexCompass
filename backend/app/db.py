@@ -422,6 +422,21 @@ CREATE INDEX IF NOT EXISTS idx_classification_evidence_dataset
 CREATE INDEX IF NOT EXISTS idx_catalogue_assessments_dataset
     ON catalogue_assessments(dataset_key, assessed_at DESC);
 """),
+    # -- Migration 5: Additive canonical metadata and cadence fields --
+    (5, """
+BEGIN IMMEDIATE;
+ALTER TABLE catalogue_datasets ADD COLUMN licence_identifier TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN licence_title TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN licence_url TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN attribution TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN themes_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE catalogue_datasets ADD COLUMN catalogue_page_url TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN metadata_api_url TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN declared_update_frequency TEXT;
+ALTER TABLE catalogue_datasets ADD COLUMN declared_update_frequency_text TEXT;
+INSERT OR IGNORE INTO schema_version (version) VALUES (5);
+COMMIT;
+"""),
 ]
 
 

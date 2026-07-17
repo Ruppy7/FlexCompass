@@ -403,6 +403,8 @@ def _classify_maintenance(
             lifecycle.evidence,
             lifecycle.confidence,
         )
+    if lifecycle.value is not LifecycleStatus.active:
+        return _Dimension(MaintenanceState.unknown)
     if pattern.value in {
         PublicationPattern.event_driven,
         PublicationPattern.static_reference,

@@ -43,10 +43,14 @@ as JSON text. Generated snapshots, SQLite databases, caches, queues, and reports
 The catalogue layer adds observation-based records for public portal metadata:
 
 - `CatalogueDataset`: one public dataset with `source_dataset_id`, `raw_record`,
-  `observed_at`, classification evidence, lifecycle, publication pattern, and
-  access status. Resources are nested.
+  `observed_at`, declared update-frequency text, canonical public metadata,
+  classification evidence, and unknown-by-default source status fields.
+  Resources are nested.
 - `DatasetResource`: one downloadable resource with `source_dataset_id`,
   `raw_record`, `observed_at`, URL, format, and size.
+- `CatalogueObservation`: one portal-fetch observation with status, source
+  content hash, dataset/resource totals, pagination completeness, warnings,
+  and nullable request/response/retry facts.
 - `ClassificationEvidence`: one piece of evidence supporting a non-factual
   classification (lifecycle, pattern, access, maintenance) with confidence.
 
@@ -54,14 +58,16 @@ The catalogue layer adds observation-based records for public portal metadata:
 
 Each sync run produces a deterministic observation key derived from portal ID,
 observation timestamp, and content hash. The content hash is SHA-256 of the
-redacted snapshot core (with FlexCompass-generated clocks stripped).
+redacted source snapshot core (with FlexCompass-generated clocks stripped).
+Classifier assessments are persisted separately and do not affect immutable
+source snapshot identity.
 
 ### Atomic local artifacts
 
 Sync writes are atomic: a temporary file is written then renamed. If the
-snapshot already exists with identical content, no write occurs. Incomplete or
-partial portal results are isolated and never published as the last valid
-registry. A failed sync likewise preserves the last valid state.
+snapshot already exists with identical content, no write occurs. Failed portals
+do not alter the registry. Partial observations update conservatively without
+erasing known source facts.
 
 ### Secret redaction
 
@@ -71,12 +77,16 @@ All persisted and printed artifacts pass through `redact()`, which recursively:
   `[REDACTED]`
 - Replaces inline `key=value` credential patterns with `key=[REDACTED]`
 - Replaces private-host and credential-bearing URLs with `[REDACTED_URL]`
+- Removes sensitive query parameters while retaining benign parameters needed
+  by public download URLs
 
 ### Review queue
 
 The review queue tracks datasets with unknown classifications. Each item has a
 deterministic hash ID based on portal, dataset, dimension, and reason. The
-queue is replaceable (not immutable) and preserves items for failed portals.
+queue is replaceable (not immutable). A fresh complete or partial
+classification pass replaces that portal's items; failed and unrequested portal
+items are preserved.
 
 ### Dated observations
 

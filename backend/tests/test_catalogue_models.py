@@ -12,7 +12,6 @@ from app.catalogue_models import (
     DatasetResource,
     EvidenceConfidence,
     LifecycleStatus,
-    MaintenanceState,
     PortalPlatform,
     PublicationPattern,
 )
@@ -92,8 +91,8 @@ def test_canonical_classifications_default_to_unknown():
     observation = CatalogueObservation(
         id="nged:example:2026-07-16T00:00:00Z",
         portal_id="nged",
-        source_dataset_id="example",
         observed_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        status="complete",
     )
     evidence = ClassificationEvidence(
         id="nged:example:lifecycle-status",
@@ -106,7 +105,7 @@ def test_canonical_classifications_default_to_unknown():
     assert dataset.lifecycle_status is LifecycleStatus.unknown
     assert dataset.publication_pattern is PublicationPattern.unknown
     assert dataset.access_status is AccessStatus.unknown
-    assert observation.maintenance_state is MaintenanceState.unknown
+    assert observation.status == "complete"
     assert evidence.confidence is EvidenceConfidence.unknown
 
 
@@ -213,8 +212,8 @@ def test_observation_timestamps_are_normalised_to_utc():
     observation = CatalogueObservation(
         id="nged:example:observation",
         portal_id="nged",
-        source_dataset_id="example",
         observed_at=observed_at,
+        status="complete",
     )
 
     assert observation.observed_at == datetime(2026, 7, 16, 1, 0, tzinfo=timezone.utc)
@@ -226,6 +225,73 @@ def test_observation_timestamps_reject_naive_datetimes():
         CatalogueObservation(
             id="nged:example:observation",
             portal_id="nged",
-            source_dataset_id="example",
             observed_at=datetime(2026, 7, 16),
+            status="complete",
         )
+
+
+def test_s8_observation_contract_has_store_aligned_fields():
+    """S8: CatalogueObservation has status, content_hash, completeness, and nullable request facts."""
+    observation = CatalogueObservation(
+        id="nged:example:observation",
+        portal_id="nged",
+        observed_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        status="complete",
+    )
+    # Store-aligned fields with defaults
+    assert observation.status == "complete"
+    assert observation.complete is None
+    assert observation.content_hash is None
+    assert observation.expected_count is None
+    assert observation.dataset_count is None
+    assert observation.resource_count is None
+    assert observation.snapshot_path is None
+    assert observation.adapter_version is None
+    assert observation.schema_version is None
+    assert observation.request_class is None
+    # Nullable request/endpoint/response/elapsed/retry facts
+    assert observation.request_url is None
+    assert observation.endpoint is None
+    assert observation.response_status is None
+    assert observation.elapsed_seconds is None
+    assert observation.retry_count is None
+    assert observation.retry_outcome is None
+    assert observation.errors == []
+    assert observation.warnings == []
+
+
+def test_s8_observation_status_is_required_and_completeness_is_not_inferred():
+    """S8: Missing fetch status is invalid while unknown completeness stays null."""
+    with pytest.raises(ValidationError, match="status"):
+        CatalogueObservation(
+            id="nged:observation",
+            portal_id="nged",
+            observed_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        )
+
+    with pytest.raises(ValidationError, match="status"):
+        CatalogueObservation(
+            id="nged:observation",
+            portal_id="nged",
+            observed_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+            status="guessed",
+        )
+
+
+def test_s9_dataset_canonical_metadata_defaults_to_none():
+    """S9: New canonical metadata fields default to None/empty."""
+    dataset = CatalogueDataset(
+        id="nged:example",
+        portal_id="nged",
+        source_dataset_id="example",
+        observed_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    assert dataset.licence_identifier is None
+    assert dataset.licence_title is None
+    assert dataset.licence_url is None
+    assert dataset.attribution is None
+    assert dataset.themes == []
+    assert dataset.catalogue_page_url is None
+    assert dataset.metadata_api_url is None
+    assert dataset.declared_update_frequency is None
+    assert dataset.declared_update_frequency_text is None

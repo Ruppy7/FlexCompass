@@ -28,7 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(description="Synchronise and compare approved public catalogue metadata.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    sync = commands.add_parser("sync", help="Fetch public metadata with anonymous read-only GET requests.")
+    sync_description = "Fetch public metadata with anonymous read-only GET requests."
+    sync = commands.add_parser(
+        "sync",
+        help=sync_description,
+        description=sync_description,
+    )
     sync.add_argument("--portal", choices=("all", *CATALOGUE_PORTALS), default="all")
     sync.add_argument("--db-path", type=Path, default=ROOT / "data" / "cache" / "catalogue" / "registry.sqlite3")
     sync.add_argument("--output-dir", type=Path, default=ROOT / "data" / "snapshots" / "catalogues")

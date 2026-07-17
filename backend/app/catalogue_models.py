@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -131,6 +131,15 @@ class CatalogueDataset(_UtcTimestampModel):
     description: str | None = None
     publisher: str | None = None
     licence: str | None = None
+    licence_identifier: str | None = None
+    licence_title: str | None = None
+    licence_url: str | None = None
+    attribution: str | None = None
+    themes: list[str] = Field(default_factory=list)
+    catalogue_page_url: str | None = None
+    metadata_api_url: str | None = None
+    declared_update_frequency: str | None = None
+    declared_update_frequency_text: str | None = None
     portal_url: str | None = None
     api_url: str | None = None
     source_created_at: datetime | None = None
@@ -146,20 +155,29 @@ class CatalogueDataset(_UtcTimestampModel):
 
 
 class CatalogueObservation(_UtcTimestampModel):
-    """A time-stamped public observation of a portal dataset."""
+    """A time-stamped public observation of a portal fetch."""
 
     id: str
     portal_id: str
-    source_dataset_id: str
     observed_at: datetime
-    source_created_at: datetime | None = None
-    source_updated_at: datetime | None = None
-    record_count: int | None = None
+    status: Literal["complete", "partial", "failed"]
+    adapter_version: str | None = None
+    schema_version: int | None = None
+    content_hash: str | None = None
+    expected_count: int | None = None
+    dataset_count: int | None = None
     resource_count: int | None = None
-    maintenance_state: MaintenanceState = MaintenanceState.unknown
-    access_status: AccessStatus = AccessStatus.unknown
-    classification_evidence: list[ClassificationEvidence] = Field(default_factory=list)
-    raw_record: dict[str, Any] = Field(default_factory=dict)
+    complete: bool | None = None
+    snapshot_path: str | None = None
+    request_class: str | None = None
+    request_url: str | None = None
+    endpoint: str | None = None
+    response_status: int | None = None
+    elapsed_seconds: float | None = None
+    retry_count: int | None = None
+    retry_outcome: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 CATALOGUE_PORTALS: Mapping[str, CataloguePortalConfig] = MappingProxyType(

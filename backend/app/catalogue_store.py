@@ -107,8 +107,11 @@ def _upsert_dataset(
                description, publisher, licence, portal_url, api_url,
                source_created_at, source_updated_at, lifecycle_status,
                publication_pattern, access_status, tags_json, raw_record_json,
-               first_seen_at, last_seen_at, last_observation_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               first_seen_at, last_seen_at, last_observation_id,
+               licence_identifier, licence_title, licence_url, attribution,
+               themes_json, catalogue_page_url, metadata_api_url,
+               declared_update_frequency, declared_update_frequency_text
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(dataset_key) DO UPDATE SET
                source_record_id = excluded.source_record_id,
                title = COALESCE(excluded.title, title),
@@ -134,6 +137,17 @@ def _upsert_dataset(
                raw_record_json = CASE
                    WHEN ? AND excluded.raw_record_json = '{}' THEN raw_record_json
                    ELSE excluded.raw_record_json END,
+               licence_identifier = COALESCE(excluded.licence_identifier, licence_identifier),
+               licence_title = COALESCE(excluded.licence_title, licence_title),
+               licence_url = COALESCE(excluded.licence_url, licence_url),
+               attribution = COALESCE(excluded.attribution, attribution),
+               themes_json = CASE
+                   WHEN ? AND excluded.themes_json = '[]' THEN themes_json
+                   ELSE excluded.themes_json END,
+               catalogue_page_url = COALESCE(excluded.catalogue_page_url, catalogue_page_url),
+               metadata_api_url = COALESCE(excluded.metadata_api_url, metadata_api_url),
+               declared_update_frequency = COALESCE(excluded.declared_update_frequency, declared_update_frequency),
+               declared_update_frequency_text = COALESCE(excluded.declared_update_frequency_text, declared_update_frequency_text),
                last_seen_at = excluded.last_seen_at,
                last_observation_id = excluded.last_observation_id""",
         (
@@ -157,6 +171,16 @@ def _upsert_dataset(
             observed_at,
             observed_at,
             observation_id,
+            dataset.licence_identifier,
+            dataset.licence_title,
+            dataset.licence_url,
+            dataset.attribution,
+            _json(dataset.themes),
+            dataset.catalogue_page_url,
+            dataset.metadata_api_url,
+            dataset.declared_update_frequency,
+            dataset.declared_update_frequency_text,
+            preserve_missing,
             preserve_missing,
             preserve_missing,
             preserve_missing,

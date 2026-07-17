@@ -346,7 +346,10 @@ def test_catalogue_metadata_modification_is_not_used_as_the_data_clock(policy) -
 
 
 def test_foreign_resource_cannot_make_a_stale_dataset_current(policy) -> None:
-    evidence = [_evidence("portal_update_frequency", "weekly")]
+    evidence = [
+        _evidence("lifecycle_status", "active"),
+        _evidence("portal_update_frequency", "weekly"),
+    ]
     resources = [
         _resource(NOW - timedelta(days=30)),
         _resource(
@@ -363,6 +366,7 @@ def test_foreign_resource_cannot_make_a_stale_dataset_current(policy) -> None:
 
     assessment = classify_dataset(_dataset(), resources, evidence, policy, NOW)
 
+    assert assessment.lifecycle is LifecycleStatus.active
     assert assessment.maintenance_state is MaintenanceState.stale
 
 
@@ -402,6 +406,7 @@ def test_description_supported_pattern_at_minimum_is_expected_dormant(policy) ->
         }
     )
     evidence = [
+        _evidence("lifecycle_status", "active", id="lifecycle-active"),
         _evidence("description_supported_state", "static_reference", id="evidence-1"),
         _evidence("description_supported_state", "static_reference", id="evidence-2"),
     ]
@@ -409,6 +414,7 @@ def test_description_supported_pattern_at_minimum_is_expected_dormant(policy) ->
     assessment = classify_dataset(_dataset(), [], evidence, policy, NOW)
 
     assert assessment.publication_pattern is PublicationPattern.static_reference
+    assert assessment.lifecycle is LifecycleStatus.active
     assert assessment.maintenance_state is MaintenanceState.expected_dormant
 
 
@@ -454,3 +460,39 @@ def test_policy_is_versioned_generic_data_without_dataset_conclusions(policy) ->
     assert policy.minimum_evidence_requirements
     assert "dataset" not in " ".join(raw_policy).lower()
     assert "overrides" not in raw_policy
+
+
+def test_s2_stale_requires_lifecycle_active(policy) -> None:
+    """S2: With lifecycle unknown, maintenance must remain unknown even with cadence evidence."""
+    evidence = [_evidence("portal_update_frequency", "weekly")]
+    resources = [_resource(NOW - timedelta(days=30))]
+
+    assessment = classify_dataset(_dataset(), resources, evidence, policy, NOW)
+
+    assert assessment.lifecycle is LifecycleStatus.unknown
+    assert assessment.maintenance_state is MaintenanceState.unknown
+
+
+def test_s2_unknown_lifecycle_cannot_be_expected_dormant_from_pattern(policy) -> None:
+    """S2: Unknown lifecycle keeps maintenance unknown even for a static pattern."""
+    evidence = [_evidence("publication_pattern", "static_reference")]
+
+    assessment = classify_dataset(_dataset(), [], evidence, policy, NOW)
+
+    assert assessment.lifecycle is LifecycleStatus.unknown
+    assert assessment.publication_pattern is PublicationPattern.static_reference
+    assert assessment.maintenance_state is MaintenanceState.unknown
+
+
+def test_s2_stale_with_active_lifecycle_and_cadence(policy) -> None:
+    """S2: With lifecycle active and stale cadence, maintenance is stale."""
+    evidence = [
+        _evidence("lifecycle_status", "active"),
+        _evidence("portal_update_frequency", "weekly"),
+    ]
+    resources = [_resource(NOW - timedelta(days=30))]
+
+    assessment = classify_dataset(_dataset(), resources, evidence, policy, NOW)
+
+    assert assessment.lifecycle is LifecycleStatus.active
+    assert assessment.maintenance_state is MaintenanceState.stale

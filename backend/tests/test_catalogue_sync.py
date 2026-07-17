@@ -420,3 +420,85 @@ def test_cli_invalid_diff_inputs_exit_one_safely(tmp_path: Path, failure: str, c
     assert main(["diff", "--before", str(before), "--after", str(after)]) == 1
     output = capsys.readouterr().out
     assert json.loads(output)["status"] == "failed"
+
+
+def test_s3_queue_retention_preserves_unrequested_portal_items(tmp_path: Path):
+    """S3: On subset sync, preserve existing queue items for unrequested portals."""
+    queue_path = tmp_path / "cache" / "review-queue.json"
+    # First sync with two portals
+    first = run_sync(tmp_path, {"nged": make_result("nged"), "spen": make_result("spen")})
+    first_queue = json.loads(first.review_queue_path.read_text(encoding="utf-8"))
+    first_portals = {item["portal_id"] for item in first_queue}
+    assert "nged" in first_portals or "spen" in first_portals
+
+    # Second sync with only nged - spen items should be preserved
+    second = sync_catalogues(
+        ["nged"],
+        lambda portal: FakeClient(
+            next(pid for pid, reg in CATALOGUE_PORTALS.items() if reg is portal),
+            {"nged": make_result("nged")},
+        ),
+        tmp_path / "catalogue.sqlite3",
+        tmp_path / "snapshots",
+        NOW + timedelta(minutes=5),
+        fetcher=fake_fetch,
+        review_queue_path=queue_path,
+        policy_path=Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json",
+    )
+    second_queue = json.loads(second.review_queue_path.read_text(encoding="utf-8"))
+    second_portals = {item["portal_id"] for item in second_queue}
+    # spen items should be preserved since spen was not requested
+    assert "spen" in second_portals
+
+
+def test_s3_partial_requested_portal_replaces_its_previous_queue_items(tmp_path: Path):
+    """S3: A fresh partial classification pass replaces that portal's old queue."""
+    queue_path = tmp_path / "cache" / "review-queue.json"
+    run_sync(tmp_path, {"nged": make_result("nged", source_id="old-source")})
+
+    partial = make_result("nged", source_id="new-source", complete=False)
+    sync_catalogues(
+        ["nged"],
+        lambda portal: FakeClient("nged", {"nged": partial}),
+        tmp_path / "catalogue.sqlite3",
+        tmp_path / "snapshots",
+        NOW + timedelta(minutes=5),
+        fetcher=fake_fetch,
+        review_queue_path=queue_path,
+        policy_path=Path(__file__).parents[2]
+        / "data"
+        / "catalogue"
+        / "maintenance-policy.json",
+    )
+
+    queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert {item["source_dataset_id"] for item in queue} == {"new-source"}
+
+
+def test_q3_snapshot_does_not_mutate_fetched_adapter_objects(tmp_path: Path):
+    """Q3: Snapshot creation does not mutate the original fetched adapter objects."""
+    result = make_result("nged")
+    result.datasets[0].classification_evidence.append(
+        ClassificationEvidence(
+            id="nged:public-dataset:lifecycle",
+            portal_id="nged",
+            source_dataset_id="public-dataset",
+            classification="lifecycle_status",
+            source_value="active",
+            evidence="The public source explicitly marks this dataset active.",
+            confidence=EvidenceConfidence.high,
+            observed_at=NOW,
+        )
+    )
+    original_datasets = [d.model_dump(mode="json") for d in result.datasets]
+    original_resources = [r.model_dump(mode="json") for r in result.resources]
+
+    summary = run_sync(tmp_path, {"nged": result})
+
+    # The original result objects should not have been mutated
+    assert [d.model_dump(mode="json") for d in result.datasets] == original_datasets
+    assert [r.model_dump(mode="json") for r in result.resources] == original_resources
+    snapshot = json.loads(
+        summary.portals["nged"].snapshot_path.read_text(encoding="utf-8")
+    )
+    assert snapshot["datasets"][0]["lifecycle_status"] == "unknown"

@@ -84,11 +84,17 @@ def _canonical_json(value: Any) -> bytes:
 
 
 _SENSITIVE_KEY = re.compile(
-    r"(?:authorization|cookie|credential|password|secret|token|api[_-]?key)", re.IGNORECASE
+    r"^(?:authorization|auth|cookie|credential|password|secret|token|"
+    r"api[_-]?key|access[_-]?token|client[_-]?secret)$",
+    re.IGNORECASE,
 )
 _URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _KEY_VALUE_SECRET = re.compile(
     r"(?i)(authorization|password|secret|token|api[_-]?key)\s*[=:]\s*[^\s,;&]+"
+)
+_SENSITIVE_QUERY_PARAM = re.compile(
+    r"^(?:authorization|cookie|credential|password|secret|token|api[_-]?key|apikey|access_token|client_secret)$",
+    re.IGNORECASE,
 )
 
 
@@ -112,7 +118,20 @@ def _safe_url(value: str) -> str:
         return "[REDACTED_URL]"
     if parsed.username or parsed.password or _is_private_host(parsed.hostname):
         return "[REDACTED_URL]"
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    # Preserve benign query parameters; remove only sensitive ones.
+    safe_query = _filter_sensitive_query(parsed.query)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, safe_query, ""))
+
+
+def _filter_sensitive_query(query: str) -> str:
+    """Remove sensitive query parameters while preserving benign ones."""
+    if not query:
+        return ""
+    from urllib.parse import parse_qsl, urlencode
+
+    pairs = parse_qsl(query, keep_blank_values=True)
+    safe_pairs = [(k, v) for k, v in pairs if not _SENSITIVE_QUERY_PARAM.match(k)]
+    return urlencode(safe_pairs)
 
 
 def _safe_text(value: str) -> str:
@@ -229,9 +248,6 @@ def _classify(
             policy,
             now,
         )
-        dataset.lifecycle_status = assessment.lifecycle
-        dataset.publication_pattern = assessment.publication_pattern
-        dataset.access_status = assessment.access_status
         assessments.append((dataset, assessment))
     return assessments
 
@@ -323,9 +339,9 @@ def _sync_one(
             close()
     if result.portal_id != portal_id:
         raise ValueError("adapter result portal does not match requested portal")
-    assessments = _classify(result, policy, now)
     core = _snapshot_core(result)
     content_hash = hashlib.sha256(_canonical_json(_snapshot_identity(core))).hexdigest()
+    assessments = _classify(result, policy, now)
     snapshot_path = output_dir / _timestamp_directory(now) / f"{portal_id}.json"
     status: SyncStatus = "complete" if result.complete else "partial"
     manifest = {
@@ -426,11 +442,13 @@ def sync_catalogues(
     else:
         run_status = "partial"
     queue_path = review_queue_path or root / "data" / "cache" / "catalogue" / "review-queue.json"
-    failed_portals = {
-        portal_id for portal_id, outcome in outcomes.items() if outcome.status == "failed"
+    # Replace items only for portals with a fresh complete or partial classification
+    # pass. Preserve existing items for failed and unrequested portals.
+    refreshed_portals = {
+        portal_id for portal_id, outcome in outcomes.items() if outcome.status != "failed"
     }
     retained: list[dict[str, Any]] = []
-    if queue_path.exists() and failed_portals:
+    if queue_path.exists():
         try:
             previous_queue = json.loads(queue_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -439,7 +457,8 @@ def sync_catalogues(
             retained = [
                 item
                 for item in previous_queue
-                if isinstance(item, dict) and item.get("portal_id") in failed_portals
+                if isinstance(item, dict)
+                and item.get("portal_id") not in refreshed_portals
             ]
     merged: dict[str, dict[str, Any]] = {}
     for item in [*retained, *review_items]:

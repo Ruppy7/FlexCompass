@@ -34,12 +34,11 @@ python -m app.catalogue_cli sync --portal nged
 ```
 
 Outputs (all git-ignored): SQLite registry at
-`data/cache/catalogue/registry.sqlite3`, JSON snapshots at
-`data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
-`data/cache/catalogue/review-queue.json`. Snapshots are atomic and immutable;
-incomplete or partial portal results are isolated at the portal boundary and
-never published as the last valid registry. A failed sync likewise preserves
-the last valid state.
+`../data/cache/catalogue/registry.sqlite3`, JSON snapshots at
+`../data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
+`../data/cache/catalogue/review-queue.json`. Snapshots are atomic and immutable.
+Failed portals do not alter the registry. Partial observations update the
+registry conservatively without erasing known source facts.
 
 ### Diff
 
@@ -47,8 +46,8 @@ Compare two local snapshots:
 
 ```bash
 python -m app.catalogue_cli diff \
-  --before data/snapshots/catalogues/20260715T120000.000000Z/nged.json \
-  --after  data/snapshots/catalogues/20260716T120000.000000Z/nged.json
+  --before ../data/snapshots/catalogues/20260715T120000.000000Z/nged.json \
+  --after  ../data/snapshots/catalogues/20260716T120000.000000Z/nged.json
 ```
 
 Changes: `dataset_added`, `dataset_removed`, `metadata_changed`,
@@ -76,14 +75,17 @@ confidence (`high`, `medium`, `low`, `unknown`). Unknown values are preserved.
 - **Maintenance state**: `on_schedule`, `possibly_overdue`, `stale`,
   `expected_dormant`, `unknown`. Stale = active + periodic + cadence observed +
   latest data age exceeds cadence x grace multiplier. Static, archive, and
-  event-driven datasets are `expected_dormant`. Refresh cadence and stale
+  event-driven datasets with compatible lifecycle evidence are
+  `expected_dormant`. Refresh cadence and stale
   classification are evidence-backed and preserve unknowns rather than inferred
   from absent evidence.
 
 ## Provenance and secret redaction
 
 Every record retains `source_dataset_id`, `raw_record`, and `observed_at`.
-Content hashes (SHA-256 of redacted snapshot) support deduplication. All
+Content hashes (SHA-256 of the redacted source snapshot, separate from
+classifier assessments) support deduplication. Benign public URL query
+parameters are retained. All
 artifacts are redacted of: authentication keys (`authorization`, `token`,
 `api_key`, `secret`, `password`, `credential`, `cookie`), inline credential
 patterns, private-host URLs, and credential-bearing URLs.

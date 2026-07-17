@@ -147,7 +147,7 @@ def test_migration_four_upgrades_versioned_legacy_database_without_losing_data(t
     finally:
         legacy.close()
 
-    assert run_migrations(db_path) == 4
+    assert run_migrations(db_path) == 5
 
     with get_connection(db_path) as conn:
         legacy_row = conn.execute(
@@ -171,7 +171,7 @@ def test_migration_four_upgrades_versioned_legacy_database_without_losing_data(t
         "Legacy public fixture",
         "https://example.invalid/legacy",
     )
-    assert version == 4
+    assert version == 5
     assert foreign_key_errors == []
     assert {table: len(keys) for table, keys in foreign_keys.items()} == {
         "catalogue_datasets": 1,
@@ -586,3 +586,132 @@ def test_list_catalogue_assessments_is_portal_scoped_and_decodes_reasoning(conn)
     assert assessments[0]["missing_evidence"] == ["published update schedule"]
     assert list_catalogue_assessments(conn, "spen", "shared-source-id") == []
     assert list_catalogue_assessments(conn, "nged", "missing") == []
+
+
+def test_migration_five_adds_canonical_metadata_columns(tmp_path):
+    """Migration 5 is additive: adds new columns to existing catalogue_datasets."""
+    db_path = tmp_path / "catalogue.db"
+    run_migrations(db_path)
+    with get_connection(db_path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(catalogue_datasets)").fetchall()
+        }
+    assert "licence_identifier" in columns
+    assert "licence_title" in columns
+    assert "licence_url" in columns
+    assert "attribution" in columns
+    assert "themes_json" in columns
+    assert "catalogue_page_url" in columns
+    assert "metadata_api_url" in columns
+    assert "declared_update_frequency" in columns
+    assert "declared_update_frequency_text" in columns
+
+
+def test_migration_five_is_idempotent(tmp_path):
+    """Migration 5 can be applied multiple times without error."""
+    db_path = tmp_path / "catalogue.db"
+    run_migrations(db_path)
+    version = run_migrations(db_path)
+    assert version == 5
+
+
+def test_migration_five_upgrades_current_v4_registry_without_data_loss(tmp_path):
+    """Migration 5 upgrades a populated Package 1 v4 registry transactionally."""
+    db_path = tmp_path / "version-four.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:4]:
+            conn.executescript(ddl)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        conn.execute(
+            """INSERT INTO catalogue_observations (
+                   observation_id, portal_id, observed_at, content_hash,
+                   snapshot_path, status, dataset_count, resource_count
+               ) VALUES ('obs', 'nged', '2026-07-16T00:00:00+00:00', 'hash',
+                         'snapshot.json', 'complete', 1, 0)"""
+        )
+        conn.execute(
+            """INSERT INTO catalogue_datasets (
+                   dataset_key, portal_id, source_dataset_id, source_record_id,
+                   title, first_seen_at, last_seen_at, last_observation_id
+               ) VALUES ('nged:legacy', 'nged', 'legacy', 'legacy', 'Legacy title',
+                         '2026-07-16T00:00:00+00:00',
+                         '2026-07-16T00:00:00+00:00', 'obs')"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert run_migrations(db_path) == 5
+    assert run_migrations(db_path) == 5
+    with get_connection(db_path) as migrated:
+        row = migrated.execute(
+            "SELECT title, declared_update_frequency_text FROM catalogue_datasets"
+        ).fetchone()
+        foreign_key_errors = migrated.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert tuple(row) == ("Legacy title", None)
+    assert foreign_key_errors == []
+
+
+def test_migration_five_rolls_back_all_columns_and_version_on_failure(tmp_path):
+    """Migration 5 leaves no partial schema when an ALTER statement fails."""
+    db_path = tmp_path / "migration-failure.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:4]:
+            conn.executescript(ddl)
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        conn.execute("ALTER TABLE catalogue_datasets ADD COLUMN licence_title TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
+        run_migrations(db_path)
+
+    with sqlite3.connect(db_path) as failed:
+        columns = {
+            row[1]
+            for row in failed.execute("PRAGMA table_info(catalogue_datasets)").fetchall()
+        }
+        versions = {
+            row[0] for row in failed.execute("SELECT version FROM schema_version").fetchall()
+        }
+
+    assert "licence_title" in columns
+    assert "licence_identifier" not in columns
+    assert 5 not in versions
+
+
+def test_s5_persistence_roundtrip_for_frequency_fields(conn):
+    """S5: declared_update_frequency fields persist through the store."""
+    result = make_result()
+    result.datasets[0].declared_update_frequency = "weekly"
+    result.datasets[0].declared_update_frequency_text = "Weekly"
+    persist_catalogue_result(conn, result, "nged.json", "nged-hash")
+
+    stored = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    assert stored["declared_update_frequency"] == "weekly"
+    assert stored["declared_update_frequency_text"] == "Weekly"
+
+
+def test_s9_persistence_roundtrip_for_canonical_metadata(conn):
+    """S9: Canonical metadata fields persist through the store."""
+    result = make_result()
+    result.datasets[0].licence_identifier = "odc-odbl"
+    result.datasets[0].licence_title = "ODC Open Data License"
+    result.datasets[0].licence_url = "https://opendatacommons.org/licenses/odbl/"
+    result.datasets[0].attribution = "Test Publisher"
+    result.datasets[0].themes = ["flexibility", "networks"]
+    result.datasets[0].catalogue_page_url = "https://example.invalid/dataset/test"
+    persist_catalogue_result(conn, result, "nged.json", "nged-hash")
+
+    stored = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    assert stored["licence_identifier"] == "odc-odbl"
+    assert stored["licence_title"] == "ODC Open Data License"
+    assert stored["licence_url"] == "https://opendatacommons.org/licenses/odbl/"
+    assert stored["attribution"] == "Test Publisher"
+    assert stored["themes"] == ["flexibility", "networks"]
+    assert stored["catalogue_page_url"] == "https://example.invalid/dataset/test"
