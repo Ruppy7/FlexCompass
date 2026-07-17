@@ -36,7 +36,7 @@ measure of forecast accuracy.
 ## Storage
 
 SQLite is used without an ORM. Structured lists and raw records are serialized
-as JSON text. Local databases are generated artifacts and are never committed.
+as JSON text. Generated snapshots, SQLite databases, caches, queues, and reports are ignored/local outputs and are never committed.
 
 ## Catalogue observation model
 
@@ -59,8 +59,9 @@ redacted snapshot core (with FlexCompass-generated clocks stripped).
 ### Atomic local artifacts
 
 Sync writes are atomic: a temporary file is written then renamed. If the
-snapshot already exists with identical content, no write occurs. Failed syncs
-do not publish partial artifacts; the previous valid state is preserved.
+snapshot already exists with identical content, no write occurs. Incomplete or
+partial portal results are isolated and never published as the last valid
+registry. A failed sync likewise preserves the last valid state.
 
 ### Secret redaction
 
@@ -81,3 +82,11 @@ queue is replaceable (not immutable) and preserves items for failed portals.
 
 Catalogue counts, titles, and metadata are point-in-time observations, not
 stable facts. The `observed_at` timestamp records when FlexCompass fetched data.
+Refresh cadence and stale classification are evidence-backed and preserve
+unknowns rather than inferred from absent evidence.
+
+## Testing boundaries
+
+Live portal tests are opt-in via `FLEXCOMPASS_LIVE_PORTAL_TESTS=1`; seven
+parametrized cases are skipped by default with zero network calls. Licence and
+attribution must be verified before redistributing source data.

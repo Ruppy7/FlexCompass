@@ -17,8 +17,8 @@ and catalogue access was last checked on 15 July 2026.
 
 Anonymous catalogue access does not prove that every dataset resource is
 anonymous or redistributable. The repository stores curated catalogue metadata
-only. Downloaded portal responses, caches, generated inventories, and databases
-are local artifacts and must not be committed.
+only. Generated snapshots, SQLite databases, caches, queues, and reports are
+ignored/local outputs and must not be committed.
 
 ## Catalogue intelligence workflow
 
@@ -37,8 +37,9 @@ Outputs (all git-ignored): SQLite registry at
 `data/cache/catalogue/registry.sqlite3`, JSON snapshots at
 `data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
 `data/cache/catalogue/review-queue.json`. Snapshots are atomic and immutable;
-partial failures are isolated at the portal boundary, preserving last valid
-state.
+incomplete or partial portal results are isolated at the portal boundary and
+never published as the last valid registry. A failed sync likewise preserves
+the last valid state.
 
 ### Diff
 
@@ -75,7 +76,9 @@ confidence (`high`, `medium`, `low`, `unknown`). Unknown values are preserved.
 - **Maintenance state**: `on_schedule`, `possibly_overdue`, `stale`,
   `expected_dormant`, `unknown`. Stale = active + periodic + cadence observed +
   latest data age exceeds cadence x grace multiplier. Static, archive, and
-  event-driven datasets are `expected_dormant`.
+  event-driven datasets are `expected_dormant`. Refresh cadence and stale
+  classification are evidence-backed and preserve unknowns rather than inferred
+  from absent evidence.
 
 ## Provenance and secret redaction
 
@@ -89,5 +92,8 @@ patterns, private-host URLs, and credential-bearing URLs.
 
 Catalogue metadata is not analytical ingestion, eligibility assessment,
 bidding/dispatch/asset-control advice, forecasting, or commercial advice.
-Counts and metadata are dated observations, not stable facts. Verify
-dataset-level licences before redistribution.
+Counts and metadata are dated observations, not stable facts. Licence and
+attribution must be verified before redistributing source data.
+
+Live portal tests are opt-in via `FLEXCOMPASS_LIVE_PORTAL_TESTS=1`; seven
+parametrized cases are skipped by default with zero network calls.

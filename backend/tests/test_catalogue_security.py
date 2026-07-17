@@ -96,6 +96,22 @@ def _ods_record_with_secret():
     }
 
 
+def _ckan_record_with_inline_token():
+    """CKAN record with an inline token=<secret> pattern in a text field."""
+    return {
+        "id": "inline-token-uuid", "name": "inline-token-dataset",
+        "title": "Public network dataset",
+        "notes": f"Access via token={SYNTHETIC_SECRET} for public catalogue.",
+        "license_title": "Example", "organization": {"name": "example-org"},
+        "resources": [{"id": "inline-resource", "name": "CSV",
+            "url": "https://example.invalid/data.csv",
+            "format": "CSV", "mimetype": "text/csv", "size": 42,
+            "created": "2026-01-01T10:00:00+00:00",
+            "last_modified": "2026-01-02T11:00:00+00:00"}],
+        "tags": [{"name": "synthetic"}],
+    }
+
+
 
 class _FakeResp:
     def __init__(self, payload):
@@ -286,6 +302,40 @@ class TestSummaryJSONRedaction:
         _assert_no_secrets(_serialise(summary_as_json(s)), context="summary")
 
 
+class TestInlineTokenRedaction:
+    """Regression: inline token=<synthetic-secret> is redacted from all pipeline outputs."""
+
+    def test_inline_token_redacted_from_snapshot(self, tmp_path):
+        s, _, _ = _run_sync(tmp_path, "nged", _ckan_record_with_inline_token())
+        snapshot_text = s.portals["nged"].snapshot_path.read_text("utf-8")
+        assert SYNTHETIC_SECRET not in snapshot_text, (
+            "inline token=<secret> leaked into snapshot")
+        assert "token=[REDACTED]" in snapshot_text
+
+    def test_inline_token_redacted_from_db(self, tmp_path):
+        import sqlite3
+        _, db, _ = _run_sync(tmp_path, "nged", _ckan_record_with_inline_token())
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            for row in conn.execute("SELECT * FROM catalogue_observations").fetchall():
+                row_text = _serialise(dict(row))
+                assert SYNTHETIC_SECRET not in row_text, (
+                    "inline token=<secret> leaked into DB observations")
+            for row in conn.execute("SELECT * FROM catalogue_datasets").fetchall():
+                row_text = _serialise(dict(row))
+                assert SYNTHETIC_SECRET not in row_text, (
+                    "inline token=<secret> leaked into DB datasets")
+        finally:
+            conn.close()
+
+    def test_inline_token_redacted_from_summary(self, tmp_path):
+        s, _, _ = _run_sync(tmp_path, "nged", _ckan_record_with_inline_token())
+        summary_text = _serialise(summary_as_json(s))
+        assert SYNTHETIC_SECRET not in summary_text, (
+            "inline token=<secret> leaked into summary JSON")
+
+
 class TestGetOnly:
     @pytest.mark.parametrize("pid,pf", [
         ("nged", lambda r: _ckan_page(r, count=len(r))),
@@ -365,7 +415,6 @@ def _live_enabled():
 
 
 @pytest.mark.skipif(not _live_enabled(), reason="FLEXCOMPASS_LIVE_PORTAL_TESTS=1 to enable")
-@pytest.mark.live
 @pytest.mark.parametrize("portal_id", sorted(CATALOGUE_PORTALS))
 def test_live_portal(portal_id):
     import httpx
