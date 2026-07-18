@@ -322,6 +322,11 @@ class TestRedactFunction:
         result = redact("Bearer XyZa1234")
         assert "XyZa1234" not in result
 
+    def test_standalone_purely_alphabetic_bearer_is_redacted(self):
+        """A standalone purely alphabetic Bearer token is credential-shaped, not prose."""
+        result = redact("Bearer abcdefghijklmno")
+        assert "abcdefghijklmno" not in result
+
     def test_semicolon_delimited_sensitive_query_is_redacted(self):
         """Semicolon-delimited sensitive query pairs must be removed."""
         url = "https://example.invalid/data.csv?format=csv;credential=MARKER"

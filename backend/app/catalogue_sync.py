@@ -207,10 +207,17 @@ def _redact_auth_scheme(match: re.Match[str]) -> str:
     # guard because short base64 can be purely alphabetic.
     if scheme.casefold() == "basic" and _is_short_base64_credential(credential):
         return "[REDACTED]"
-    # Purely alphabetic values of typical English-word length are prose,
-    # not credentials (e.g. "Basic metadata about network capacity").
-    if credential.isalpha() and len(credential) >= 4:
+    # Inspect trailing context: if the token is followed by more alphabetic
+    # words (sentence structure), it's prose. Otherwise, it's a credential.
+    trailing = match.string[match.end():]
+    if trailing and re.match(r"\s+[A-Za-z]+", trailing):
+        # Sentence-like prose: "Bearer information about public datasets"
         return match.group(0)
+    # Purely alphabetic values of typical English-word length are prose
+    # only when followed by sentence context (checked above).
+    if credential.isalpha() and len(credential) >= 4:
+        # Standalone alphabetic token: credential-shaped
+        return "[REDACTED]"
     # Anything with non-letter characters (digits, punctuation) in a
     # short token is credential-shaped rather than prose.
     if not credential.isalpha():
