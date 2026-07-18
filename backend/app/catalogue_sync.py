@@ -146,21 +146,46 @@ def _filter_sensitive_query(query: str) -> str:
     """Remove sensitive query parameters while preserving benign ones."""
     if not query:
         return ""
-    from urllib.parse import unquote_plus, urlencode
+    from urllib.parse import unquote, urlencode
 
-    # Split on both '&' and ';' — semicolon is a supported legacy separator
-    # for this security filter (not a general RFC 3986 query-separator guarantee).
-    # parse_qsl on Python ≥ 3.10 no longer treats ';' as a separator by default,
-    # so we split manually to ensure credential-bearing pairs are caught.
+    # Decode one layer of percent-encoding to catch encoded separators
+    # like %3B (;) and %26 (&) that would otherwise hide credential pairs.
+    # This is exactly one safe decoding layer; ordinary encoded values
+    # (e.g. %20 for space) are preserved through the re-encoding step.
+    decoded_query = unquote(query)
+
     pairs: list[tuple[str, str]] = []
-    for part in re.split(r"[&;]", query):
-        if "=" in part:
-            key, _, value = part.partition("=")
-            pairs.append((unquote_plus(key), unquote_plus(value)))
-        elif part:
-            pairs.append((unquote_plus(part), ""))
-    safe_pairs = [(k, v) for k, v in pairs if not _SENSITIVE_QUERY_PARAM.match(k)]
-    return urlencode(safe_pairs)
+    # Split on & first (primary separator), then check each part for hidden
+    # credentials after ; (legacy separator). Only split on ; if it's hiding
+    # a sensitive key, to preserve ordinary encoded values like delimiter=%3B.
+    for amp_part in decoded_query.split("&"):
+        # Check if this part contains hidden credentials after ;
+        has_sensitive_semicolon = False
+        for semi_part in amp_part.split(";"):
+            if "=" in semi_part:
+                key = semi_part.partition("=")[0]
+                if _SENSITIVE_QUERY_PARAM.match(key):
+                    has_sensitive_semicolon = True
+                    break
+
+        if has_sensitive_semicolon:
+            # Split on ; and filter sensitive pairs
+            for semi_part in amp_part.split(";"):
+                if "=" in semi_part:
+                    key, _, value = semi_part.partition("=")
+                    if not _SENSITIVE_QUERY_PARAM.match(key):
+                        pairs.append((key, value))
+                elif semi_part:
+                    pairs.append((semi_part, ""))
+        else:
+            # Keep the part as-is (may contain ; in value)
+            if "=" in amp_part:
+                key, _, value = amp_part.partition("=")
+                pairs.append((key, value))
+            elif amp_part:
+                pairs.append((amp_part, ""))
+
+    return urlencode(pairs)
 
 
 def _filter_sensitive_fragment(fragment: str) -> str:
@@ -194,6 +219,9 @@ def _redact_non_url_text(value: str) -> str:
     return _AUTH_SCHEME_SECRET.sub(_redact_auth_scheme, text)
 
 
+_BENIGN_PROSE_WORDS = frozenset({"metadata", "information"})
+
+
 def _redact_auth_scheme(match: re.Match[str]) -> str:
     """Redact opaque auth values without destroying ordinary scheme-like prose."""
     scheme = match.group(1)
@@ -208,16 +236,12 @@ def _redact_auth_scheme(match: re.Match[str]) -> str:
     # guard because short base64 can be purely alphabetic.
     if scheme.casefold() == "basic" and _is_short_base64_credential(credential):
         return "[REDACTED]"
-    # Inspect trailing context: if the token is followed by more alphabetic
-    # words (sentence structure), it's prose. Otherwise, it's a credential.
-    trailing = match.string[match.end():]
-    if trailing and re.match(r"\s+[A-Za-z]+", trailing):
-        # Sentence-like prose: "Bearer information about public datasets"
+    # Specific benign prose: "Basic metadata ..." or "Bearer information ..."
+    # where the word after the scheme is a known common English noun.
+    if credential.casefold() in _BENIGN_PROSE_WORDS:
         return match.group(0)
-    # Purely alphabetic values of typical English-word length are prose
-    # only when followed by sentence context (checked above).
+    # Purely alphabetic values of typical English-word length are credential-shaped.
     if credential.isalpha() and len(credential) >= 4:
-        # Standalone alphabetic token: credential-shaped
         return "[REDACTED]"
     # Anything with non-letter characters (digits, punctuation) in a
     # short token is credential-shaped rather than prose.

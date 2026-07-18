@@ -327,6 +327,16 @@ class TestRedactFunction:
         result = redact("Bearer abcdefghijklmno")
         assert "abcdefghijklmno" not in result
 
+    def test_bearer_token_embedded_in_sentence_is_redacted(self):
+        """Bearer token followed by sentence context must still be redacted."""
+        result = redact("Record notes: Bearer abcdefghijklmno provided for download.")
+        assert "abcdefghijklmno" not in result
+
+    def test_basic_credential_embedded_in_sentence_is_redacted(self):
+        """Basic credential followed by sentence context must still be redacted."""
+        result = redact("Basic ABCD supplied by publisher.")
+        assert "ABCD" not in result
+
     def test_semicolon_delimited_sensitive_query_is_redacted(self):
         """Semicolon-delimited sensitive query pairs must be removed."""
         url = "https://example.invalid/data.csv?format=csv;credential=MARKER"
@@ -340,6 +350,27 @@ class TestRedactFunction:
         result = redact(url)
         assert "SECRET_VALUE" not in result
         assert "format=csv" in result
+
+    def test_url_encoded_semicolon_credential_is_redacted(self):
+        """%3Bcredential=MARKER must be caught after one decode layer."""
+        url = "https://example.invalid/data.csv?format=csv%3Bcredential=MARKER"
+        result = redact(url)
+        assert "MARKER" not in result
+        assert "format=csv" in result
+
+    def test_url_encoded_ampersand_auth_is_redacted(self):
+        """%26auth=MARKER must be caught after one decode layer."""
+        url = "https://example.invalid/data.csv?format=csv%26auth=MARKER"
+        result = redact(url)
+        assert "MARKER" not in result
+        assert "format=csv" in result
+
+    def test_url_encoded_benign_value_preserved(self):
+        """Ordinary percent-encoded values must survive, not gain query semantics."""
+        url = "https://example.invalid/data.csv?q=hello%20world"
+        result = redact(url)
+        assert "hello" in result
+        assert "world" in result
 
     def test_sync_redacts_inline_credential_and_auth_query_aliases(self, tmp_path):
         record = _ckan_record_with_secret()
@@ -399,6 +430,58 @@ class TestRedactFunction:
                 assert "abcdefghijklmno" not in row_text, "Bearer token leaked into DB raw_record"
                 assert "Basic metadata about network capacity" in row_text
                 assert "Bearer information about public datasets" in row_text
+        finally:
+            conn.close()
+
+    def test_sync_redacts_url_encoded_credential_query(self, tmp_path):
+        """End-to-end: %3Bcredential=MARKER is absent from snapshot and SQLite."""
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            "https://example.invalid/data.csv?format=csv%3Bcredential=MARKER"
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+
+        assert "MARKER" not in snapshot_text
+        assert "format=csv" in snapshot_text
+
+        import sqlite3
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            for row in conn.execute(
+                "SELECT raw_record_json FROM catalogue_datasets"
+            ).fetchall():
+                row_text = _serialise(dict(row))
+                assert "MARKER" not in row_text, "URL-encoded credential leaked into DB"
+        finally:
+            conn.close()
+
+    def test_sync_redacts_bearer_in_sentence_from_raw_record(self, tmp_path):
+        """End-to-end: Bearer token in sentence context is absent from snapshot and SQLite."""
+        record = _ckan_record_with_secret()
+        record["notes"] = (
+            "Record notes: Bearer abcdefghijklmno provided for download. "
+            "Also Basic ABCD supplied by publisher."
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+
+        assert "abcdefghijklmno" not in snapshot_text
+        assert "ABCD" not in snapshot_text
+
+        import sqlite3
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            for row in conn.execute(
+                "SELECT raw_record_json FROM catalogue_datasets"
+            ).fetchall():
+                row_text = _serialise(dict(row))
+                assert "abcdefghijklmno" not in row_text, "Bearer in sentence leaked into DB"
+                assert "ABCD" not in row_text, "Basic in sentence leaked into DB"
         finally:
             conn.close()
 
