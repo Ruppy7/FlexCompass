@@ -792,6 +792,74 @@ def test_exact_credential_marker_is_absent_from_every_sync_surface(tmp_path):
         )
 
 
+class TestS5EncodedSpaceCredentialDirect:
+    """S5: Encoded auth values are redacted after URL component decoding."""
+
+    @pytest.mark.parametrize(
+        "suffix, secret",
+        [
+            ("?note=public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
+            ("?note=public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("#note=public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
+            ("#note=public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+        ],
+    )
+    def test_encoded_query_and_fragment_values_are_redacted(self, suffix, secret):
+        result = redact(f"https://example.invalid/data.csv{suffix}")
+
+        assert secret not in result
+        assert "note=" in result
+        assert "public" in result
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Basic metadata about network capacity",
+            "Bearer information about public datasets",
+        ],
+    )
+    def test_benign_auth_prose_in_query_values_is_preserved(self, value):
+        from urllib.parse import parse_qs, quote, urlsplit
+
+        url = f"https://example.invalid/data.csv?note={quote(value)}"
+
+        assert parse_qs(urlsplit(redact(url)).query) == {"note": [value]}
+
+
+class TestS5EncodedSpaceCredentialEndToEnd:
+    """S5: End-to-end sync tests for encoded-space credentials in URLs."""
+
+    @pytest.mark.parametrize(
+        "encoded_note, secret",
+        [
+            ("public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
+            ("public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+        ],
+    )
+    def test_sync_redacts_encoded_query_values_from_snapshot_and_sqlite(
+        self, tmp_path, encoded_note, secret
+    ):
+        import sqlite3
+
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            f"https://example.invalid/data.csv?format=csv&note={encoded_note}"
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        assert secret not in snapshot_text
+        assert secret not in stored_url
+        assert secret not in raw_record_json
+        assert "format=csv" in snapshot_text
+        assert "format=csv" in stored_url
+
+
 class TestQ1CLISecurityPath:
     """Q1: CLI security path - secret-bearing result flows through CLI sync seam."""
 

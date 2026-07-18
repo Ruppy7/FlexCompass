@@ -175,14 +175,14 @@ def _filter_sensitive_query(query: str) -> str:
                 if "=" in part:
                     key, _, value = part.partition("=")
                     if not _SENSITIVE_QUERY_PARAM.match(key):
-                        pairs.append((key, value))
+                        pairs.append((key, _redact_non_url_text(value)))
                 elif part:
                     pairs.append((part, ""))
         else:
             # Keep the decoded segment as-is (may contain & or ; in value)
             if "=" in decoded_segment:
                 key, _, value = decoded_segment.partition("=")
-                pairs.append((key, value))
+                pairs.append((key, _redact_non_url_text(value)))
             elif decoded_segment:
                 pairs.append((decoded_segment, ""))
 
@@ -202,7 +202,9 @@ def _filter_sensitive_fragment(fragment: str) -> str:
     from urllib.parse import parse_qsl
 
     pairs = parse_qsl(fragment, keep_blank_values=True)
-    if any(_SENSITIVE_QUERY_PARAM.match(key) for key, _ in pairs):
+    if "=" in fragment or any(
+        _SENSITIVE_QUERY_PARAM.match(key) for key, _ in pairs
+    ):
         return _filter_sensitive_query(fragment)
     return _redact_non_url_text(fragment)
 
