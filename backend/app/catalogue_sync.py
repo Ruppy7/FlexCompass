@@ -148,42 +148,43 @@ def _filter_sensitive_query(query: str) -> str:
         return ""
     from urllib.parse import unquote, urlencode
 
-    # Decode one layer of percent-encoding to catch encoded separators
-    # like %3B (;) and %26 (&) that would otherwise hide credential pairs.
-    # This is exactly one safe decoding layer; ordinary encoded values
-    # (e.g. %20 for space) are preserved through the re-encoding step.
-    decoded_query = unquote(query)
-
+    # Split on literal & first (these are always separators)
+    amp_segments = query.split("&")
     pairs: list[tuple[str, str]] = []
-    # Split on & first (primary separator), then check each part for hidden
-    # credentials after ; (legacy separator). Only split on ; if it's hiding
-    # a sensitive key, to preserve ordinary encoded values like delimiter=%3B.
-    for amp_part in decoded_query.split("&"):
-        # Check if this part contains hidden credentials after ;
-        has_sensitive_semicolon = False
-        for semi_part in amp_part.split(";"):
-            if "=" in semi_part:
-                key = semi_part.partition("=")[0]
-                if _SENSITIVE_QUERY_PARAM.match(key):
-                    has_sensitive_semicolon = True
-                    break
 
-        if has_sensitive_semicolon:
-            # Split on ; and filter sensitive pairs
-            for semi_part in amp_part.split(";"):
-                if "=" in semi_part:
-                    key, _, value = semi_part.partition("=")
+    for segment in amp_segments:
+        # Decode this segment to check for hidden sensitive keys
+        decoded_segment = unquote(segment)
+
+        # Check if this segment contains ; or & followed by a sensitive key
+        # Pattern: ;sensitive_key= or &sensitive_key=
+        has_hidden_sensitive = False
+        for delim in [";", "&"]:
+            for part in decoded_segment.split(delim):
+                if "=" in part:
+                    key = part.partition("=")[0]
+                    if _SENSITIVE_QUERY_PARAM.match(key):
+                        has_hidden_sensitive = True
+                        break
+            if has_hidden_sensitive:
+                break
+
+        if has_hidden_sensitive:
+            # Split on both ; and & using regex and filter sensitive pairs
+            for part in re.split(r"[;&]", decoded_segment):
+                if "=" in part:
+                    key, _, value = part.partition("=")
                     if not _SENSITIVE_QUERY_PARAM.match(key):
                         pairs.append((key, value))
-                elif semi_part:
-                    pairs.append((semi_part, ""))
+                elif part:
+                    pairs.append((part, ""))
         else:
-            # Keep the part as-is (may contain ; in value)
-            if "=" in amp_part:
-                key, _, value = amp_part.partition("=")
+            # Keep the decoded segment as-is (may contain & or ; in value)
+            if "=" in decoded_segment:
+                key, _, value = decoded_segment.partition("=")
                 pairs.append((key, value))
-            elif amp_part:
-                pairs.append((amp_part, ""))
+            elif decoded_segment:
+                pairs.append((decoded_segment, ""))
 
     return urlencode(pairs)
 

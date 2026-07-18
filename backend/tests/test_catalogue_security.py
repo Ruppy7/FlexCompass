@@ -372,6 +372,22 @@ class TestRedactFunction:
         assert "hello" in result
         assert "world" in result
 
+    def test_url_encoded_ampersand_in_value_preserved(self):
+        """Encoded ampersand in value must not create separate query keys."""
+        url = "https://example.invalid/data.csv?q=alpha%26beta"
+        result = redact(url)
+        # The value should contain both alpha and beta, not split into separate keys
+        assert "alpha" in result
+        assert "beta" in result
+        # Should not create a key named "beta" with empty value
+        from urllib.parse import parse_qs, urlsplit
+        query = urlsplit(result).query
+        parsed = parse_qs(query)
+        assert "q" in parsed
+        # The value for q should contain both parts
+        assert "alpha" in parsed["q"][0]
+        assert "beta" in parsed["q"][0]
+
     def test_sync_redacts_inline_credential_and_auth_query_aliases(self, tmp_path):
         record = _ckan_record_with_secret()
         record["notes"] = f"credential={EXACT_CREDENTIAL_MARKER}"
