@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import ipaddress
 import json
@@ -145,9 +146,18 @@ def _filter_sensitive_query(query: str) -> str:
     """Remove sensitive query parameters while preserving benign ones."""
     if not query:
         return ""
-    from urllib.parse import parse_qsl, urlencode
+    from urllib.parse import unquote_plus, urlencode
 
-    pairs = parse_qsl(query, keep_blank_values=True)
+    # Split on both '&' and ';' since both are valid query separators
+    # (RFC 3986 §3.4).  parse_qsl on Python ≥ 3.10 no longer treats ';'
+    # as a separator by default, so we split manually.
+    pairs: list[tuple[str, str]] = []
+    for part in re.split(r"[&;]", query):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            pairs.append((unquote_plus(key), unquote_plus(value)))
+        elif part:
+            pairs.append((unquote_plus(part), ""))
     safe_pairs = [(k, v) for k, v in pairs if not _SENSITIVE_QUERY_PARAM.match(k)]
     return urlencode(safe_pairs)
 
@@ -185,11 +195,39 @@ def _redact_non_url_text(value: str) -> str:
 
 def _redact_auth_scheme(match: re.Match[str]) -> str:
     """Redact opaque auth values without destroying ordinary scheme-like prose."""
+    scheme = match.group(1)
     credential = match.group(2)
-    looks_opaque = len(credential) >= 16 or bool(
-        re.search(r"[0-9._~+/=-]", credential)
-    )
-    return "[REDACTED]" if looks_opaque else match.group(0)
+    if scheme.casefold() not in ("bearer", "basic"):
+        return "[REDACTED]"
+    # Long opaque tokens are always credential-shaped.
+    if len(credential) >= 16:
+        return "[REDACTED]"
+    # Short Basic values that decode from base64 to include ':' are
+    # credential pairs (e.g. "YTpi" → "a:b").  Check before the prose
+    # guard because short base64 can be purely alphabetic.
+    if scheme.casefold() == "basic" and _is_short_base64_credential(credential):
+        return "[REDACTED]"
+    # Purely alphabetic values of typical English-word length are prose,
+    # not credentials (e.g. "Basic metadata about network capacity").
+    if credential.isalpha() and len(credential) >= 4:
+        return match.group(0)
+    # Anything with non-letter characters (digits, punctuation) in a
+    # short token is credential-shaped rather than prose.
+    if not credential.isalpha():
+        return "[REDACTED]"
+    return match.group(0)
+
+
+def _is_short_base64_credential(value: str) -> bool:
+    """Return True when *value* looks like a short base64-encoded credential."""
+    if len(value) < 4 or not value.isascii():
+        return False
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.b64decode(padded, validate=True)
+    except Exception:
+        return False
+    return b":" in decoded
 
 
 def _safe_text(value: str) -> str:

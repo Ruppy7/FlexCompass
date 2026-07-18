@@ -312,6 +312,30 @@ class TestRedactFunction:
         assert r["a"]["b"][0]["token"] == "[REDACTED]"
         assert r["a"]["b"][0]["ok"] == "v"
 
+    def test_short_basic_base64_credential_is_redacted(self):
+        """Basic YTpi decodes to 'a:b' — a valid short credential that must not leak."""
+        result = redact("Basic YTpi")
+        assert "YTpi" not in result
+
+    def test_short_bearer_token_with_digits_is_redacted(self):
+        """A short alphabetic+digit Bearer value is credential-shaped, not prose."""
+        result = redact("Bearer XyZa1234")
+        assert "XyZa1234" not in result
+
+    def test_semicolon_delimited_sensitive_query_is_redacted(self):
+        """Semicolon-delimited sensitive query pairs must be removed."""
+        url = "https://example.invalid/data.csv?format=csv;credential=MARKER"
+        result = redact(url)
+        assert "MARKER" not in result
+        assert "format=csv" in result
+
+    def test_semicolon_delimited_auth_query_is_redacted(self):
+        """Semicolon-delimited auth= query must be removed."""
+        url = "https://example.invalid/data.csv?format=csv;auth=SECRET_VALUE"
+        result = redact(url)
+        assert "SECRET_VALUE" not in result
+        assert "format=csv" in result
+
     def test_sync_redacts_inline_credential_and_auth_query_aliases(self, tmp_path):
         record = _ckan_record_with_secret()
         record["notes"] = f"credential={EXACT_CREDENTIAL_MARKER}"
@@ -324,6 +348,19 @@ class TestRedactFunction:
         snapshot = summary.portals["nged"].snapshot_path.read_text("utf-8")
 
         assert EXACT_CREDENTIAL_MARKER not in snapshot
+        assert "format=csv" in snapshot
+
+    def test_sync_redacts_semicolon_credential_query(self, tmp_path):
+        """End-to-end: semicolon-delimited credential query is removed from snapshot."""
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            "https://example.invalid/data.csv?format=csv;credential=MARKER"
+        )
+
+        summary, _, _ = _run_sync(tmp_path, "nged", record)
+        snapshot = summary.portals["nged"].snapshot_path.read_text("utf-8")
+
+        assert "MARKER" not in snapshot
         assert "format=csv" in snapshot
 
 
