@@ -94,8 +94,7 @@ _SENSITIVE_KEY = re.compile(
 )
 _URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _KEY_VALUE_SECRET = re.compile(
-    r"(?i)\b(auth|credential|password|secret|token|api[_-]?key|access[_-]?token|"
-    r"client[_-]?secret)\s*[=:]\s*[^\s,;&]+"
+    r"(?i)\b([a-z0-9_-]+)(\s*[=:]\s*)[^\s,;&]+"
 )
 _AUTHORIZATION_SECRET = re.compile(
     r"(?i)\b(authorization)\s*[=:]\s*[^,;\r\n]+"
@@ -104,15 +103,35 @@ _COOKIE_SECRET = re.compile(r"(?i)\b(cookie)\s*[=:]\s*[^,\r\n]+")
 _AUTH_SCHEME_SECRET = re.compile(
     r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]+)"
 )
-_SENSITIVE_QUERY_PARAM = re.compile(
-    r"^(?:authorization|auth|cookie|credential|password|secret|token|api[_-]?key|"
-    r"access[_-]?token|client[_-]?secret|signature|sig|security[_-]?token|"
-    r"x-amz-(?:credential|signature|security-token)|"
-    r"x-goog-(?:credential|signature)|awsaccesskeyid|googleaccessid|"
-    r"key-pair-id)$",
-    re.IGNORECASE,
-)
 _QUERY_VALUE_DECODE_ROUNDS = 3
+_VALID_PERCENT_ESCAPE = re.compile(r"[0-9a-fA-F]{2}")
+
+
+def _is_sensitive_name(value: str) -> bool:
+    """Return whether the complete value is an exact sensitive field name."""
+    return _SENSITIVE_KEY.fullmatch(value) is not None
+
+
+def _is_sensitive_pair(value: str) -> bool:
+    """Return whether decoded data starts with an exact sensitive pair."""
+    key, separator, _ = value.partition("=")
+    return bool(separator and _is_sensitive_name(key.strip()))
+
+
+def _has_malformed_percent_escape(value: str) -> bool:
+    """Return whether any percent sign is not followed by two hex digits."""
+    offset = 0
+    while True:
+        offset = value.find("%", offset)
+        if offset < 0:
+            return False
+        if not _VALID_PERCENT_ESCAPE.fullmatch(value[offset + 1 : offset + 3]):
+            return True
+        offset += 3
+
+
+def _has_control_character(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
 
 def _is_private_host(hostname: str | None) -> bool:
@@ -158,7 +177,7 @@ def _filter_sensitive_query(query: str) -> str:
             continue
         raw_key, separator, raw_value = segment.partition("=")
         key, complete = _bounded_url_decode(raw_key, form_encoded=True)
-        if not complete or _SENSITIVE_QUERY_PARAM.match(key):
+        if not complete or _is_sensitive_name(key) or _is_sensitive_pair(key):
             continue
         value = _redact_query_value(raw_value) if separator else ""
         pairs.append((key, value))
@@ -172,24 +191,33 @@ def _bounded_url_decode(value: str, *, form_encoded: bool) -> tuple[str, bool]:
 
     decoded = value
     for round_index in range(_QUERY_VALUE_DECODE_ROUNDS):
+        if _has_malformed_percent_escape(decoded) or _has_control_character(decoded):
+            return decoded, False
         decoder = unquote_plus if form_encoded and round_index == 0 else unquote
         further_decoded = decoder(decoded)
+        if _has_control_character(further_decoded):
+            return further_decoded, False
         if further_decoded == decoded:
             return decoded, True
         decoded = further_decoded
-    return decoded, unquote(decoded) == decoded
+    return decoded, (
+        not _has_malformed_percent_escape(decoded)
+        and not _has_control_character(decoded)
+        and unquote(decoded) == decoded
+    )
 
 
 def _remove_sensitive_value_pairs(value: str) -> str:
     """Remove credential pairs from decoded value data without promoting it."""
     parts = re.split(r"([;&])", value)
-    retained = [parts[0]]
-    for index in range(1, len(parts), 2):
-        delimiter, part = parts[index : index + 2]
-        key, separator, _ = part.partition("=")
-        if separator and _SENSITIVE_QUERY_PARAM.match(key):
+    retained: list[str] = []
+    for index in range(0, len(parts), 2):
+        part = parts[index]
+        if _is_sensitive_pair(part):
             continue
-        retained.extend((delimiter, part))
+        if retained and index:
+            retained.append(parts[index - 1])
+        retained.append(part)
     return "".join(retained)
 
 
@@ -208,7 +236,8 @@ def _redact_fragment_text(value: str) -> str:
     decoded, complete = _bounded_url_decode(value, form_encoded=False)
     if not complete:
         return quote("[REDACTED]", safe="")
-    return quote(_redact_non_url_text(decoded), safe="/-._~")
+    safe_value = _remove_sensitive_value_pairs(decoded)
+    return quote(_redact_non_url_text(safe_value), safe="/-._~")
 
 
 def _filter_sensitive_fragment(fragment: str) -> str:
@@ -234,7 +263,12 @@ def _redact_non_url_text(value: str) -> str:
         lambda match: f"{match.group(1)}=[REDACTED]", text
     )
     text = _KEY_VALUE_SECRET.sub(
-        lambda match: f"{match.group(1)}=[REDACTED]", text
+        lambda match: (
+            f"{match.group(1)}{match.group(2)}[REDACTED]"
+            if _is_sensitive_name(match.group(1))
+            else match.group(0)
+        ),
+        text,
     )
     return _AUTH_SCHEME_SECRET.sub(_redact_auth_scheme, text)
 
@@ -296,7 +330,7 @@ def redact(value: Any) -> Any:
     """Recursively remove authentication material and private endpoint details."""
     if isinstance(value, Mapping):
         return {
-            str(key): "[REDACTED]" if _SENSITIVE_KEY.search(str(key)) else redact(item)
+            str(key): "[REDACTED]" if _is_sensitive_name(str(key)) else redact(item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):

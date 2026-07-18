@@ -30,6 +30,17 @@ SYNTHETIC_SECRET = "sk-fake-7a9b3c4d5e6f-SECRET"
 SYNTHETIC_TOKEN = "Bearer eyJhbGciOiJub25lIn0.secret-token-value"
 SYNTHETIC_API_KEY = "apikey=AKIAIOSFODNN7SECRET"
 EXACT_CREDENTIAL_MARKER = "EXACT-CREDENTIAL-MARKER-4f91c7"
+CANONICAL_SENSITIVE_NAMES = (
+    "authorization", "auth", "cookie", "credential", "password", "secret",
+    "token", "api_key", "api-key", "apikey", "access_token", "access-token",
+    "accesstoken", "client_secret", "client-secret", "clientsecret", "signature",
+    "sig", "security_token", "security-token", "securitytoken",
+    "x_amz_credential", "x-amz-credential", "x_amz_signature",
+    "x-amz-signature", "x_amz_security_token", "x-amz-security-token",
+    "x_goog_credential", "x-goog-credential", "x_goog_signature",
+    "x-goog-signature", "awsaccesskeyid", "googleaccessid", "key_pair_id",
+    "key-pair-id", "keypairid",
+)
 PRIVATE_HOST_URL = "https://192.168.1.100/internal/admin"
 CREDENTIAL_URL = "https://user:password@internal.example.com/data"
 UNSAFE_MARKERS = [
@@ -1062,6 +1073,216 @@ class TestS6URLRedactionPersistence:
                 "keep": ["yes"],
             }
         assert "hidden" not in snapshot_text
+
+
+class TestCanonicalSensitiveNameDirect:
+    @pytest.mark.parametrize("name", CANONICAL_SENSITIVE_NAMES)
+    def test_mapping_query_and_fragment_share_exact_sensitive_names(self, name):
+        url = (
+            f"https://example.invalid/data.csv?{name}=LEAK_MARKER_123456&keep=yes"
+            f"#{name}=LEAK_MARKER_123456&state=public"
+        )
+
+        assert redact({name: "LEAK_MARKER_123456"})[name] == "[REDACTED]"
+        result = redact(url)
+        assert "LEAK_MARKER_123456" not in result
+        assert "keep=yes" in result
+        assert "state=public" in result
+
+    def test_exact_matching_preserves_tokenized_fields(self):
+        assert redact({"tokenized_fields": ["field1"]}) == {
+            "tokenized_fields": ["field1"]
+        }
+
+    @pytest.mark.parametrize("name", CANONICAL_SENSITIVE_NAMES)
+    def test_encoded_equals_credential_in_key_data_is_dropped(self, name):
+        result = redact(
+            f"https://example.invalid/data.csv?"
+            f"{name}%3DLEAK_MARKER_123456&keep=yes"
+        )
+
+        assert "LEAK_MARKER_123456" not in result
+        assert "keep=yes" in result
+
+    def test_benign_encoded_equals_remains_key_data(self):
+        from urllib.parse import parse_qsl, urlsplit
+
+        result = redact(
+            "https://example.invalid/data.csv?note%3Dalpha%3Dbeta&keep=yes"
+        )
+
+        assert parse_qsl(urlsplit(result).query, keep_blank_values=True) == [
+            ("note=alpha=beta", ""),
+            ("keep", "yes"),
+        ]
+
+    @pytest.mark.parametrize("name", CANONICAL_SENSITIVE_NAMES)
+    @pytest.mark.parametrize("surface", ["query-value", "plain-fragment"])
+    def test_initial_decoded_chunk_uses_complete_sensitive_pair_predicate(
+        self, name, surface
+    ):
+        from urllib.parse import quote
+
+        pair = quote(f"{name}=LEAK_MARKER_123456", safe="")
+        suffix = f"?note={pair}&keep=yes" if surface == "query-value" else f"#{pair}"
+
+        result = redact(f"https://example.invalid/data.csv{suffix}")
+
+        assert "LEAK_MARKER_123456" not in result
+        if surface == "query-value":
+            assert "keep=yes" in result
+
+
+class TestCanonicalSensitiveNamePersistence:
+    @pytest.mark.parametrize("name", CANONICAL_SENSITIVE_NAMES)
+    def test_complete_vocabulary_is_absent_from_snapshot_and_sqlite(
+        self, tmp_path, name
+    ):
+        import sqlite3
+        from urllib.parse import quote
+
+        marker = "LEAK_MARKER_123456"
+        pair = quote(f"{name}={marker}", safe="")
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            f"https://example.invalid/data.csv?{name}={marker}&"
+            f"encoded={pair}&keep=yes#{pair}"
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        assert marker not in snapshot_text
+        assert marker not in stored_url
+        assert marker not in raw_record_json
+        assert "keep=yes" in stored_url
+
+    def test_benign_encoded_equals_survives_snapshot_and_sqlite(self, tmp_path):
+        import sqlite3
+        from urllib.parse import parse_qsl, urlsplit
+
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            "https://example.invalid/data.csv?note%3Dalpha%3Dbeta&keep=yes"
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot = json.loads(
+            summary.portals["nged"].snapshot_path.read_text("utf-8")
+        )
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        expected = [("note=alpha=beta", ""), ("keep", "yes")]
+        for persisted in (
+            snapshot["resources"][0]["url"],
+            stored_url,
+            json.loads(raw_record_json)["url"],
+        ):
+            assert parse_qsl(
+                urlsplit(persisted).query, keep_blank_values=True
+            ) == expected
+
+
+MALFORMED_OR_CONTROL_KEYS = (
+    "token%",
+    "token%2",
+    "token%GG",
+    "tok%65n%",
+    "token%00",
+    "token%1F",
+    "token%7F",
+)
+
+
+class TestMalformedAndControlURLDataDirect:
+    @pytest.mark.parametrize("raw_key", MALFORMED_OR_CONTROL_KEYS)
+    @pytest.mark.parametrize("surface", ["query", "fragment"])
+    def test_affected_component_fails_closed(self, raw_key, surface):
+        suffix = (
+            f"?{raw_key}=LEAK_MARKER_123456&keep=yes"
+            if surface == "query"
+            else f"#{raw_key}=LEAK_MARKER_123456&state=public"
+        )
+
+        result = redact(f"https://example.invalid/data.csv{suffix}")
+
+        assert "LEAK_MARKER_123456" not in result
+
+    @pytest.mark.parametrize("surface", ["query", "fragment"])
+    def test_benign_well_formed_percent_data_is_preserved(self, surface):
+        from urllib.parse import parse_qs, urlsplit
+
+        suffix = "?note=caf%C3%A9" if surface == "query" else "#note=caf%C3%A9"
+        parsed = urlsplit(redact(f"https://example.invalid/data.csv{suffix}"))
+
+        assert parse_qs(getattr(parsed, surface)) == {"note": ["café"]}
+
+
+class TestMalformedAndControlURLDataPersistence:
+    @pytest.mark.parametrize("raw_key", MALFORMED_OR_CONTROL_KEYS)
+    @pytest.mark.parametrize("surface", ["query", "fragment"])
+    def test_all_representatives_are_absent_from_snapshot_and_sqlite(
+        self, tmp_path, raw_key, surface
+    ):
+        import sqlite3
+
+        suffix = (
+            f"?{raw_key}=LEAK_MARKER_123456&keep=yes"
+            if surface == "query"
+            else f"#{raw_key}=LEAK_MARKER_123456&state=public"
+        )
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            f"https://example.invalid/data.csv{suffix}"
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        assert "LEAK_MARKER_123456" not in snapshot_text
+        assert "LEAK_MARKER_123456" not in stored_url
+        assert "LEAK_MARKER_123456" not in raw_record_json
+
+    @pytest.mark.parametrize("surface", ["query", "fragment"])
+    def test_benign_well_formed_percent_data_survives_persistence(
+        self, tmp_path, surface
+    ):
+        import sqlite3
+        from urllib.parse import parse_qs, urlsplit
+
+        suffix = "?note=caf%C3%A9" if surface == "query" else "#note=caf%C3%A9"
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = (
+            f"https://example.invalid/data.csv{suffix}"
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot = json.loads(
+            summary.portals["nged"].snapshot_path.read_text("utf-8")
+        )
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        for persisted in (
+            snapshot["resources"][0]["url"],
+            stored_url,
+            json.loads(raw_record_json)["url"],
+        ):
+            parsed = urlsplit(persisted)
+            assert parse_qs(getattr(parsed, surface)) == {"note": ["café"]}
 
 
 class TestQ1CLISecurityPath:
