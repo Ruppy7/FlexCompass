@@ -800,8 +800,16 @@ class TestS5EncodedSpaceCredentialDirect:
         [
             ("?note=public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
             ("?note=public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("?note=public%2520Bearer%2520TokenMarker123456", "TokenMarker123456"),
+            ("?note=public%2520Basic%2520YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("?note=public+Bearer+TokenMarker123456", "TokenMarker123456"),
+            ("?note=public+Basic+YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
             ("#note=public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
             ("#note=public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("#note=public%2520Bearer%2520TokenMarker123456", "TokenMarker123456"),
+            ("#note=public%2520Basic%2520YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("#note=public+Bearer+TokenMarker123456", "TokenMarker123456"),
+            ("#note=public+Basic+YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
         ],
     )
     def test_encoded_query_and_fragment_values_are_redacted(self, suffix, secret):
@@ -825,6 +833,32 @@ class TestS5EncodedSpaceCredentialDirect:
 
         assert parse_qs(urlsplit(redact(url)).query) == {"note": [value]}
 
+    def test_percent_encoded_literal_plus_remains_literal(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        url = "https://example.invalid/data.csv?note=alpha%2Bbeta"
+
+        assert parse_qs(urlsplit(redact(url)).query) == {"note": ["alpha+beta"]}
+
+    def test_form_spaces_are_redacted_before_an_encoded_sensitive_delimiter(self):
+        url = (
+            "https://example.invalid/data.csv?"
+            "note=public+Bearer+TokenMarker123456%26auth=hidden"
+        )
+
+        result = redact(url)
+
+        assert "TokenMarker123456" not in result
+        assert "hidden" not in result
+        assert "public" in result
+
+    def test_literal_plus_survives_before_an_encoded_sensitive_delimiter(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        url = "https://example.invalid/data.csv?note=alpha%2Bbeta%26auth=hidden"
+
+        assert parse_qs(urlsplit(redact(url)).query) == {"note": ["alpha+beta"]}
+
 
 class TestS5EncodedSpaceCredentialEndToEnd:
     """S5: End-to-end sync tests for encoded-space credentials in URLs."""
@@ -834,6 +868,10 @@ class TestS5EncodedSpaceCredentialEndToEnd:
         [
             ("public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
             ("public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("public%2520Bearer%2520TokenMarker123456", "TokenMarker123456"),
+            ("public%2520Basic%2520YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("public+Bearer+TokenMarker123456", "TokenMarker123456"),
+            ("public+Basic+YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
         ],
     )
     def test_sync_redacts_encoded_query_values_from_snapshot_and_sqlite(

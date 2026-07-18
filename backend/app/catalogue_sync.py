@@ -112,6 +112,7 @@ _SENSITIVE_QUERY_PARAM = re.compile(
     r"key-pair-id)$",
     re.IGNORECASE,
 )
+_QUERY_VALUE_DECODE_ROUNDS = 3
 
 
 def _is_private_host(hostname: str | None) -> bool:
@@ -154,7 +155,9 @@ def _filter_sensitive_query(query: str) -> str:
 
     for segment in amp_segments:
         # Decode this segment to check for hidden sensitive keys
-        decoded_segment = unquote(segment)
+        # Keep an encoded literal plus distinguishable from a form-space plus.
+        structural_segment = re.sub(r"(?i)%2b", "%252B", segment)
+        decoded_segment = unquote(structural_segment)
 
         # Check if this segment contains ; or & followed by a sensitive key
         # Pattern: ;sensitive_key= or &sensitive_key=
@@ -175,18 +178,32 @@ def _filter_sensitive_query(query: str) -> str:
                 if "=" in part:
                     key, _, value = part.partition("=")
                     if not _SENSITIVE_QUERY_PARAM.match(key):
-                        pairs.append((key, _redact_non_url_text(value)))
+                        pairs.append((key, _redact_query_value(value)))
                 elif part:
                     pairs.append((part, ""))
         else:
-            # Keep the decoded segment as-is (may contain & or ; in value)
-            if "=" in decoded_segment:
-                key, _, value = decoded_segment.partition("=")
-                pairs.append((key, _redact_non_url_text(value)))
-            elif decoded_segment:
-                pairs.append((decoded_segment, ""))
+            # Decode the retained value independently so deeper encoded
+            # delimiters remain data rather than acquiring query semantics.
+            if "=" in segment:
+                raw_key, _, raw_value = segment.partition("=")
+                pairs.append((unquote(raw_key), _redact_query_value(raw_value)))
+            elif segment:
+                pairs.append((unquote(segment), ""))
 
     return urlencode(pairs)
+
+
+def _redact_query_value(value: str) -> str:
+    """Decode and redact one retained URL value without reparsing its contents."""
+    from urllib.parse import unquote, unquote_plus
+
+    decoded = unquote_plus(value)
+    for _ in range(_QUERY_VALUE_DECODE_ROUNDS - 1):
+        further_decoded = unquote(decoded)
+        if further_decoded == decoded:
+            break
+        decoded = further_decoded
+    return _redact_non_url_text(decoded)
 
 
 def _filter_sensitive_fragment(fragment: str) -> str:
