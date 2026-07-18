@@ -93,7 +93,7 @@ _SENSITIVE_KEY = re.compile(
 )
 _URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _KEY_VALUE_SECRET = re.compile(
-    r"(?i)\b(password|secret|token|api[_-]?key|access[_-]?token|"
+    r"(?i)\b(auth|credential|password|secret|token|api[_-]?key|access[_-]?token|"
     r"client[_-]?secret)\s*[=:]\s*[^\s,;&]+"
 )
 _AUTHORIZATION_SECRET = re.compile(
@@ -101,10 +101,10 @@ _AUTHORIZATION_SECRET = re.compile(
 )
 _COOKIE_SECRET = re.compile(r"(?i)\b(cookie)\s*[=:]\s*[^,\r\n]+")
 _AUTH_SCHEME_SECRET = re.compile(
-    r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+"
+    r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]+)"
 )
 _SENSITIVE_QUERY_PARAM = re.compile(
-    r"^(?:authorization|cookie|credential|password|secret|token|api[_-]?key|"
+    r"^(?:authorization|auth|cookie|credential|password|secret|token|api[_-]?key|"
     r"access[_-]?token|client[_-]?secret|signature|sig|security[_-]?token|"
     r"x-amz-(?:credential|signature|security-token)|"
     r"x-goog-(?:credential|signature)|awsaccesskeyid|googleaccessid|"
@@ -180,7 +180,16 @@ def _redact_non_url_text(value: str) -> str:
     text = _KEY_VALUE_SECRET.sub(
         lambda match: f"{match.group(1)}=[REDACTED]", text
     )
-    return _AUTH_SCHEME_SECRET.sub("[REDACTED]", text)
+    return _AUTH_SCHEME_SECRET.sub(_redact_auth_scheme, text)
+
+
+def _redact_auth_scheme(match: re.Match[str]) -> str:
+    """Redact opaque auth values without destroying ordinary scheme-like prose."""
+    credential = match.group(2)
+    looks_opaque = len(credential) >= 16 or bool(
+        re.search(r"[0-9._~+/=-]", credential)
+    )
+    return "[REDACTED]" if looks_opaque else match.group(0)
 
 
 def _safe_text(value: str) -> str:
@@ -471,6 +480,7 @@ def _sync_one(
         "snapshot_path": snapshot_path.as_posix(),
         "content_hash": content_hash,
     }
+    _validated_snapshot({"manifest": manifest, **core})
     snapshot_existed = snapshot_path.exists()
     try:
         with get_connection(db_path) as conn:
@@ -773,8 +783,11 @@ def diff_snapshots(before: str | Path, after: str | Path) -> SnapshotDiff:
         raise ValueError("cannot diff snapshots from different portals")
     old, new = before_snapshot.datasets, after_snapshot.datasets
     changes: list[SnapshotChange] = []
-    for source_id in sorted(new.keys() - old.keys()):
-        changes.append(SnapshotChange("dataset_added", source_id, after=new[source_id]))
+    if before_snapshot.complete:
+        for source_id in sorted(new.keys() - old.keys()):
+            changes.append(
+                SnapshotChange("dataset_added", source_id, after=new[source_id])
+            )
     if before_snapshot.complete and after_snapshot.complete:
         for source_id in sorted(old.keys() - new.keys()):
             changes.append(

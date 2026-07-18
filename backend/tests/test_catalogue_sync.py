@@ -191,6 +191,19 @@ def test_snapshot_is_canonical_atomic_redacted_and_repeatable(tmp_path: Path):
     assert "10.0.0.8" not in stored_raw
 
 
+def test_sync_rejects_resource_collections_that_diff_would_reject(tmp_path: Path):
+    result = make_result("nged")
+    result.datasets[0].resources = [
+        result.resources[0].model_copy(update={"name": "Nested-only name"})
+    ]
+
+    summary = run_sync(tmp_path, {"nged": result})
+
+    assert summary.status == "failed"
+    assert summary.portals["nged"].snapshot_path is None
+    assert not list((tmp_path / "snapshots").rglob("nged.json"))
+
+
 def test_content_hash_ignores_observation_clock_for_identical_source_content(tmp_path: Path):
     first = run_sync(tmp_path, {"nged": make_result("nged")})
     later = NOW + timedelta(minutes=5)
@@ -417,6 +430,24 @@ def test_diff_does_not_report_definitive_removal_from_partial_snapshot(
     result = diff_snapshots(before, after)
 
     assert not any(change.kind == "dataset_removed" for change in result.changes)
+
+
+def test_diff_does_not_report_definitive_addition_from_partial_baseline(
+    tmp_path: Path,
+):
+    before = write_snapshot(
+        tmp_path / "before.json",
+        portal_id="nged",
+        complete=False,
+    )
+    after = write_snapshot(
+        tmp_path / "after.json",
+        make_result("nged", source_id="possibly-existing").datasets[0],
+    )
+
+    result = diff_snapshots(before, after)
+
+    assert not any(change.kind == "dataset_added" for change in result.changes)
 
 
 def test_diff_compares_resources_and_evidence_order_insensitively(tmp_path: Path):

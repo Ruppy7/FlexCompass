@@ -231,6 +231,16 @@ class TestSafeErrorRedaction:
 
 
 class TestRedactFunction:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "Basic metadata about network capacity",
+            "Bearer information about public datasets",
+        ],
+    )
+    def test_benign_auth_scheme_prose_is_preserved(self, value):
+        assert redact(value) == value
+
     def test_authorization_key(self):
         assert redact({"authorization": SYNTHETIC_TOKEN})["authorization"] == "[REDACTED]"
 
@@ -301,6 +311,20 @@ class TestRedactFunction:
         assert r["a"]["authorization"] == "[REDACTED]"
         assert r["a"]["b"][0]["token"] == "[REDACTED]"
         assert r["a"]["b"][0]["ok"] == "v"
+
+    def test_sync_redacts_inline_credential_and_auth_query_aliases(self, tmp_path):
+        record = _ckan_record_with_secret()
+        record["notes"] = f"credential={EXACT_CREDENTIAL_MARKER}"
+        record["resources"][0]["url"] = (
+            "https://example.invalid/data.csv?format=csv&"
+            f"auth={EXACT_CREDENTIAL_MARKER}"
+        )
+
+        summary, _, _ = _run_sync(tmp_path, "nged", record)
+        snapshot = summary.portals["nged"].snapshot_path.read_text("utf-8")
+
+        assert EXACT_CREDENTIAL_MARKER not in snapshot
+        assert "format=csv" in snapshot
 
 
 class TestSummaryJSONRedaction:
