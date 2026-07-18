@@ -148,9 +148,10 @@ def _filter_sensitive_query(query: str) -> str:
         return ""
     from urllib.parse import unquote_plus, urlencode
 
-    # Split on both '&' and ';' since both are valid query separators
-    # (RFC 3986 §3.4).  parse_qsl on Python ≥ 3.10 no longer treats ';'
-    # as a separator by default, so we split manually.
+    # Split on both '&' and ';' — semicolon is a supported legacy separator
+    # for this security filter (not a general RFC 3986 query-separator guarantee).
+    # parse_qsl on Python ≥ 3.10 no longer treats ';' as a separator by default,
+    # so we split manually to ensure credential-bearing pairs are caught.
     pairs: list[tuple[str, str]] = []
     for part in re.split(r"[&;]", query):
         if "=" in part:

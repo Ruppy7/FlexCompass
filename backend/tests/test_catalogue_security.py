@@ -368,6 +368,40 @@ class TestRedactFunction:
         assert "MARKER" not in snapshot
         assert "format=csv" in snapshot
 
+    def test_sync_redacts_basic_and_bearer_credentials_from_raw_record(self, tmp_path):
+        """End-to-end: Basic YTpi and Bearer abcdefghijklmno are absent from
+        snapshot and SQLite raw-record fields, while benign prose survives."""
+        record = _ckan_record_with_secret()
+        record["notes"] = (
+            "Auth example: Basic YTpi and Bearer abcdefghijklmno. "
+            "Benign: Basic metadata about network capacity "
+            "and Bearer information about public datasets."
+        )
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+
+        # Credential values must be absent
+        assert "YTpi" not in snapshot_text
+        assert "abcdefghijklmno" not in snapshot_text
+        # Benign prose must survive
+        assert "Basic metadata about network capacity" in snapshot_text
+        assert "Bearer information about public datasets" in snapshot_text
+
+        # SQLite raw-record fields must also be clean
+        import sqlite3
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        try:
+            for row in conn.execute("SELECT raw_record_json FROM catalogue_datasets").fetchall():
+                row_text = _serialise(dict(row))
+                assert "YTpi" not in row_text, "Basic YTpi leaked into DB raw_record"
+                assert "abcdefghijklmno" not in row_text, "Bearer token leaked into DB raw_record"
+                assert "Basic metadata about network capacity" in row_text
+                assert "Bearer information about public datasets" in row_text
+        finally:
+            conn.close()
+
 
 class TestSummaryJSONRedaction:
     def test_summary_no_secrets(self, tmp_path):
