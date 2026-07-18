@@ -104,6 +104,7 @@ _AUTH_SCHEME_SECRET = re.compile(
     r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]+)"
 )
 _QUERY_VALUE_DECODE_ROUNDS = 3
+_NESTED_URL_REDACTION_ROUNDS = 3
 _VALID_PERCENT_ESCAPE = re.compile(r"[0-9a-fA-F]{2}")
 
 
@@ -116,6 +117,14 @@ def _is_sensitive_pair(value: str) -> bool:
     """Return whether decoded data starts with an exact sensitive pair."""
     key, separator, _ = value.partition("=")
     return bool(separator and _is_sensitive_name(key.strip()))
+
+
+def _decoded_key_is_sensitive(value: str) -> bool:
+    """Reject canonical names hidden by whitespace or encoded delimiters."""
+    return any(
+        _is_sensitive_name(part.partition("=")[0].strip())
+        for part in re.split(r"[&;]", value)
+    )
 
 
 def _has_malformed_percent_escape(value: str) -> bool:
@@ -147,7 +156,9 @@ def _is_private_host(hostname: str | None) -> bool:
     return not address.is_global
 
 
-def _safe_url(value: str) -> str:
+def _safe_url(
+    value: str, *, nested_url_rounds: int = _NESTED_URL_REDACTION_ROUNDS
+) -> str:
     try:
         parsed = urlsplit(value)
     except ValueError:
@@ -155,14 +166,18 @@ def _safe_url(value: str) -> str:
     if parsed.username or parsed.password or _is_private_host(parsed.hostname):
         return "[REDACTED_URL]"
     # Preserve benign query parameters; remove only sensitive ones.
-    safe_query = _filter_sensitive_query(parsed.query)
+    safe_query = _filter_sensitive_query(
+        parsed.query, nested_url_rounds=nested_url_rounds
+    )
     safe_fragment = _filter_sensitive_fragment(parsed.fragment)
     return urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, safe_query, safe_fragment)
     )
 
 
-def _filter_sensitive_query(query: str) -> str:
+def _filter_sensitive_query(
+    query: str, *, nested_url_rounds: int = _NESTED_URL_REDACTION_ROUNDS
+) -> str:
     """Remove sensitive query parameters while preserving benign ones."""
     if not query:
         return ""
@@ -177,9 +192,13 @@ def _filter_sensitive_query(query: str) -> str:
             continue
         raw_key, separator, raw_value = segment.partition("=")
         key, complete = _bounded_url_decode(raw_key, form_encoded=True)
-        if not complete or _is_sensitive_name(key) or _is_sensitive_pair(key):
+        if not complete or _decoded_key_is_sensitive(key):
             continue
-        value = _redact_query_value(raw_value) if separator else ""
+        value = (
+            _redact_query_value(raw_value, nested_url_rounds=nested_url_rounds)
+            if separator
+            else ""
+        )
         pairs.append((key, value))
 
     return urlencode(pairs)
@@ -221,12 +240,22 @@ def _remove_sensitive_value_pairs(value: str) -> str:
     return "".join(retained)
 
 
-def _redact_query_value(value: str) -> str:
+def _redact_query_value(
+    value: str, *, nested_url_rounds: int, form_encoded: bool = True
+) -> str:
     """Decode and redact one retained URL value without reparsing its contents."""
-    decoded, complete = _bounded_url_decode(value, form_encoded=True)
+    decoded, complete = _bounded_url_decode(value, form_encoded=form_encoded)
     if not complete:
         return "[REDACTED]"
-    return _redact_non_url_text(_remove_sensitive_value_pairs(decoded))
+    safe_value = _redact_non_url_text(_remove_sensitive_value_pairs(decoded))
+    if nested_url_rounds <= 0:
+        return "[REDACTED_URL]" if _URL.search(safe_value) else safe_value
+    return _URL.sub(
+        lambda match: _safe_url(
+            match.group(0), nested_url_rounds=nested_url_rounds - 1
+        ),
+        safe_value,
+    )
 
 
 def _redact_fragment_text(value: str) -> str:
@@ -240,6 +269,36 @@ def _redact_fragment_text(value: str) -> str:
     return quote(_redact_non_url_text(safe_value), safe="/-._~")
 
 
+def _filter_plain_fragment(fragment: str) -> str:
+    """Filter pair-like fragment chunks without reparsing encoded delimiters."""
+    from urllib.parse import quote
+
+    parts = re.split(r"([&;])", fragment)
+    retained: list[str] = []
+    for index in range(0, len(parts), 2):
+        segment = parts[index]
+        if not segment:
+            continue
+        raw_key, separator, raw_value = segment.partition("=")
+        key, complete = _bounded_url_decode(raw_key, form_encoded=False)
+        if not complete or _decoded_key_is_sensitive(key):
+            continue
+        if separator:
+            value = _redact_query_value(
+                raw_value,
+                nested_url_rounds=_NESTED_URL_REDACTION_ROUNDS,
+            )
+            safe_segment = (
+                f"{quote(key, safe='/-._~')}={quote(value, safe='/-._~')}"
+            )
+        else:
+            safe_segment = _redact_fragment_text(segment)
+        if retained and index:
+            retained.append(parts[index - 1])
+        retained.append(safe_segment)
+    return "".join(retained)
+
+
 def _filter_sensitive_fragment(fragment: str) -> str:
     """Preserve public fragments while removing credential-bearing pairs."""
     if not fragment:
@@ -250,9 +309,7 @@ def _filter_sensitive_fragment(fragment: str) -> str:
         safe_prefix = _redact_fragment_text(prefix)
         return f"{safe_prefix}?{safe_query}" if safe_query else safe_prefix
 
-    if "=" in fragment:
-        return _filter_sensitive_query(fragment)
-    return _redact_fragment_text(fragment)
+    return _filter_plain_fragment(fragment)
 
 
 def _redact_non_url_text(value: str) -> str:

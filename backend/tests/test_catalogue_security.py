@@ -1132,6 +1132,46 @@ class TestCanonicalSensitiveNameDirect:
         if surface == "query-value":
             assert "keep=yes" in result
 
+    @pytest.mark.parametrize("delimiter", ["%26", "%3B"])
+    def test_encoded_internal_key_delimiter_cannot_smuggle_sensitive_name(
+        self, delimiter
+    ):
+        result = redact(
+            "https://example.invalid/data.csv?"
+            f"note{delimiter}token=LEAK_MARKER_123456&keep=yes"
+        )
+
+        assert "LEAK_MARKER_123456" not in result
+        assert "keep=yes" in result
+
+    @pytest.mark.parametrize("raw_key", ["token%20", "%20token", "token+"])
+    def test_sensitive_query_name_ignores_syntactic_outer_whitespace(self, raw_key):
+        result = redact(
+            f"https://example.invalid/data.csv?{raw_key}=LEAK_MARKER_123456&keep=yes"
+        )
+
+        assert "LEAK_MARKER_123456" not in result
+        assert "keep=yes" in result
+
+    def test_encoded_nested_credential_url_is_redacted(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        result = redact(
+            "https://example.invalid/data.csv?"
+            "redirect=https%3A%2F%2Fuser%3Apass%40internal.example.com%2Fx"
+        )
+
+        assert parse_qs(urlsplit(result).query) == {"redirect": ["[REDACTED_URL]"]}
+        assert "user" not in result
+        assert "pass" not in result
+        assert "internal.example.com" not in result
+
+    @pytest.mark.parametrize("fragment", ["/route;mode=full", "section;mode=full"])
+    def test_benign_opaque_fragment_structure_is_preserved(self, fragment):
+        url = f"https://example.invalid/data.csv#{fragment}"
+
+        assert redact(url) == url
+
 
 class TestCanonicalSensitiveNamePersistence:
     @pytest.mark.parametrize("name", CANONICAL_SENSITIVE_NAMES)
@@ -1188,6 +1228,65 @@ class TestCanonicalSensitiveNamePersistence:
             assert parse_qsl(
                 urlsplit(persisted).query, keep_blank_values=True
             ) == expected
+
+    @pytest.mark.parametrize(
+        "url, forbidden",
+        [
+            (
+                "https://example.invalid/data.csv?"
+                "note%26token=LEAK_MARKER_123456&keep=yes",
+                "LEAK_MARKER_123456",
+            ),
+            (
+                "https://example.invalid/data.csv?"
+                "token%20=LEAK_MARKER_123456&keep=yes",
+                "LEAK_MARKER_123456",
+            ),
+            (
+                "https://example.invalid/data.csv?"
+                "redirect=https%3A%2F%2Fuser%3Apass%40internal.example.com%2Fx",
+                "internal.example.com",
+            ),
+        ],
+    )
+    def test_review_bypasses_are_absent_from_snapshot_and_sqlite(
+        self, tmp_path, url, forbidden
+    ):
+        import sqlite3
+
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = url
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        assert forbidden not in snapshot_text
+        assert forbidden not in stored_url
+        assert forbidden not in raw_record_json
+
+    def test_opaque_fragment_structure_survives_snapshot_and_sqlite(self, tmp_path):
+        import sqlite3
+
+        expected = "https://example.invalid/data.csv#/route;mode=full"
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = expected
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot = json.loads(
+            summary.portals["nged"].snapshot_path.read_text("utf-8")
+        )
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        assert snapshot["resources"][0]["url"] == expected
+        assert stored_url == expected
+        assert json.loads(raw_record_json)["url"] == expected
 
 
 MALFORMED_OR_CONTROL_KEYS = (
