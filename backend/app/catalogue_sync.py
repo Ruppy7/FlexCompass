@@ -169,7 +169,9 @@ def _safe_url(
     safe_query = _filter_sensitive_query(
         parsed.query, nested_url_rounds=nested_url_rounds
     )
-    safe_fragment = _filter_sensitive_fragment(parsed.fragment)
+    safe_fragment = _filter_sensitive_fragment(
+        parsed.fragment, nested_url_rounds=nested_url_rounds
+    )
     return urlunsplit(
         (parsed.scheme, parsed.netloc, parsed.path, safe_query, safe_fragment)
     )
@@ -248,28 +250,44 @@ def _redact_query_value(
     if not complete:
         return "[REDACTED]"
     safe_value = _redact_non_url_text(_remove_sensitive_value_pairs(decoded))
+    return _redact_nested_urls(
+        safe_value, nested_url_rounds=nested_url_rounds
+    )
+
+
+def _redact_nested_urls(value: str, *, nested_url_rounds: int) -> str:
+    """Redact embedded URLs with a single budget shared across all components."""
     if nested_url_rounds <= 0:
-        return "[REDACTED_URL]" if _URL.search(safe_value) else safe_value
+        return "[REDACTED_URL]" if _URL.search(value) else value
     return _URL.sub(
         lambda match: _safe_url(
             match.group(0), nested_url_rounds=nested_url_rounds - 1
         ),
-        safe_value,
+        value,
     )
 
 
-def _redact_fragment_text(value: str) -> str:
-    """Percent-decode and safely re-encode non-query fragment data."""
+def _redact_fragment_value(value: str, *, nested_url_rounds: int) -> str:
+    """Redact fragment data while preserving its benign source representation."""
     from urllib.parse import quote
 
     decoded, complete = _bounded_url_decode(value, form_encoded=False)
     if not complete:
         return quote("[REDACTED]", safe="")
     safe_value = _remove_sensitive_value_pairs(decoded)
-    return quote(_redact_non_url_text(safe_value), safe="/-._~")
+    redacted_value = _redact_non_url_text(safe_value)
+    plus_as_space = _redact_non_url_text(safe_value.replace("+", " "))
+    if plus_as_space != safe_value.replace("+", " "):
+        redacted_value = plus_as_space
+    redacted_value = _redact_nested_urls(
+        redacted_value, nested_url_rounds=nested_url_rounds
+    )
+    if redacted_value == decoded:
+        return value
+    return quote(redacted_value, safe="/-._~")
 
 
-def _filter_plain_fragment(fragment: str) -> str:
+def _filter_plain_fragment(fragment: str, *, nested_url_rounds: int) -> str:
     """Filter pair-like fragment chunks without reparsing encoded delimiters."""
     from urllib.parse import quote
 
@@ -284,32 +302,41 @@ def _filter_plain_fragment(fragment: str) -> str:
         if not complete or _decoded_key_is_sensitive(key):
             continue
         if separator:
-            value = _redact_query_value(
-                raw_value,
-                nested_url_rounds=_NESTED_URL_REDACTION_ROUNDS,
+            value = _redact_fragment_value(
+                raw_value, nested_url_rounds=nested_url_rounds
             )
             safe_segment = (
-                f"{quote(key, safe='/-._~')}={quote(value, safe='/-._~')}"
+                f"{quote(key, safe='/-._~')}={value}"
             )
         else:
-            safe_segment = _redact_fragment_text(segment)
+            safe_segment = _redact_fragment_value(
+                segment, nested_url_rounds=nested_url_rounds
+            )
         if retained and index:
             retained.append(parts[index - 1])
         retained.append(safe_segment)
     return "".join(retained)
 
 
-def _filter_sensitive_fragment(fragment: str) -> str:
+def _filter_sensitive_fragment(
+    fragment: str, *, nested_url_rounds: int = _NESTED_URL_REDACTION_ROUNDS
+) -> str:
     """Preserve public fragments while removing credential-bearing pairs."""
     if not fragment:
         return ""
     prefix, separator, query = fragment.partition("?")
     if separator:
-        safe_query = _filter_sensitive_query(query)
-        safe_prefix = _redact_fragment_text(prefix)
+        safe_query = _filter_sensitive_query(
+            query, nested_url_rounds=nested_url_rounds
+        )
+        safe_prefix = _redact_fragment_value(
+            prefix, nested_url_rounds=nested_url_rounds
+        )
         return f"{safe_prefix}?{safe_query}" if safe_query else safe_prefix
 
-    return _filter_plain_fragment(fragment)
+    return _filter_plain_fragment(
+        fragment, nested_url_rounds=nested_url_rounds
+    )
 
 
 def _redact_non_url_text(value: str) -> str:

@@ -1172,6 +1172,33 @@ class TestCanonicalSensitiveNameDirect:
 
         assert redact(url) == url
 
+    @pytest.mark.parametrize("suffix", ["", "?keep=yes"])
+    def test_encoded_nested_credential_url_is_redacted_from_fragment(self, suffix):
+        result = redact(
+            "https://example.invalid/data.csv#"
+            "https%3A%2F%2Fuser%3Apass%40internal.example.com%2Fx"
+            f"{suffix}"
+        )
+
+        assert "user" not in result
+        assert "pass" not in result
+        assert "internal.example.com" not in result
+
+    def test_raw_plus_in_benign_fragment_pair_remains_literal(self):
+        url = "https://example.invalid/data.csv#note=alpha+beta"
+
+        assert redact(url) == url
+
+    def test_nested_fragment_url_budget_fails_closed_without_recursion(self):
+        value = "https://user:pass@internal.example.com/x"
+        for _ in range(300):
+            value = f"https://public.example.com/x#next={value}"
+
+        result = redact(value)
+
+        assert "user:pass" not in result
+        assert "internal.example.com" not in result
+
 
 class TestCanonicalSensitiveNamePersistence:
     @pytest.mark.parametrize("name", CANONICAL_SENSITIVE_NAMES)
