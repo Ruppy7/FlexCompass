@@ -898,6 +898,172 @@ class TestS5EncodedSpaceCredentialEndToEnd:
         assert "format=csv" in stored_url
 
 
+class TestS6URLRedactionDirect:
+    @pytest.mark.parametrize(
+        "suffix, secret",
+        [
+            ("?note=public%252520Bearer%252520TokenMarker123456", "TokenMarker123456"),
+            ("#note=public%252520Basic%252520YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("?note=public%25252520Bearer%25252520TokenMarker123456", "TokenMarker123456"),
+            ("#note=public%25252520Basic%25252520YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+        ],
+    )
+    def test_decode_budget_boundary_fails_closed(self, suffix, secret):
+        result = redact(f"https://example.invalid/data.csv{suffix}")
+
+        assert secret not in result
+
+    @pytest.mark.parametrize(
+        "fragment, secret",
+        [
+            ("public%20Bearer%20TokenMarker123456", "TokenMarker123456"),
+            ("public%20Basic%20YWxpY2U6c2VjcmV0", "YWxpY2U6c2VjcmV0"),
+            ("public%20Bearer%20TokenMarker123456?keep=yes", "TokenMarker123456"),
+            ("public%20Basic%20YWxpY2U6c2VjcmV0?keep=yes", "YWxpY2U6c2VjcmV0"),
+        ],
+    )
+    def test_plain_fragment_and_prefix_credentials_are_redacted(self, fragment, secret):
+        result = redact(f"https://example.invalid/data.csv#{fragment}")
+
+        assert secret not in result
+        assert "public" in result
+
+    def test_plain_fragment_uses_percent_decoding_not_form_decoding(self):
+        from urllib.parse import unquote, urlsplit
+
+        result = redact("https://example.invalid/data.csv#alpha%2Bbeta+gamma")
+
+        assert unquote(urlsplit(result).fragment) == "alpha+beta+gamma"
+
+    @pytest.mark.parametrize(
+        "suffix, component",
+        [
+            ("?note=alpha%26beta=gamma%26auth=hidden&keep=yes", "query"),
+            ("?note=alpha%3Bbeta=gamma%3Bauth=hidden&keep=yes", "query"),
+            ("#note=alpha%26beta=gamma%26auth=hidden&keep=yes", "fragment"),
+            ("#note=alpha%3Bbeta=gamma%3Bauth=hidden&keep=yes", "fragment"),
+        ],
+    )
+    def test_encoded_delimiters_remain_inside_the_retained_value(self, suffix, component):
+        from urllib.parse import parse_qs, urlsplit
+
+        parsed_url = urlsplit(redact(f"https://example.invalid/data.csv{suffix}"))
+        encoded_pairs = getattr(parsed_url, component)
+
+        assert parse_qs(encoded_pairs) == {
+            "note": ["alpha&beta=gamma"] if "%26" in suffix else ["alpha;beta=gamma"],
+            "keep": ["yes"],
+        }
+        assert "hidden" not in encoded_pairs
+
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "?tok%2565n=LEAK_MARKER&keep=yes",
+            "?tok%252565n=LEAK_MARKER&keep=yes",
+            "#tok%2565n=LEAK_MARKER&keep=yes",
+            "#tok%252565n=LEAK_MARKER&keep=yes",
+        ],
+    )
+    def test_multiply_encoded_sensitive_key_names_are_removed(self, suffix):
+        result = redact(f"https://example.invalid/data.csv{suffix}")
+
+        assert "LEAK_MARKER" not in result
+        assert "keep=yes" in result
+
+
+class TestS6URLRedactionPersistence:
+    @pytest.mark.parametrize(
+        "url, secret",
+        [
+            (
+                "https://example.invalid/data.csv?"
+                "note=public%25252520Bearer%25252520TokenMarker123456",
+                "TokenMarker123456",
+            ),
+            (
+                "https://example.invalid/data.csv#"
+                "note=public%25252520Basic%25252520YWxpY2U6c2VjcmV0",
+                "YWxpY2U6c2VjcmV0",
+            ),
+            (
+                "https://example.invalid/data.csv#public%20Bearer%20TokenMarker123456",
+                "TokenMarker123456",
+            ),
+            (
+                "https://example.invalid/data.csv#"
+                "public%20Basic%20YWxpY2U6c2VjcmV0?keep=yes",
+                "YWxpY2U6c2VjcmV0",
+            ),
+            (
+                "https://example.invalid/data.csv?tok%2565n=LEAK_MARKER&keep=yes",
+                "LEAK_MARKER",
+            ),
+            (
+                "https://example.invalid/data.csv#tok%252565n=LEAK_MARKER&keep=yes",
+                "LEAK_MARKER",
+            ),
+        ],
+    )
+    def test_credentials_are_absent_from_snapshot_and_sqlite(self, tmp_path, url, secret):
+        import sqlite3
+
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = url
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        assert secret not in snapshot_text
+        assert secret not in stored_url
+        assert secret not in raw_record_json
+
+    @pytest.mark.parametrize(
+        "url, component, expected_note",
+        [
+            (
+                "https://example.invalid/data.csv?"
+                "note=alpha%26beta=gamma%26auth=hidden&keep=yes",
+                "query",
+                "alpha&beta=gamma",
+            ),
+            (
+                "https://example.invalid/data.csv#"
+                "note=alpha%3Bbeta=gamma%3Bauth=hidden&keep=yes",
+                "fragment",
+                "alpha;beta=gamma",
+            ),
+        ],
+    )
+    def test_persistence_preserves_encoded_delimiters_as_value_data(
+        self, tmp_path, url, component, expected_note
+    ):
+        import sqlite3
+        from urllib.parse import parse_qs, urlsplit
+
+        record = _ckan_record_with_secret()
+        record["resources"][0]["url"] = url
+
+        summary, db, _ = _run_sync(tmp_path, "nged", record)
+        snapshot_text = summary.portals["nged"].snapshot_path.read_text("utf-8")
+        with sqlite3.connect(db) as conn:
+            stored_url, raw_record_json = conn.execute(
+                "SELECT url, raw_record_json FROM catalogue_resources"
+            ).fetchone()
+
+        for persisted in (stored_url, json.loads(raw_record_json)["url"]):
+            parsed_url = urlsplit(persisted)
+            assert parse_qs(getattr(parsed_url, component)) == {
+                "note": [expected_note],
+                "keep": ["yes"],
+            }
+        assert "hidden" not in snapshot_text
+
+
 class TestQ1CLISecurityPath:
     """Q1: CLI security path - secret-bearing result flows through CLI sync seam."""
 

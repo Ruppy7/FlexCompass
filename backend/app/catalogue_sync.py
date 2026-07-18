@@ -147,63 +147,68 @@ def _filter_sensitive_query(query: str) -> str:
     """Remove sensitive query parameters while preserving benign ones."""
     if not query:
         return ""
-    from urllib.parse import unquote, urlencode
+    from urllib.parse import urlencode
 
-    # Split on literal & first (these are always separators)
-    amp_segments = query.split("&")
     pairs: list[tuple[str, str]] = []
 
-    for segment in amp_segments:
-        # Decode this segment to check for hidden sensitive keys
-        # Keep an encoded literal plus distinguishable from a form-space plus.
-        structural_segment = re.sub(r"(?i)%2b", "%252B", segment)
-        decoded_segment = unquote(structural_segment)
-
-        # Check if this segment contains ; or & followed by a sensitive key
-        # Pattern: ;sensitive_key= or &sensitive_key=
-        has_hidden_sensitive = False
-        for delim in [";", "&"]:
-            for part in decoded_segment.split(delim):
-                if "=" in part:
-                    key = part.partition("=")[0]
-                    if _SENSITIVE_QUERY_PARAM.match(key):
-                        has_hidden_sensitive = True
-                        break
-            if has_hidden_sensitive:
-                break
-
-        if has_hidden_sensitive:
-            # Split on both ; and & using regex and filter sensitive pairs
-            for part in re.split(r"[;&]", decoded_segment):
-                if "=" in part:
-                    key, _, value = part.partition("=")
-                    if not _SENSITIVE_QUERY_PARAM.match(key):
-                        pairs.append((key, _redact_query_value(value)))
-                elif part:
-                    pairs.append((part, ""))
-        else:
-            # Decode the retained value independently so deeper encoded
-            # delimiters remain data rather than acquiring query semantics.
-            if "=" in segment:
-                raw_key, _, raw_value = segment.partition("=")
-                pairs.append((unquote(raw_key), _redact_query_value(raw_value)))
-            elif segment:
-                pairs.append((unquote(segment), ""))
+    # Only literal source delimiters define query structure. Encoded
+    # delimiters are decoded later and remain inside their original value.
+    for segment in re.split(r"[&;]", query):
+        if not segment:
+            continue
+        raw_key, separator, raw_value = segment.partition("=")
+        key, complete = _bounded_url_decode(raw_key, form_encoded=True)
+        if not complete or _SENSITIVE_QUERY_PARAM.match(key):
+            continue
+        value = _redact_query_value(raw_value) if separator else ""
+        pairs.append((key, value))
 
     return urlencode(pairs)
 
 
-def _redact_query_value(value: str) -> str:
-    """Decode and redact one retained URL value without reparsing its contents."""
+def _bounded_url_decode(value: str, *, form_encoded: bool) -> tuple[str, bool]:
+    """Decode at most the fixed budget and report residual valid encoding."""
     from urllib.parse import unquote, unquote_plus
 
-    decoded = unquote_plus(value)
-    for _ in range(_QUERY_VALUE_DECODE_ROUNDS - 1):
-        further_decoded = unquote(decoded)
+    decoded = value
+    for round_index in range(_QUERY_VALUE_DECODE_ROUNDS):
+        decoder = unquote_plus if form_encoded and round_index == 0 else unquote
+        further_decoded = decoder(decoded)
         if further_decoded == decoded:
-            break
+            return decoded, True
         decoded = further_decoded
-    return _redact_non_url_text(decoded)
+    return decoded, unquote(decoded) == decoded
+
+
+def _remove_sensitive_value_pairs(value: str) -> str:
+    """Remove credential pairs from decoded value data without promoting it."""
+    parts = re.split(r"([;&])", value)
+    retained = [parts[0]]
+    for index in range(1, len(parts), 2):
+        delimiter, part = parts[index : index + 2]
+        key, separator, _ = part.partition("=")
+        if separator and _SENSITIVE_QUERY_PARAM.match(key):
+            continue
+        retained.extend((delimiter, part))
+    return "".join(retained)
+
+
+def _redact_query_value(value: str) -> str:
+    """Decode and redact one retained URL value without reparsing its contents."""
+    decoded, complete = _bounded_url_decode(value, form_encoded=True)
+    if not complete:
+        return "[REDACTED]"
+    return _redact_non_url_text(_remove_sensitive_value_pairs(decoded))
+
+
+def _redact_fragment_text(value: str) -> str:
+    """Percent-decode and safely re-encode non-query fragment data."""
+    from urllib.parse import quote
+
+    decoded, complete = _bounded_url_decode(value, form_encoded=False)
+    if not complete:
+        return quote("[REDACTED]", safe="")
+    return quote(_redact_non_url_text(decoded), safe="/-._~")
 
 
 def _filter_sensitive_fragment(fragment: str) -> str:
@@ -213,17 +218,12 @@ def _filter_sensitive_fragment(fragment: str) -> str:
     prefix, separator, query = fragment.partition("?")
     if separator:
         safe_query = _filter_sensitive_query(query)
-        safe_prefix = _redact_non_url_text(prefix)
+        safe_prefix = _redact_fragment_text(prefix)
         return f"{safe_prefix}?{safe_query}" if safe_query else safe_prefix
 
-    from urllib.parse import parse_qsl
-
-    pairs = parse_qsl(fragment, keep_blank_values=True)
-    if "=" in fragment or any(
-        _SENSITIVE_QUERY_PARAM.match(key) for key, _ in pairs
-    ):
+    if "=" in fragment:
         return _filter_sensitive_query(fragment)
-    return _redact_non_url_text(fragment)
+    return _redact_fragment_text(fragment)
 
 
 def _redact_non_url_text(value: str) -> str:
