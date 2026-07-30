@@ -6,12 +6,26 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 import pytest
+from app.db import MIGRATIONS, get_connection, run_migrations
+from app.outage_store import (
+    commit_ingestion_run,
+    count_outage_events,
+    count_source_snapshots,
+    get_outage_event,
+    list_outage_events,
+    list_source_snapshots,
+    record_failed_ingestion_run,
+    save_snapshot,
+    summarise_outage_events,
+    upsert_outage_events,
+)
 from app.outages import (
     OutageEvent,
     OutageReject,
@@ -229,6 +243,21 @@ def source_snapshot_data() -> dict[str, object]:
         "parser_version": "1",
         "local_snapshot_path": "data/snapshots/ssen/nafirs-hv/example.csv",
     }
+
+
+@pytest.fixture
+def temp_db(tmp_path: Path) -> Path:
+    return tmp_path / "outage-store.sqlite3"
+
+
+@pytest.fixture
+def parsed_event() -> OutageEvent:
+    return OutageEvent(**outage_event_data())
+
+
+@pytest.fixture
+def source_snapshot() -> SourceSnapshot:
+    return SourceSnapshot(**source_snapshot_data())
 
 
 @pytest.mark.parametrize(("model", "expected_fields"), EXPECTED_MODEL_FIELDS.items())
@@ -910,3 +939,464 @@ def test_discovery_wraps_invalid_resource_model_fields_without_leakage(
 
     assert "SYNTHETIC_SIGNATURE_MUST_NOT_LEAK" not in str(caught.value)
     assert "X-Amz-Signature" not in str(caught.value)
+
+
+def _install_schema_through_five(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as connection:
+        for version, ddl in MIGRATIONS[:5]:
+            connection.executescript(ddl)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
+        connection.commit()
+
+
+def _snapshot_with(
+    snapshot: SourceSnapshot,
+    *,
+    snapshot_id: str,
+    fetched_at: datetime,
+    resource_id: str | None = None,
+) -> SourceSnapshot:
+    return snapshot.model_copy(
+        update={
+            "snapshot_id": snapshot_id,
+            "content_sha256": snapshot_id.removeprefix("sha256:"),
+            "fetched_at": fetched_at,
+            "source_resource_id": resource_id or snapshot.source_resource_id,
+        }
+    )
+
+
+def _event_with(
+    event: OutageEvent,
+    *,
+    event_id: str,
+    snapshot_id: str,
+    incident_started_local: str,
+    licence_area: Literal["SEPD", "SHEPD"] = "SEPD",
+    district_short_code: str = "SWIN",
+    reporting_year: int = 2026,
+    cause_code: str | None = "99",
+    customers_affected: int | None = 220,
+    customer_minutes_lost: int | None = None,
+) -> OutageEvent:
+    return event.model_copy(
+        update={
+            "event_id": event_id,
+            "source_snapshot_id": snapshot_id,
+            "incident_started_local": incident_started_local,
+            "licence_area": licence_area,
+            "district_short_code": district_short_code,
+            "reporting_year": reporting_year,
+            "cause_code": cause_code,
+            "customers_affected": customers_affected,
+            "customer_minutes_lost": customer_minutes_lost,
+        }
+    )
+
+
+def test_outage_schema_migrates_with_required_tables_and_indexes(
+    temp_db: Path,
+) -> None:
+    assert run_migrations(temp_db) == 6
+    with get_connection(temp_db) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        snapshot_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(source_snapshots)")
+        }
+        event_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(outage_events)")
+        }
+
+    assert {
+        "source_snapshots",
+        "ingestion_runs",
+        "outage_events",
+        "outage_rejects",
+    } <= tables
+    assert {
+        "idx_outage_events_area_year",
+        "idx_outage_events_district",
+        "idx_outage_events_cause",
+        "idx_outage_events_incident",
+    } <= indexes
+    assert "signed_redirect_url" not in snapshot_columns
+    assert {"raw_record_json", "quality_flags_json"} <= event_columns
+
+
+def test_migration_six_upgrades_populated_version_five_without_data_loss(
+    temp_db: Path,
+) -> None:
+    _install_schema_through_five(temp_db)
+    with sqlite3.connect(temp_db) as connection:
+        connection.execute(
+            """INSERT INTO portal_datasets (id, name, portal_url)
+               VALUES (?, ?, ?)""",
+            ("legacy", "Legacy public fixture", "https://example.invalid/legacy"),
+        )
+        connection.commit()
+
+    assert run_migrations(temp_db) == 6
+    assert run_migrations(temp_db) == 6
+    with get_connection(temp_db) as connection:
+        row = connection.execute(
+            "SELECT name FROM portal_datasets WHERE id = ?", ("legacy",)
+        ).fetchone()
+        foreign_key_errors = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+
+    assert row[0] == "Legacy public fixture"
+    assert foreign_key_errors == []
+
+
+def test_migration_six_rolls_back_every_new_object_and_version_on_failure(
+    temp_db: Path,
+) -> None:
+    _install_schema_through_five(temp_db)
+    with sqlite3.connect(temp_db) as connection:
+        connection.execute("CREATE TABLE outage_events (placeholder TEXT)")
+        connection.commit()
+
+    with pytest.raises(sqlite3.OperationalError):
+        run_migrations(temp_db)
+
+    with sqlite3.connect(temp_db) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        versions = {
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_version")
+        }
+
+    assert "outage_events" in tables
+    assert {
+        "source_snapshots",
+        "ingestion_runs",
+        "outage_rejects",
+    }.isdisjoint(tables)
+    assert 6 not in versions
+
+
+def test_snapshot_round_trip_filters_pages_and_omits_signed_urls(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+) -> None:
+    newest = _snapshot_with(
+        source_snapshot,
+        snapshot_id="sha256:newest",
+        fetched_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+    )
+    second = _snapshot_with(
+        source_snapshot,
+        snapshot_id="sha256:second",
+        fetched_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+    )
+    third = _snapshot_with(
+        source_snapshot,
+        snapshot_id="sha256:third",
+        fetched_at=datetime(2026, 7, 29, tzinfo=timezone.utc),
+        resource_id=SHEPD_RESOURCE_ID,
+    )
+    for snapshot in (second, third, newest):
+        save_snapshot(snapshot, db_path=temp_db)
+
+    assert count_source_snapshots(db_path=temp_db) == 3
+    assert count_source_snapshots(
+        source_resource_id=SHEPD_RESOURCE_ID, db_path=temp_db
+    ) == 1
+    assert [item.snapshot_id for item in list_source_snapshots(
+        source_resource_id=SHEPD_RESOURCE_ID, db_path=temp_db
+    )] == ["sha256:third"]
+    assert [item.snapshot_id for item in list_source_snapshots(
+        limit=2, offset=0, db_path=temp_db
+    )] == ["sha256:newest", "sha256:second"]
+    assert [item.snapshot_id for item in list_source_snapshots(
+        limit=2, offset=2, db_path=temp_db
+    )] == ["sha256:third"]
+    assert list_source_snapshots(limit=2, offset=3, db_path=temp_db) == []
+    assert list_source_snapshots(limit=2, offset=10, db_path=temp_db) == []
+    public = SourceSnapshotPublic(
+        **list_source_snapshots(limit=1, db_path=temp_db)[0].model_dump()
+    ).model_dump(mode="json")
+    assert "local_snapshot_path" not in public
+    assert "signed_redirect_url" not in json.dumps(public)
+
+
+def test_snapshot_store_rejects_signed_redirect_provenance(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+) -> None:
+    signed = source_snapshot.model_copy(
+        update={
+            "stable_source_url": (
+                "https://data-api.ssen.co.uk/stable.csv?"
+                "X-Amz-Signature=SYNTHETIC_SIGNATURE_MUST_NOT_PERSIST"
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="stable SSEN"):
+        save_snapshot(signed, db_path=temp_db)
+
+    assert count_source_snapshots(db_path=temp_db) == 0
+
+
+@pytest.mark.parametrize("limit", [0, 1001])
+def test_outage_and_snapshot_queries_reject_limits_outside_contract(
+    temp_db: Path,
+    limit: int,
+) -> None:
+    with pytest.raises(ValueError, match="limit"):
+        list_outage_events(limit=limit, db_path=temp_db)
+    with pytest.raises(ValueError, match="limit"):
+        list_source_snapshots(limit=limit, db_path=temp_db)
+
+
+def test_event_upsert_round_trips_json_and_updates_evidence(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    save_snapshot(source_snapshot, db_path=temp_db)
+    first = parsed_event.model_copy(
+        update={
+            "quality_flags": ["invalid_customers_affected"],
+            "raw_record": {"HV_INCIDENT_TIME": "12/07/2026  16:33", "v": 1},
+        }
+    )
+    updated = first.model_copy(
+        update={
+            "cause": "Updated public evidence",
+            "quality_flags": [],
+            "raw_record": {"HV_INCIDENT_TIME": "12/07/2026  16:33", "v": 2},
+        }
+    )
+
+    assert upsert_outage_events([first], db_path=temp_db) == 1
+    assert upsert_outage_events([updated], db_path=temp_db) == 1
+
+    rows = list_outage_events(db_path=temp_db)
+    assert len(rows) == 1
+    assert rows[0] == updated
+    assert get_outage_event(updated.event_id, db_path=temp_db) == updated
+    assert get_outage_event("missing", db_path=temp_db) is None
+
+
+def test_event_queries_share_filters_and_have_deterministic_page_boundaries(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    save_snapshot(source_snapshot, db_path=temp_db)
+    events = [
+        _event_with(
+            parsed_event,
+            event_id="event-c",
+            snapshot_id=source_snapshot.snapshot_id,
+            incident_started_local="2026-07-03T00:00:00",
+            district_short_code="NORTH",
+            cause_code=None,
+        ),
+        _event_with(
+            parsed_event,
+            event_id="event-b",
+            snapshot_id=source_snapshot.snapshot_id,
+            incident_started_local="2026-07-02T00:00:00",
+            licence_area="SHEPD",
+            reporting_year=2025,
+            cause_code="11",
+        ),
+        _event_with(
+            parsed_event,
+            event_id="event-a",
+            snapshot_id=source_snapshot.snapshot_id,
+            incident_started_local="2026-07-02T00:00:00",
+        ),
+    ]
+    upsert_outage_events(events, db_path=temp_db)
+
+    assert [item.event_id for item in list_outage_events(
+        limit=2, offset=0, db_path=temp_db
+    )] == ["event-a", "event-b"]
+    assert [item.event_id for item in list_outage_events(
+        limit=2, offset=2, db_path=temp_db
+    )] == ["event-c"]
+    assert list_outage_events(limit=2, offset=3, db_path=temp_db) == []
+    assert list_outage_events(limit=2, offset=9, db_path=temp_db) == []
+    filters = {
+        "licence_area": "SHEPD",
+        "district_short_code": "SWIN",
+        "reporting_year": 2025,
+        "cause_code": "11",
+        "db_path": temp_db,
+    }
+    assert count_outage_events(**filters) == 1
+    assert [item.event_id for item in list_outage_events(**filters)] == ["event-b"]
+    assert summarise_outage_events(
+        licence_area="SHEPD", reporting_year=2025, db_path=temp_db
+    ).customers_affected_total == 220
+
+
+def test_summary_preserves_all_null_sums(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    save_snapshot(source_snapshot, db_path=temp_db)
+    event = _event_with(
+        parsed_event,
+        event_id="null-metrics",
+        snapshot_id=source_snapshot.snapshot_id,
+        incident_started_local="2026-07-02T00:00:00",
+        customers_affected=None,
+        customer_minutes_lost=None,
+    )
+    upsert_outage_events([event], db_path=temp_db)
+
+    summary = summarise_outage_events(
+        licence_area="SEPD", reporting_year=2026, db_path=temp_db
+    )
+
+    assert summary == OutageSummary(
+        event_count=1,
+        customers_affected_total=None,
+        customer_minutes_lost_total=None,
+        incident_started_local_min="2026-07-02T00:00:00",
+        incident_started_local_max="2026-07-02T00:00:00",
+    )
+
+
+def test_commit_ingestion_run_is_one_atomic_transaction(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    marker = "SYNTHETIC_SIGNATURE_MUST_NOT_PERSIST"
+    reject = OutageReject(
+        run_id="run:complete",
+        source_resource_id=source_snapshot.source_resource_id,
+        row_number=2,
+        error_code="invalid_incident_time",
+        error_message="invalid local incident timestamp",
+        raw_row={"HV_INCIDENT_TIME": "not-a-date", "signed_url": marker},
+    )
+
+    result = commit_ingestion_run(
+        run_id="run:complete",
+        resources_seen=2,
+        snapshots=[source_snapshot],
+        events=[parsed_event],
+        rejects=[reject],
+        snapshots_created=1,
+        snapshots_reused=0,
+        warnings=["publisher cadence remains unknown"],
+        db_path=temp_db,
+    )
+
+    assert result.status == "completed"
+    assert result.events_written == 1
+    assert result.rejects_written == 1
+    with get_connection(temp_db) as connection:
+        run = connection.execute(
+            "SELECT status FROM ingestion_runs WHERE run_id = ?", ("run:complete",)
+        ).fetchone()
+        reject_json = connection.execute(
+            "SELECT raw_row_json FROM outage_rejects"
+        ).fetchone()[0]
+    assert run[0] == "completed"
+    assert json.loads(reject_json) == {
+        "HV_INCIDENT_TIME": "not-a-date",
+        "signed_url": "[REDACTED]",
+    }
+    assert marker not in reject_json
+
+
+def test_commit_ingestion_run_rolls_back_running_row_and_all_payloads(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    invalid_event = parsed_event.model_copy(
+        update={"source_snapshot_id": "sha256:missing"}
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        commit_ingestion_run(
+            run_id="run:rollback",
+            resources_seen=1,
+            snapshots=[source_snapshot],
+            events=[invalid_event],
+            rejects=[],
+            snapshots_created=1,
+            snapshots_reused=0,
+            warnings=[],
+            db_path=temp_db,
+        )
+
+    with get_connection(temp_db) as connection:
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "source_snapshots",
+                "ingestion_runs",
+                "outage_events",
+                "outage_rejects",
+            )
+        }
+    assert counts == {
+        "source_snapshots": 0,
+        "ingestion_runs": 0,
+        "outage_events": 0,
+        "outage_rejects": 0,
+    }
+
+
+def test_failed_run_records_only_redacted_safe_failure_state(
+    temp_db: Path,
+) -> None:
+    marker = "SYNTHETIC_SIGNATURE_MUST_NOT_PERSIST"
+
+    result = record_failed_ingestion_run(
+        run_id="run:failed",
+        resources_seen=1,
+        error=RuntimeError(
+            "https://storage.invalid/file.csv?X-Amz-Signature=" + marker
+        ),
+        warnings=[{"signed_url": marker}, "safe warning"],
+        db_path=temp_db,
+    )
+
+    assert result.status == "failed"
+    with get_connection(temp_db) as connection:
+        row = connection.execute(
+            """SELECT status, error, warnings_json FROM ingestion_runs
+               WHERE run_id = ?""",
+            ("run:failed",),
+        ).fetchone()
+        payload = "\n".join(connection.iterdump())
+    assert tuple(row[:2]) == ("failed", "RuntimeError: operation failed")
+    assert json.loads(row[2]) == [{"signed_url": "[REDACTED]"}, "safe warning"]
+    assert marker not in payload
+    assert "X-Amz-Signature" not in payload
+    assert count_source_snapshots(db_path=temp_db) == 0
+    assert count_outage_events(db_path=temp_db) == 0

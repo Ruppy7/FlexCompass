@@ -164,7 +164,7 @@ def test_migration_four_upgrades_versioned_legacy_database_without_losing_data(t
     finally:
         legacy.close()
 
-    assert run_migrations(db_path) == 5
+    assert run_migrations(db_path) == MIGRATIONS[-1][0]
 
     with get_connection(db_path) as conn:
         legacy_row = conn.execute(
@@ -188,7 +188,7 @@ def test_migration_four_upgrades_versioned_legacy_database_without_losing_data(t
         "Legacy public fixture",
         "https://example.invalid/legacy",
     )
-    assert version == 5
+    assert version == MIGRATIONS[-1][0]
     assert foreign_key_errors == []
     assert {table: len(keys) for table, keys in foreign_keys.items()} == {
         "catalogue_datasets": 1,
@@ -906,7 +906,7 @@ def test_migration_five_is_idempotent(tmp_path):
     db_path = tmp_path / "catalogue.db"
     run_migrations(db_path)
     version = run_migrations(db_path)
-    assert version == 5
+    assert version == MIGRATIONS[-1][0]
 
 
 def test_migration_five_upgrades_current_v4_registry_without_data_loss(tmp_path):
@@ -939,8 +939,8 @@ def test_migration_five_upgrades_current_v4_registry_without_data_loss(tmp_path)
     finally:
         conn.close()
 
-    assert run_migrations(db_path) == 5
-    assert run_migrations(db_path) == 5
+    assert run_migrations(db_path) == MIGRATIONS[-1][0]
+    assert run_migrations(db_path) == MIGRATIONS[-1][0]
     with get_connection(db_path) as migrated:
         row = migrated.execute(
             "SELECT title, declared_update_frequency_text FROM catalogue_datasets"

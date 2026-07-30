@@ -440,6 +440,107 @@ ALTER TABLE catalogue_datasets ADD COLUMN declared_update_frequency_text TEXT;
 INSERT OR IGNORE INTO schema_version (version) VALUES (5);
 COMMIT;
 """),
+    # -- Migration 6: SSEN NaFIRS HV snapshots and outage evidence --
+    (6, """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS source_snapshots (
+    snapshot_id          TEXT PRIMARY KEY,
+    source_dataset_id    TEXT NOT NULL,
+    package_id           TEXT NOT NULL,
+    source_resource_id   TEXT NOT NULL,
+    licence_area         TEXT NOT NULL CHECK (licence_area IN ('SEPD', 'SHEPD')),
+    stable_source_url    TEXT NOT NULL,
+    source_modified_at   TEXT,
+    fetched_at           TEXT NOT NULL,
+    content_sha256       TEXT NOT NULL,
+    byte_size            INTEGER NOT NULL,
+    row_count            INTEGER NOT NULL,
+    observed_columns_json TEXT NOT NULL,
+    licence_id           TEXT NOT NULL,
+    licence_title        TEXT NOT NULL,
+    licence_url          TEXT NOT NULL,
+    attribution          TEXT NOT NULL,
+    parser_version       TEXT NOT NULL,
+    local_snapshot_path  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    run_id               TEXT PRIMARY KEY,
+    status               TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    resources_seen       INTEGER NOT NULL,
+    snapshots_created    INTEGER NOT NULL DEFAULT 0,
+    snapshots_reused     INTEGER NOT NULL DEFAULT 0,
+    events_written       INTEGER NOT NULL DEFAULT 0,
+    rejects_written      INTEGER NOT NULL DEFAULT 0,
+    warnings_json        TEXT NOT NULL DEFAULT '[]',
+    error                TEXT,
+    started_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS outage_events (
+    event_id                       TEXT PRIMARY KEY,
+    source_dataset_id              TEXT NOT NULL,
+    source_resource_id             TEXT NOT NULL,
+    source_snapshot_id             TEXT NOT NULL,
+    operator                       TEXT NOT NULL,
+    licence_area                   TEXT NOT NULL CHECK (licence_area IN ('SEPD', 'SHEPD')),
+    incident_started_local         TEXT NOT NULL,
+    timezone_name                  TEXT,
+    reporting_year                 INTEGER NOT NULL,
+    voltage_kv                     REAL,
+    district_short_code            TEXT NOT NULL,
+    district_hv_reference          TEXT NOT NULL,
+    network_reference              TEXT NOT NULL,
+    primary_nrn                    TEXT,
+    primary_name                   TEXT,
+    customers_affected             INTEGER,
+    customer_minutes_lost          INTEGER,
+    average_minutes_off_supply     REAL,
+    equipment_code                 TEXT,
+    equipment                      TEXT,
+    component_code                 TEXT,
+    component                      TEXT,
+    cause_code                     TEXT,
+    cause                          TEXT,
+    contributory_cause_code        TEXT,
+    contributory_cause             TEXT,
+    damage                         TEXT,
+    exceptional_event              TEXT,
+    quality_flags_json             TEXT NOT NULL,
+    raw_record_json                TEXT NOT NULL,
+    FOREIGN KEY (source_snapshot_id)
+        REFERENCES source_snapshots(snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS outage_rejects (
+    reject_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                TEXT NOT NULL,
+    source_resource_id    TEXT NOT NULL,
+    row_number            INTEGER NOT NULL CHECK (row_number >= 1),
+    error_code            TEXT NOT NULL,
+    error_message         TEXT NOT NULL,
+    raw_row_json          TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_dataset_resource
+    ON source_snapshots(source_dataset_id, source_resource_id);
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_fetched
+    ON source_snapshots(fetched_at DESC, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_outage_events_area_year
+    ON outage_events(licence_area, reporting_year);
+CREATE INDEX IF NOT EXISTS idx_outage_events_district
+    ON outage_events(district_short_code);
+CREATE INDEX IF NOT EXISTS idx_outage_events_cause
+    ON outage_events(cause_code);
+CREATE INDEX IF NOT EXISTS idx_outage_events_incident
+    ON outage_events(incident_started_local, event_id);
+CREATE INDEX IF NOT EXISTS idx_outage_rejects_run
+    ON outage_rejects(run_id);
+INSERT OR IGNORE INTO schema_version (version) VALUES (6);
+COMMIT;
+"""),
 ]
 
 
