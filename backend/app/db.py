@@ -457,6 +457,7 @@ def get_db_path() -> Path:
 def get_connection(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
     """Context manager for a SQLite connection with WAL mode."""
     path = db_path or get_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

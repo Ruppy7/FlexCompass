@@ -314,6 +314,9 @@ class TestRedactFunction:
     def test_private_host_url(self):
         _assert_no_secrets(redact(f"at {PRIVATE_HOST_URL}"), context="private host")
 
+    def test_integer_form_loopback_url_is_redacted(self):
+        assert redact("http://2130706433/private") == "[REDACTED_URL]"
+
     def test_credential_url(self):
         _assert_no_secrets(redact(f"via {CREDENTIAL_URL}"), context="cred url")
 
@@ -1414,6 +1417,73 @@ class TestMalformedAndControlURLDataPersistence:
 class TestQ1CLISecurityPath:
     """Q1: CLI security path - secret-bearing result flows through CLI sync seam."""
 
+    def test_production_client_does_not_follow_redirect_to_private_json(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        import app.catalogue_cli as catalogue_cli
+        import httpx
+
+        marker = "PRIVATE_REDIRECT_RECORD_MUST_NOT_PERSIST"
+        private_requests = []
+
+        def handler(request):
+            if request.url.host == "2130706433":
+                private_requests.append(str(request.url))
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json=_ckan_page(
+                        [
+                            {
+                                "id": "private-redirect-id",
+                                "name": "private-redirect-dataset",
+                                "title": marker,
+                                "resources": [],
+                                "tags": [],
+                            }
+                        ],
+                        count=1,
+                    ),
+                )
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "http://2130706433/private"},
+            )
+
+        real_client = httpx.Client
+
+        def client_with_transport(*args, **kwargs):
+            return real_client(
+                *args,
+                transport=httpx.MockTransport(handler),
+                **kwargs,
+            )
+
+        monkeypatch.setattr(catalogue_cli.httpx, "Client", client_with_transport)
+        db = tmp_path / "catalogue.sqlite3"
+        summary = sync_catalogues(
+            ["nged"],
+            catalogue_cli._client_factory,
+            db,
+            tmp_path / "snapshots",
+            NOW,
+            review_queue_path=tmp_path / "review-queue.json",
+        )
+
+        with sqlite3.connect(db) as connection:
+            persisted = connection.execute(
+                "SELECT COUNT(*) FROM catalogue_datasets WHERE title = ?",
+                (marker,),
+            ).fetchone()[0]
+
+        assert private_requests == []
+        assert summary.status == "failed"
+        assert summary.portals["nged"].status == "failed"
+        assert persisted == 0
+
     def test_cli_sync_secret_result_is_redacted(self, tmp_path, capsys, monkeypatch):
         """Q1: Secret-bearing fake result flows through CLI, exit 0, output redacted."""
         db = tmp_path / "catalogue.sqlite3"
@@ -1513,7 +1583,7 @@ def _live_enabled():
 def test_live_portal(portal_id):
     import httpx
     portal = CATALOGUE_PORTALS[portal_id]
-    client = httpx.Client(timeout=portal.timeout_seconds, follow_redirects=True)
+    client = httpx.Client(timeout=portal.timeout_seconds, follow_redirects=False)
     try:
         result = fetch_catalogue(portal, client, datetime.now(timezone.utc))
     finally:

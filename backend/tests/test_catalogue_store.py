@@ -100,6 +100,19 @@ def count_rows(conn: sqlite3.Connection, table: str) -> int:
     return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
+def test_explicit_nested_database_path_creates_missing_parent(tmp_path):
+    db_path = tmp_path / "data" / "cache" / "catalogue" / "registry.sqlite3"
+
+    assert not db_path.parent.exists()
+    assert run_migrations(db_path) >= 4
+
+    assert db_path.is_file()
+    with get_connection(db_path) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0] >= 4
+
+
 def test_registry_migration_coexists_with_legacy_tables_and_has_foreign_keys_and_indexes(tmp_path):
     db_path = tmp_path / "catalogue.db"
 

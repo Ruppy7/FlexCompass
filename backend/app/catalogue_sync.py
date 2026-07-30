@@ -152,6 +152,9 @@ def _is_private_host(hostname: str | None) -> bool:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
+        numeric_part = r"(?:0[xX][0-9a-fA-F]+|\d+)"
+        if re.fullmatch(rf"{numeric_part}(?:\.{numeric_part})*", host):
+            return True
         return False
     return not address.is_global
 

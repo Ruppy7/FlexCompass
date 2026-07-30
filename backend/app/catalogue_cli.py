@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _client_factory(portal: CataloguePortalConfig) -> httpx.Client:
-    return httpx.Client(timeout=portal.timeout_seconds, follow_redirects=True)
+    return httpx.Client(timeout=portal.timeout_seconds, follow_redirects=False)
 
 
 def _print_json(value: object) -> None:
