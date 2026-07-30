@@ -40,52 +40,53 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
 
 ## Orchestration
 
-- The primary agent acts as project manager, orchestrator, and senior architect.
-  Material implementation, research, and independent review should be delegated
-  through Orca-managed worktrees and coordinated through the Orca bus.
-- Keep one implementation owner per worktree. Use a different worker for
-  independent review when a change is material or high risk.
-- Worktrees are scoped to independent tasks or change streams, not individual
-  agent attempts. Reuse the existing task worktree for rework, follow-ups, and
-  replacement workers while that task remains active.
-- When a task is complete, close its worker terminals and remove its Orca
-  worktree after confirming that required outputs are retained, the worktree is
-  clean, and no review or follow-up is pending. Never force-remove a dirty
-  worktree; stop and resolve or escalate unexpected changes first.
-- Every worker inherits this file's Git identity, public-data, read-only portal,
-  provenance, and engineering rules. Task briefs must repeat the rules that are
-  most relevant to the assignment.
-- Worker routing and evaluation records are maintained locally under
-  `project-plan/delegation/`. Append an evaluation after every reviewed worker
-  attempt, including partial or failed attempts; do not select models by
-  sentiment alone once observed evidence exists.
-- The local worker roster is operator-controlled. Do not add a model, provider,
-  or delegation channel without explicit approval.
-- Launch Orca workers in the harness's non-interactive full-auto/YOLO mode so
-  scoped implementation and test commands do not pause for local approvals.
-  This changes execution permissions only; it never broadens the task brief,
-  Git identity, public-data, read-only portal, credential, or safety boundaries.
+- The agent in the active Codex chat is the primary orchestrator, project
+  manager, and senior architect for that session.
+- Delegated work uses Codex-native subagents only. Every subagent must use model
+  `gpt-5.6-sol`; select reasoning effort according to the task:
+  - `low` for bounded mechanical work, targeted evidence extraction, and small
+    documentation or verification tasks;
+  - `medium` for normal multi-file implementation, integration, debugging, and
+    independent task review;
+  - `high` for architecture, security-sensitive or adversarial review, broad
+    research synthesis, and final review gates.
+- The orchestrator normally does not implement production code. It owns
+  discovery, design, planning, decomposition, dispatch, oversight, review,
+  verification, decisions, and continuity. Production-code implementation by
+  the orchestrator requires explicit user direction.
+- Keep one implementation owner for each material task or change stream. Use a
+  different Codex subagent for independent review when work is material or high
+  risk. The orchestrator independently inspects the diff and runs the final
+  verification gates; a subagent report is not completion evidence.
+- Every subagent inherits this file's Git identity, public-data, read-only
+  portal, provenance, credential, and engineering rules. Task briefs must
+  repeat the constraints most relevant to the bounded assignment.
+- Orca, Cline, OpenCode, Amp, external provider wrappers, and all other agent
+  runtimes are prohibited unless the user explicitly reverses this decision.
+- Historical orchestration and delegation material under dated `archive/`
+  directories is evidence only. It must not be treated as active instruction,
+  invoked, or used to select the current execution path.
 
 ## Orchestrator memory and project records
 
 - At the start of every primary-agent session, read `/memory/CURRENT.md` before
   broad discovery or task execution. It is the canonical live handoff: verify
-  its stated Git/worktree facts, then continue from its `Next action` section.
+  its stated Git and checkout facts, then continue from its `Next action` section.
   If it is absent or stale, reconstruct and update it before delegating work.
 - The primary orchestrator maintains local continuity records under the
   Git-ignored `/memory/` directory. Each memory is a Markdown file and may be
   amended as understanding changes; it is a pointer and context layer, not a
   substitute for verified source evidence.
 - Only the primary orchestrator may create, edit, rename, or delete files under
-  `/memory/`. Deployed workers must not modify that directory. Relevant context
-  must be supplied to workers through task briefs or the Orca bus instead.
+  `/memory/`. Codex subagents must not modify that directory. Relevant context
+  must be supplied directly through bounded subagent task briefs.
 - At the end of every substantive turn, the primary orchestrator reviews and,
   where the state changed, updates relevant `/memory/` files, `project-plan/`
-  documents, decisions, backlog items, and delegation/evaluation records.
+  documents, decisions, backlog items, and retained task evidence.
 - Before a session switch or after every material task gate, update
-  `/memory/CURRENT.md` with the public commit, active worktree paths and heads,
-  cleanliness, completed reviews, next task and model route, required context
-  files, and any blockers. Never store credentials or runtime-scoped terminal
+  `/memory/CURRENT.md` with the public commit, active branch or checkout heads,
+  cleanliness, completed reviews, next task and Sol effort route, required
+  context files, and any blockers. Never store credentials or runtime-scoped
   handles there.
 - `/memory/` and `project-plan/` are local-only. Never stage or commit their
   contents, and do not promote them into public documentation without an
@@ -94,34 +95,21 @@ identity and remote owner; stop if they do not belong to `ruppy7`.
 ## Efficiency and continuity
 
 - Start from continuity, not rediscovery. Read `AGENTS.md`, the relevant
-  `/memory/` pointers, the active implementation plan, and the model/evaluation
-  log before broad repository searches. Re-scan only evidence that is missing,
-  stale, or needed for the current decision.
-- Use the recorded Orca wrapper and command recipes under
-  `project-plan/delegation/`. Do not repeatedly reconstruct `PATH`, rediscover
-  known CLI syntax, or probe runtime state after it has already been verified
-  healthy unless a command actually fails.
-- Monitor workers through one event-driven Orca bus wait filtered to
-  `worker_done` and `escalation`. Do not poll at short intervals or repeatedly
-  read terminal output; inspect a terminal only for a failure, escalation,
-  missing completion event, or explicit debugging need.
-- Use Orca worktree comments and workspace status at meaningful phase changes
-  (`in-progress`, `in-review`, `completed`). Read the current comment before
-  updating it so user context is not overwritten.
-- Treat terminal handles as runtime-scoped and ephemeral. Reacquire them after
-  an Orca restart instead of persisting stale handles as durable project state.
-- Manual task creation, explicit model routing, and event-driven completion are
-  the default for implementation and review. Trial `orchestration run` only for
-  multiple independent, low-risk tasks after recording the experiment; do not
-  use its coordinator loop to obscure review ownership or model selection.
+  `/memory/` pointers, the active implementation plan, and relevant live
+  evidence before broad repository searches. Re-scan only evidence that is
+  missing, stale, or needed for the current decision.
+- Give each Codex subagent one bounded assignment with explicit acceptance
+  criteria, file boundaries, safety constraints, and expected verification.
+- Parallelise only genuinely independent read-only work or disjoint change
+  streams. Keep production-code ownership singular and re-use the same owner
+  for rework while that task remains active.
+- Treat subagent identifiers and runtime handles as ephemeral. Preserve durable
+  facts, decisions, diffs, verification results, and next actions in the
+  orchestrator-owned continuity records instead.
 - Batch independent read-only inspections and verification commands where that
   keeps output clear. Avoid repeating a check whose result is already current
   and recorded unless the relevant state changed.
-- Route workers from the approved roster using the evaluation log and the
-  task's lane. Deliberately gather evidence for underused approved routes; do
-  not default every implementation or review to the most familiar model.
 - Close each task gate before opening the next: verify the implementation,
-  obtain the required independent verdicts, preserve useful reports, append
-  worker evaluations, update continuity records, close terminals, and clean up
-  task-only worktrees. Record these checkpoints immediately so session
-  compaction or handoff does not force reconstruction.
+  obtain the required independent verdicts, resolve findings, preserve useful
+  reports, and update continuity records. Record these checkpoints immediately
+  so session compaction or handoff does not force reconstruction.
