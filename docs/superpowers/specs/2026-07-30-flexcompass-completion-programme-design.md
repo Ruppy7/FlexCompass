@@ -1,6 +1,6 @@
 # FlexCompass Completion Programme Design
 
-Date: 2026-07-30  
+Date: 2026-07-30
 Status: approved programme direction; written specification pending final user review
 
 ## 1. Purpose
@@ -28,8 +28,11 @@ FlexCompass is complete enough for a stable public release when:
 1. NGED, SP Energy Networks, SP Electricity North West, SSEN, UK Power
    Networks, Northern Powergrid, and NESO are visible through one evidence-backed
    catalogue observatory.
-2. Every discovered dataset has current catalogue evidence and either a
-   reviewed ingestion decision or an explicit evidence-backed blocker.
+2. Every portal has a refresh attempt within its configured review window. A
+   successful attempt supplies the current complete snapshot; a failed attempt
+   exposes the failed observation and timestamp of the last valid snapshot.
+   Every dataset in that last valid complete snapshot has either a reviewed
+   ingestion decision or an explicit evidence-backed blocker.
 3. At least one end-to-end real-data workflow lets a new user fetch public data,
    query canonical records, inspect provenance, and reproduce a published
    analysis. The first workflow is SSEN historical HV outages.
@@ -79,9 +82,11 @@ product.
 
 ### 3.4 Provenance is a user feature
 
-Source dataset and resource identifiers, raw-record evidence or an immutable
-reference, observation time, snapshot hash, parser version, and quality status
-must remain available from analytical output back to source evidence.
+Every derived canonical portal record preserves its `source_dataset_id`, source
+resource identifier, exact safe `raw_record`, and immutable snapshot/evidence
+reference. Observation time, snapshot hash, parser version, and quality status
+remain available from analytical output back to source evidence. A reference
+supplements `raw_record`; it never replaces it.
 
 ### 3.5 Local-first delivery
 
@@ -123,10 +128,15 @@ Each discovered dataset has a time-stamped decision:
 - `access_blocked`
 - `unknown`
 
-The decision includes rationale, evidence, licence state, access state, and the
-next unresolved question where applicable. Comprehensive curation proceeds
-continuously; it does not block a source that independently passes the
-deep-ingestion gate.
+The decision is a versioned record containing portal and source dataset
+identity, decision, rationale, evidence references, licence state, access
+state, review state (`proposed`, `reviewed`, or `superseded`), review time,
+reviewer identifier, unresolved question, and next review time. A dataset meets
+Tier 2 only when its current decision is `reviewed`. An `unknown` or
+`access_blocked` decision can close review only when it records the explicit
+evidence-backed blocker, unresolved question, and next review time.
+Comprehensive curation proceeds continuously; it does not block a source that
+independently passes the deep-ingestion gate.
 
 ### Tier 3: analytical integration
 
@@ -136,8 +146,8 @@ A selected dataset has:
 - a verified public read contract;
 - immutable snapshots and redacted fetch evidence;
 - strict source-specific parsing;
-- canonical records with `source_dataset_id` and `raw_record` or an immutable
-  evidence reference;
+- canonical records with `source_dataset_id`, source resource identifier, exact
+  safe `raw_record`, and an immutable snapshot/evidence reference;
 - explicit rejects and quality flags;
 - idempotence, schema-drift, security, and provenance tests;
 - read-only API access and reproducible export.
@@ -376,8 +386,12 @@ exist and are the baseline for this phase.
 
 - Profile datasets where catalogue metadata cannot establish access, licence,
   schema, temporal coverage, or analytical role.
-- Record reviewed decisions and blockers without requiring all datasets to be
-  resolved before approved deep-ingestion work begins.
+- Add a versioned reviewed dataset-decision record containing portal and source
+  dataset identity, decision, rationale, evidence references, licence/access
+  state, review state/time/reviewer, unresolved question, and next review time.
+- Record reviewed decisions and explicit evidence-backed blockers without
+  requiring all datasets to be resolved before approved deep-ingestion work
+  begins.
 - Preserve ambiguous and conflicting evidence.
 
 ### WP1.5 Drift, licence, and public-safe exports
@@ -386,9 +400,11 @@ exist and are the baseline for this phase.
 - Export reproducible portal coverage and review-state summaries.
 - Publish only metadata and aggregate evidence that passes the public boundary.
 
-Exit gate: all seven portals are visibly integrated; each discovered dataset
-has evidence and a decision state; the API and UI do not substitute legacy seed
-records for the registry.
+Exit gate: all seven portals are visibly integrated; each dataset in each
+portal’s last valid complete snapshot has a reviewed decision or an explicit
+evidence-backed blocker with a next review time; failed current refresh attempts
+and last-valid timestamps are visible; the API and UI do not substitute legacy
+seed records for the registry.
 
 ## 9. Phase 2 — SSEN historical-outage MVP
 
@@ -398,9 +414,17 @@ Goal: deliver the first complete real-data research workflow.
 
 - Retain accepted source models, verified CC BY 4.0 fixtures, strict SEPD/SHEPD
   schemas, fail-closed discovery, and day-first parsing.
-- Resolve the outstanding persistence-redaction invariant for arbitrarily
-  nested encoded signed targets and signed URL keys without corrupting benign
-  warnings.
+- Resolve the outstanding persistence-redaction invariant with a bounded,
+  fail-closed sanitizer: at most 64 KiB per persisted string leaf, 512 KiB per
+  structured value, and eight percent-decoding/normalisation passes. If a
+  budget is exceeded, or another valid percent-decoding transform remains
+  after pass eight, redact the entire unsafe diagnostic value. If preserving a
+  canonical record would require altering its `raw_record`, reject that record
+  instead.
+- Test literal signed material; encoded signed targets and keys at one, four,
+  eight, and nine layers; malformed percent sequences; ordinary percentages;
+  multiline warnings; per-string oversize input; and aggregate-budget
+  exhaustion.
 - Complete collector, snapshot, atomic persistence, reject, CLI, read-only API,
   attribution, and verification tasks.
 
@@ -651,8 +675,10 @@ material.
 - Every public export passes licence, attribution, provenance, aggregation, and
   public-boundary review.
 - Third-party data is not relicensed by the repository’s MIT licence.
-- Generated source data, snapshots, databases, caches, and reports remain
-  untracked.
+- Generated source data, snapshots, databases, caches, intermediate reports,
+  and generated analyses remain untracked. Deliberately curated documentation
+  or aggregate analysis artifacts may be committed only after licence,
+  attribution, provenance, and public-boundary review.
 
 ## 17. Verification and review model
 
