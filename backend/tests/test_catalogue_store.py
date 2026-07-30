@@ -1,0 +1,1016 @@
+"""Behavioural tests for catalogue registry persistence."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import replace
+from datetime import datetime, timezone
+
+import pytest
+from app.catalogue_adapters import CatalogueFetchResult
+from app.catalogue_models import (
+    AccessStatus,
+    CatalogueDataset,
+    ClassificationEvidence,
+    DatasetResource,
+    EvidenceConfidence,
+    LifecycleStatus,
+    PublicationPattern,
+)
+from app.catalogue_store import (
+    get_catalogue_dataset,
+    latest_catalogue_observation,
+    list_catalogue_assessments,
+    list_catalogue_resources,
+    list_classification_evidence,
+    observation_key,
+    persist_catalogue_assessment,
+    persist_catalogue_result,
+)
+from app.db import MIGRATIONS, get_connection, run_migrations
+
+OBSERVED_AT = datetime(2026, 7, 16, 8, 30, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def conn(tmp_path):
+    db_path = tmp_path / "catalogue.db"
+    run_migrations(db_path)
+    with get_connection(db_path) as connection:
+        yield connection
+
+
+def make_result(
+    *,
+    portal_id: str = "nged",
+    source_dataset_id: str = "shared-source-id",
+    complete: bool = True,
+    title: str | None = "Public flexibility data",
+    resource_url: str | None = "https://example.invalid/public.csv",
+    raw_record: dict | None = None,
+) -> CatalogueFetchResult:
+    dataset_id = f"{portal_id}:{source_dataset_id}"
+    resource = DatasetResource(
+        id=f"{dataset_id}:resource-one",
+        portal_id=portal_id,
+        source_dataset_id=source_dataset_id,
+        name="Public CSV" if resource_url else None,
+        url=resource_url,
+        format="CSV" if resource_url else None,
+        observed_at=OBSERVED_AT,
+        raw_record={"resource_source_only": True} if resource_url else {},
+    )
+    evidence = ClassificationEvidence(
+        id=f"{dataset_id}:access-status",
+        portal_id=portal_id,
+        source_dataset_id=source_dataset_id,
+        classification="access_status",
+        evidence="The public API returned a resource URL.",
+        confidence=EvidenceConfidence.high,
+        source_value={"access": "public"},
+        observed_at=OBSERVED_AT,
+        raw_record={"evidence_source_only": ["preserve"]},
+    )
+    dataset = CatalogueDataset(
+        id=dataset_id,
+        portal_id=portal_id,
+        source_dataset_id=source_dataset_id,
+        title=title,
+        publisher="Synthetic public fixture publisher" if title else None,
+        observed_at=OBSERVED_AT,
+        tags=["flexibility", "public"] if title else [],
+        resources=[resource] if resource_url else [],
+        classification_evidence=[evidence] if title else [],
+        raw_record=raw_record if raw_record is not None else {"source_dataset_id": source_dataset_id},
+    )
+    return CatalogueFetchResult(
+        portal_id=portal_id,
+        observed_at=OBSERVED_AT,
+        datasets=[dataset],
+        resources=[resource] if resource_url else [],
+        expected_count=1 if complete else None,
+        complete=complete,
+        warnings=[] if complete else ["Pagination total count is absent."],
+        raw_pages=[{"result": {"source_dataset_id": source_dataset_id}}],
+    )
+
+
+def count_rows(conn: sqlite3.Connection, table: str) -> int:
+    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_explicit_nested_database_path_creates_missing_parent(tmp_path):
+    db_path = tmp_path / "data" / "cache" / "catalogue" / "registry.sqlite3"
+
+    assert not db_path.parent.exists()
+    assert run_migrations(db_path) >= 4
+
+    assert db_path.is_file()
+    with get_connection(db_path) as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0] >= 4
+
+
+def test_registry_migration_coexists_with_legacy_tables_and_has_foreign_keys_and_indexes(tmp_path):
+    db_path = tmp_path / "catalogue.db"
+
+    assert run_migrations(db_path) >= 4
+
+    with get_connection(db_path) as conn:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        foreign_keys = {
+            table: conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            for table in (
+                "catalogue_datasets",
+                "catalogue_resources",
+                "classification_evidence",
+                "catalogue_assessments",
+            )
+        }
+
+    assert {
+        "portal_datasets",
+        "catalogue_observations",
+        "catalogue_datasets",
+        "catalogue_resources",
+        "classification_evidence",
+        "catalogue_assessments",
+    } <= names
+    assert all(foreign_keys.values())
+    assert {
+        "idx_catalogue_observations_portal_observed",
+        "idx_catalogue_datasets_portal_source",
+        "idx_catalogue_resources_dataset",
+        "idx_classification_evidence_dataset",
+        "idx_catalogue_assessments_dataset",
+    } <= indexes
+
+
+def test_migration_four_upgrades_versioned_legacy_database_without_losing_data(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:3]:
+            legacy.executescript(ddl)
+            legacy.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        legacy.execute(
+            """INSERT INTO portal_datasets (id, name, portal_url)
+               VALUES ('legacy-dataset', 'Legacy public fixture', 'https://example.invalid/legacy')"""
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    assert run_migrations(db_path) == 5
+
+    with get_connection(db_path) as conn:
+        legacy_row = conn.execute(
+            "SELECT id, name, portal_url FROM portal_datasets WHERE id = 'legacy-dataset'"
+        ).fetchone()
+        version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        foreign_key_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        foreign_keys = {
+            table: conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+            for table in (
+                "catalogue_datasets",
+                "catalogue_resources",
+                "classification_evidence",
+                "catalogue_assessments",
+            )
+        }
+        indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+
+    assert tuple(legacy_row) == (
+        "legacy-dataset",
+        "Legacy public fixture",
+        "https://example.invalid/legacy",
+    )
+    assert version == 5
+    assert foreign_key_errors == []
+    assert {table: len(keys) for table, keys in foreign_keys.items()} == {
+        "catalogue_datasets": 1,
+        "catalogue_resources": 2,
+        "classification_evidence": 2,
+        "catalogue_assessments": 2,
+    }
+    assert {
+        "idx_catalogue_observations_portal_observed",
+        "idx_catalogue_datasets_portal_source",
+        "idx_catalogue_resources_dataset",
+        "idx_classification_evidence_dataset",
+        "idx_catalogue_assessments_dataset",
+    } <= indexes
+
+
+def test_migration_four_rolls_back_all_registry_objects_and_version_on_failure(
+    tmp_path,
+):
+    db_path = tmp_path / "migration-four-failure.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:3]:
+            connection.executescript(ddl)
+            connection.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
+        connection.execute(
+            "CREATE TABLE catalogue_resources (placeholder TEXT)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="dataset_key"):
+        run_migrations(db_path)
+
+    with sqlite3.connect(db_path) as failed:
+        tables = {
+            row[0]
+            for row in failed.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row[0]
+            for row in failed.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        versions = {
+            row[0]
+            for row in failed.execute(
+                "SELECT version FROM schema_version"
+            )
+        }
+
+    assert "catalogue_resources" in tables
+    assert {
+        "catalogue_observations",
+        "catalogue_datasets",
+        "classification_evidence",
+        "catalogue_assessments",
+    }.isdisjoint(tables)
+    assert not any(name.startswith("idx_catalogue_") for name in indexes)
+    assert 4 not in versions
+
+
+def test_observation_identity_is_deterministic_and_portal_scoped():
+    first = observation_key("nged", OBSERVED_AT, "abc")
+
+    assert first == observation_key("nged", OBSERVED_AT, "abc")
+    assert first != observation_key("spen", OBSERVED_AT, "abc")
+    assert first != observation_key("nged", OBSERVED_AT, "def")
+
+
+def test_reprocessing_same_observation_is_idempotent(conn):
+    result = make_result()
+
+    first = persist_catalogue_result(conn, result, "snapshot.json", "abc")
+    second = persist_catalogue_result(conn, result, "snapshot.json", "abc")
+
+    assert first == second
+    assert first.dataset_count == 1
+    assert first.resource_count == 1
+    assert count_rows(conn, "catalogue_observations") == 1
+    assert count_rows(conn, "catalogue_datasets") == 1
+    assert count_rows(conn, "catalogue_resources") == 1
+    assert count_rows(conn, "classification_evidence") == 1
+
+
+def test_persistence_rolls_back_every_table_when_a_resource_write_fails(conn):
+    conn.execute(
+        """CREATE TRIGGER reject_resource BEFORE INSERT ON catalogue_resources
+           BEGIN SELECT RAISE(ABORT, 'synthetic resource failure'); END"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic resource failure"):
+        persist_catalogue_result(conn, make_result(), "snapshot.json", "abc")
+
+    assert count_rows(conn, "catalogue_observations") == 0
+    assert count_rows(conn, "catalogue_datasets") == 0
+    assert count_rows(conn, "catalogue_resources") == 0
+    assert count_rows(conn, "classification_evidence") == 0
+
+
+def test_failed_nested_persistence_preserves_caller_transaction_and_decision(conn):
+    conn.execute(
+        """INSERT INTO portal_datasets (id, name, portal_url)
+           VALUES ('outer-commit', 'Caller-owned work', 'https://example.invalid/outer')"""
+    )
+    conn.execute(
+        """CREATE TRIGGER reject_nested_resource BEFORE INSERT ON catalogue_resources
+           BEGIN SELECT RAISE(ABORT, 'synthetic nested failure'); END"""
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic nested failure"):
+        persist_catalogue_result(conn, make_result(), "snapshot.json", "abc")
+
+    assert conn.in_transaction is True
+    assert conn.execute(
+        "SELECT name FROM portal_datasets WHERE id = 'outer-commit'"
+    ).fetchone()[0] == "Caller-owned work"
+    assert count_rows(conn, "catalogue_observations") == 0
+    assert count_rows(conn, "catalogue_datasets") == 0
+    conn.commit()
+    assert conn.execute(
+        "SELECT name FROM portal_datasets WHERE id = 'outer-commit'"
+    ).fetchone()[0] == "Caller-owned work"
+
+    conn.execute(
+        """INSERT INTO portal_datasets (id, name, portal_url)
+           VALUES ('outer-rollback', 'Rollback work', 'https://example.invalid/rollback')"""
+    )
+    conn.rollback()
+
+    assert conn.execute(
+        "SELECT id FROM portal_datasets WHERE id = 'outer-rollback'"
+    ).fetchone() is None
+
+
+def test_incomplete_result_is_rejected_without_explicit_partial_status(conn):
+    with pytest.raises(ValueError, match="incomplete"):
+        persist_catalogue_result(conn, make_result(complete=False), "snapshot.json", "abc")
+
+    assert count_rows(conn, "catalogue_observations") == 0
+
+
+def test_incomplete_result_can_be_persisted_with_explicit_partial_status(conn):
+    result = persist_catalogue_result(
+        conn,
+        make_result(complete=False),
+        "snapshot.json",
+        "abc",
+        status="partial",
+    )
+
+    observation = latest_catalogue_observation(conn, "nged")
+    assert result.dataset_count == 1
+    assert observation is not None
+    assert observation["status"] == "partial"
+    assert observation["warnings"] == ["Pagination total count is absent."]
+
+
+def test_partial_missing_values_do_not_erase_known_source_facts(conn):
+    persist_catalogue_result(conn, make_result(), "complete.json", "complete-hash")
+
+    persist_catalogue_result(
+        conn,
+        make_result(complete=False, title=None, resource_url=None, raw_record={}),
+        "partial.json",
+        "partial-hash",
+        status="partial",
+    )
+
+    dataset = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    resource = conn.execute(
+        "SELECT name, url, format, raw_record_json FROM catalogue_resources"
+    ).fetchone()
+    assert dataset is not None
+    assert dataset["title"] == "Public flexibility data"
+    assert dataset["publisher"] == "Synthetic public fixture publisher"
+    assert dataset["tags"] == ["flexibility", "public"]
+    assert dataset["raw_record"] == {"source_dataset_id": "shared-source-id"}
+    assert tuple(resource[:3]) == (
+        "Public CSV",
+        "https://example.invalid/public.csv",
+        "CSV",
+    )
+    assert json.loads(resource[3]) == {"resource_source_only": True}
+    assert count_rows(conn, "classification_evidence") == 1
+
+
+def test_complete_observation_clears_removed_dataset_resource_and_evidence_facts(conn):
+    initial = make_result()
+    dataset = initial.datasets[0]
+    dataset.description = "Published description"
+    dataset.licence = "Published licence"
+    dataset.licence_identifier = "licence-id"
+    dataset.licence_title = "Licence title"
+    dataset.licence_url = "https://example.invalid/licence"
+    dataset.attribution = "Published attribution"
+    dataset.themes = ["network"]
+    dataset.catalogue_page_url = "https://example.invalid/catalogue"
+    dataset.metadata_api_url = "https://example.invalid/metadata"
+    dataset.declared_update_frequency = "weekly"
+    dataset.declared_update_frequency_text = "Weekly"
+    dataset.portal_url = "https://example.invalid/portal"
+    dataset.api_url = "https://example.invalid/api"
+    dataset.lifecycle_status = LifecycleStatus.active
+    dataset.publication_pattern = PublicationPattern.periodic
+    dataset.access_status = AccessStatus.public
+    resource = initial.resources[0]
+    resource.description = "Published resource description"
+    resource.media_type = "text/csv"
+    resource.size_bytes = 42
+    evidence = dataset.classification_evidence[0]
+    evidence.source_url = "https://example.invalid/evidence"
+    persist_catalogue_result(conn, initial, "initial.json", "initial-hash")
+
+    replacement = make_result()
+    replacement_dataset = replacement.datasets[0]
+    replacement_dataset.title = None
+    replacement_dataset.description = None
+    replacement_dataset.publisher = None
+    replacement_dataset.licence = None
+    replacement_dataset.licence_identifier = None
+    replacement_dataset.licence_title = None
+    replacement_dataset.licence_url = None
+    replacement_dataset.attribution = None
+    replacement_dataset.themes = []
+    replacement_dataset.catalogue_page_url = None
+    replacement_dataset.metadata_api_url = None
+    replacement_dataset.declared_update_frequency = None
+    replacement_dataset.declared_update_frequency_text = None
+    replacement_dataset.portal_url = None
+    replacement_dataset.api_url = None
+    replacement_dataset.lifecycle_status = LifecycleStatus.unknown
+    replacement_dataset.publication_pattern = PublicationPattern.unknown
+    replacement_dataset.access_status = AccessStatus.unknown
+    replacement_dataset.tags = []
+    replacement_dataset.raw_record = {}
+    replacement_resource = replacement.resources[0]
+    replacement_resource.name = None
+    replacement_resource.description = None
+    replacement_resource.url = None
+    replacement_resource.format = None
+    replacement_resource.media_type = None
+    replacement_resource.size_bytes = None
+    replacement_resource.source_created_at = None
+    replacement_resource.source_updated_at = None
+    replacement_resource.raw_record = {}
+    replacement_evidence = replacement_dataset.classification_evidence[0]
+    replacement_evidence.confidence = EvidenceConfidence.unknown
+    replacement_evidence.source_value = None
+    replacement_evidence.source_url = None
+    replacement_evidence.observed_at = None
+    replacement_evidence.raw_record = {}
+
+    persist_catalogue_result(
+        conn,
+        replacement,
+        "replacement.json",
+        "replacement-hash",
+    )
+
+    stored_dataset = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    stored_resource = list_catalogue_resources(conn, "nged", "shared-source-id")[0]
+    stored_evidence = list_classification_evidence(
+        conn, "nged", "shared-source-id"
+    )[0]
+    assert stored_dataset is not None
+    for field in (
+        "title",
+        "description",
+        "publisher",
+        "licence",
+        "licence_identifier",
+        "licence_title",
+        "licence_url",
+        "attribution",
+        "catalogue_page_url",
+        "metadata_api_url",
+        "declared_update_frequency",
+        "declared_update_frequency_text",
+        "portal_url",
+        "api_url",
+    ):
+        assert stored_dataset[field] is None
+    assert stored_dataset["themes"] == []
+    assert stored_dataset["tags"] == []
+    assert stored_dataset["raw_record"] == {}
+    assert stored_dataset["lifecycle_status"] == "unknown"
+    assert stored_dataset["publication_pattern"] == "unknown"
+    assert stored_dataset["access_status"] == "unknown"
+    for field in (
+        "name",
+        "description",
+        "url",
+        "format",
+        "media_type",
+        "size_bytes",
+        "source_created_at",
+        "source_updated_at",
+    ):
+        assert stored_resource[field] is None
+    assert stored_resource["raw_record"] == {}
+    assert stored_evidence["confidence"] == "unknown"
+    assert stored_evidence["source_value"] is None
+    assert stored_evidence["source_url"] is None
+    assert stored_evidence["observed_at"] is None
+    assert stored_evidence["raw_record"] == {}
+
+
+def test_complete_observation_removes_obsolete_resources_and_evidence(conn):
+    persist_catalogue_result(conn, make_result(), "initial.json", "initial-hash")
+    replacement = make_result(resource_url=None)
+    replacement.datasets[0].classification_evidence = []
+
+    persist_catalogue_result(
+        conn,
+        replacement,
+        "replacement.json",
+        "replacement-hash",
+    )
+
+    assert list_catalogue_resources(conn, "nged", "shared-source-id") == []
+    assert list_classification_evidence(conn, "nged", "shared-source-id") == []
+
+
+def test_failed_observation_does_not_mutate_current_registry(conn):
+    persist_catalogue_result(conn, make_result(), "initial.json", "initial-hash")
+    failed = make_result(
+        complete=False,
+        title="Untrusted failed title",
+        resource_url=None,
+        raw_record={"failed": True},
+    )
+
+    persist_catalogue_result(
+        conn,
+        failed,
+        "failed.json",
+        "failed-hash",
+        status="failed",
+    )
+
+    stored = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    assert stored is not None
+    assert stored["title"] == "Public flexibility data"
+    assert stored["raw_record"] == {"source_dataset_id": "shared-source-id"}
+    assert len(list_catalogue_resources(conn, "nged", "shared-source-id")) == 1
+    assert len(list_classification_evidence(conn, "nged", "shared-source-id")) == 1
+    assert conn.execute(
+        "SELECT status FROM catalogue_observations WHERE content_hash = 'failed-hash'"
+    ).fetchone()[0] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("nested_kind", "foreign_portal", "foreign_dataset"),
+    [
+        ("resource", "spen", "shared-source-id"),
+        ("resource", "nged", "other-dataset"),
+        ("evidence", "spen", "shared-source-id"),
+        ("evidence", "nged", "other-dataset"),
+    ],
+)
+def test_nested_associations_are_rejected_before_any_write(
+    conn,
+    nested_kind: str,
+    foreign_portal: str,
+    foreign_dataset: str,
+):
+    result = make_result()
+    if nested_kind == "resource":
+        result.datasets[0].resources[0].portal_id = foreign_portal
+        result.datasets[0].resources[0].source_dataset_id = foreign_dataset
+    else:
+        result.datasets[0].classification_evidence[0].portal_id = foreign_portal
+        result.datasets[0].classification_evidence[0].source_dataset_id = (
+            foreign_dataset
+        )
+
+    with pytest.raises(ValueError, match="association"):
+        persist_catalogue_result(conn, result, "invalid.json", "invalid-hash")
+
+    assert count_rows(conn, "catalogue_observations") == 0
+    assert count_rows(conn, "catalogue_datasets") == 0
+    assert count_rows(conn, "catalogue_resources") == 0
+    assert count_rows(conn, "classification_evidence") == 0
+
+
+def test_top_level_resource_must_belong_to_a_dataset_in_the_same_result(conn):
+    persist_catalogue_result(
+        conn,
+        make_result(source_dataset_id="existing-dataset"),
+        "existing.json",
+        "existing-hash",
+    )
+    invalid = make_result(source_dataset_id="new-dataset")
+    invalid = replace(
+        invalid,
+        resources=[
+            invalid.resources[0].model_copy(
+                update={"source_dataset_id": "existing-dataset"}
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="same fetch result"):
+        persist_catalogue_result(conn, invalid, "invalid.json", "invalid-hash")
+
+    assert get_catalogue_dataset(conn, "nged", "new-dataset") is None
+
+
+def test_dataset_and_resource_identity_is_scoped_to_portal(conn):
+    nged = persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "abc")
+    spen = persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "abc")
+
+    assert nged.dataset_count == spen.dataset_count == 1
+    assert nged.resource_count == spen.resource_count == 1
+    assert count_rows(conn, "catalogue_datasets") == 2
+    assert count_rows(conn, "catalogue_resources") == 2
+    keys = {
+        tuple(row)
+        for row in conn.execute(
+            "SELECT portal_id, source_dataset_id FROM catalogue_datasets ORDER BY portal_id"
+        )
+    }
+    assert keys == {("nged", "shared-source-id"), ("spen", "shared-source-id")}
+
+
+def test_structured_and_raw_provenance_round_trip_as_json(conn):
+    persist_catalogue_result(conn, make_result(), "snapshot.json", "abc")
+
+    dataset = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    evidence = conn.execute(
+        "SELECT source_value_json, raw_record_json FROM classification_evidence"
+    ).fetchone()
+    observation = latest_catalogue_observation(conn, "nged")
+
+    assert dataset is not None
+    assert dataset["tags"] == ["flexibility", "public"]
+    assert dataset["raw_record"] == {"source_dataset_id": "shared-source-id"}
+    assert json.loads(evidence[0]) == {"access": "public"}
+    assert json.loads(evidence[1]) == {"evidence_source_only": ["preserve"]}
+    assert observation is not None
+    assert observation["raw_pages"] == [
+        {"result": {"source_dataset_id": "shared-source-id"}}
+    ]
+
+
+def test_catalogue_assessment_persistence_is_idempotent_and_json_preserving(conn):
+    persisted = persist_catalogue_result(conn, make_result(), "snapshot.json", "abc")
+    values = {
+        "assessment_id": "nged:shared-source-id:maintenance",
+        "portal_id": "nged",
+        "source_dataset_id": "shared-source-id",
+        "observation_id": persisted.observation_id,
+        "assessment_type": "maintenance_state",
+        "assessment_value": "unknown",
+        "confidence": "unknown",
+        "rationale": ["Missing evidence; no schedule was inferred."],
+        "missing_evidence": ["published update schedule"],
+        "assessed_at": OBSERVED_AT,
+    }
+
+    persist_catalogue_assessment(conn, **values)
+    persist_catalogue_assessment(conn, **values)
+
+    row = conn.execute(
+        "SELECT rationale_json, missing_evidence_json FROM catalogue_assessments"
+    ).fetchone()
+    assert count_rows(conn, "catalogue_assessments") == 1
+    assert json.loads(row[0]) == values["rationale"]
+    assert json.loads(row[1]) == values["missing_evidence"]
+
+
+@pytest.mark.parametrize(
+    ("replacement_portal", "replacement_dataset"),
+    (("spen", "dataset-b"), ("nged", "dataset-b")),
+)
+def test_catalogue_assessment_id_cannot_be_reused_for_another_dataset(
+    conn, replacement_portal, replacement_dataset
+):
+    original = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged-a.json",
+        "nged-a-hash",
+    )
+    replacement = persist_catalogue_result(
+        conn,
+        make_result(portal_id=replacement_portal, source_dataset_id=replacement_dataset),
+        "replacement.json",
+        "replacement-hash",
+    )
+    assessment_id = "shared-assessment-id"
+    persist_catalogue_assessment(
+        conn,
+        assessment_id=assessment_id,
+        portal_id="nged",
+        source_dataset_id="dataset-a",
+        observation_id=original.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="unknown",
+        confidence="unknown",
+        rationale=["Original public-safe synthetic assessment."],
+        missing_evidence=["published update schedule"],
+        assessed_at=OBSERVED_AT,
+    )
+    original_row = conn.execute(
+        "SELECT * FROM catalogue_assessments WHERE assessment_id = ?",
+        (assessment_id,),
+    ).fetchone()
+
+    with pytest.raises(ValueError, match="dataset"):
+        persist_catalogue_assessment(
+            conn,
+            assessment_id=assessment_id,
+            portal_id=replacement_portal,
+            source_dataset_id=replacement_dataset,
+            observation_id=replacement.observation_id,
+            assessment_type="maintenance_state",
+            assessment_value="possible fit",
+            confidence="unknown",
+            rationale=["Replacement assessment must not overwrite the original."],
+            missing_evidence=[],
+            assessed_at=datetime(2026, 7, 16, 9, 30, tzinfo=timezone.utc),
+        )
+
+    stored_row = conn.execute(
+        "SELECT * FROM catalogue_assessments WHERE assessment_id = ?",
+        (assessment_id,),
+    ).fetchone()
+    assert tuple(stored_row) == tuple(original_row)
+
+
+def test_catalogue_assessment_id_allows_update_for_same_dataset(conn):
+    first = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged-a-first.json",
+        "nged-a-first-hash",
+    )
+    later = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged-a-later.json",
+        "nged-a-later-hash",
+    )
+    assessment_id = "shared-assessment-id"
+    persist_catalogue_assessment(
+        conn,
+        assessment_id=assessment_id,
+        portal_id="nged",
+        source_dataset_id="dataset-a",
+        observation_id=first.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="unknown",
+        confidence="unknown",
+        rationale=["Initial assessment."],
+        missing_evidence=["published update schedule"],
+        assessed_at=OBSERVED_AT,
+    )
+
+    later_assessed_at = datetime(2026, 7, 16, 9, 30, tzinfo=timezone.utc)
+    persist_catalogue_assessment(
+        conn,
+        assessment_id=assessment_id,
+        portal_id="nged",
+        source_dataset_id="dataset-a",
+        observation_id=later.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="worth investigating",
+        confidence="unknown",
+        rationale=["Later valid observation for the same dataset."],
+        missing_evidence=[],
+        assessed_at=later_assessed_at,
+    )
+
+    row = conn.execute(
+        """SELECT dataset_key, observation_id, assessment_value, rationale_json,
+                  missing_evidence_json, assessed_at
+           FROM catalogue_assessments WHERE assessment_id = ?""",
+        (assessment_id,),
+    ).fetchone()
+    assert tuple(row) == (
+        "nged:dataset-a",
+        later.observation_id,
+        "worth investigating",
+        '["Later valid observation for the same dataset."]',
+        "[]",
+        later_assessed_at.isoformat(),
+    )
+
+
+def test_catalogue_assessment_rejects_observation_from_another_portal(conn):
+    nged = persist_catalogue_result(
+        conn,
+        make_result(portal_id="nged", source_dataset_id="dataset-a"),
+        "nged.json",
+        "nged-hash",
+    )
+    spen = persist_catalogue_result(
+        conn,
+        make_result(portal_id="spen", source_dataset_id="dataset-b"),
+        "spen.json",
+        "spen-hash",
+    )
+
+    with pytest.raises(ValueError, match="portal"):
+        persist_catalogue_assessment(
+            conn,
+            assessment_id="nged:dataset-a:maintenance",
+            portal_id="nged",
+            source_dataset_id="dataset-a",
+            observation_id=spen.observation_id,
+            assessment_type="maintenance_state",
+            assessment_value="unknown",
+            confidence="unknown",
+            rationale=["No cross-portal evidence is valid."],
+            missing_evidence=[],
+            assessed_at=OBSERVED_AT,
+        )
+
+    assert nged.observation_id != spen.observation_id
+    assert count_rows(conn, "catalogue_assessments") == 0
+
+
+def test_list_catalogue_resources_is_portal_scoped_and_decodes_raw_provenance(conn):
+    persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "nged-hash")
+    persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "spen-hash")
+
+    resources = list_catalogue_resources(conn, "nged", "shared-source-id")
+
+    assert len(resources) == 1
+    assert resources[0]["portal_id"] == "nged"
+    assert resources[0]["raw_record"] == {"resource_source_only": True}
+    assert list_catalogue_resources(conn, "nged", "missing") == []
+
+
+def test_list_classification_evidence_is_portal_scoped_and_decodes_structured_values(conn):
+    persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "nged-hash")
+    persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "spen-hash")
+
+    evidence = list_classification_evidence(conn, "nged", "shared-source-id")
+
+    assert len(evidence) == 1
+    assert evidence[0]["portal_id"] == "nged"
+    assert evidence[0]["source_value"] == {"access": "public"}
+    assert evidence[0]["raw_record"] == {"evidence_source_only": ["preserve"]}
+    assert list_classification_evidence(conn, "nged", "missing") == []
+
+
+def test_list_classification_evidence_preserves_unknown_structured_value(conn):
+    result = make_result()
+    result.datasets[0].classification_evidence[0].source_value = None
+    persist_catalogue_result(conn, result, "nged.json", "nged-hash")
+
+    evidence = list_classification_evidence(conn, "nged", "shared-source-id")
+
+    assert evidence[0]["source_value"] is None
+
+
+def test_list_catalogue_assessments_is_portal_scoped_and_decodes_reasoning(conn):
+    nged = persist_catalogue_result(conn, make_result(portal_id="nged"), "nged.json", "nged-hash")
+    persist_catalogue_result(conn, make_result(portal_id="spen"), "spen.json", "spen-hash")
+    persist_catalogue_assessment(
+        conn,
+        assessment_id="nged:shared-source-id:maintenance",
+        portal_id="nged",
+        source_dataset_id="shared-source-id",
+        observation_id=nged.observation_id,
+        assessment_type="maintenance_state",
+        assessment_value="unknown",
+        confidence="unknown",
+        rationale=["Missing evidence; no schedule was inferred."],
+        missing_evidence=["published update schedule"],
+        assessed_at=OBSERVED_AT,
+    )
+
+    assessments = list_catalogue_assessments(conn, "nged", "shared-source-id")
+
+    assert len(assessments) == 1
+    assert assessments[0]["rationale"] == ["Missing evidence; no schedule was inferred."]
+    assert assessments[0]["missing_evidence"] == ["published update schedule"]
+    assert list_catalogue_assessments(conn, "spen", "shared-source-id") == []
+    assert list_catalogue_assessments(conn, "nged", "missing") == []
+
+
+def test_migration_five_adds_canonical_metadata_columns(tmp_path):
+    """Migration 5 is additive: adds new columns to existing catalogue_datasets."""
+    db_path = tmp_path / "catalogue.db"
+    run_migrations(db_path)
+    with get_connection(db_path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(catalogue_datasets)").fetchall()
+        }
+    assert "licence_identifier" in columns
+    assert "licence_title" in columns
+    assert "licence_url" in columns
+    assert "attribution" in columns
+    assert "themes_json" in columns
+    assert "catalogue_page_url" in columns
+    assert "metadata_api_url" in columns
+    assert "declared_update_frequency" in columns
+    assert "declared_update_frequency_text" in columns
+
+
+def test_migration_five_is_idempotent(tmp_path):
+    """Migration 5 can be applied multiple times without error."""
+    db_path = tmp_path / "catalogue.db"
+    run_migrations(db_path)
+    version = run_migrations(db_path)
+    assert version == 5
+
+
+def test_migration_five_upgrades_current_v4_registry_without_data_loss(tmp_path):
+    """Migration 5 upgrades a populated Package 1 v4 registry transactionally."""
+    db_path = tmp_path / "version-four.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:4]:
+            conn.executescript(ddl)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
+        conn.execute(
+            """INSERT INTO catalogue_observations (
+                   observation_id, portal_id, observed_at, content_hash,
+                   snapshot_path, status, dataset_count, resource_count
+               ) VALUES ('obs', 'nged', '2026-07-16T00:00:00+00:00', 'hash',
+                         'snapshot.json', 'complete', 1, 0)"""
+        )
+        conn.execute(
+            """INSERT INTO catalogue_datasets (
+                   dataset_key, portal_id, source_dataset_id, source_record_id,
+                   title, first_seen_at, last_seen_at, last_observation_id
+               ) VALUES ('nged:legacy', 'nged', 'legacy', 'legacy', 'Legacy title',
+                         '2026-07-16T00:00:00+00:00',
+                         '2026-07-16T00:00:00+00:00', 'obs')"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert run_migrations(db_path) == 5
+    assert run_migrations(db_path) == 5
+    with get_connection(db_path) as migrated:
+        row = migrated.execute(
+            "SELECT title, declared_update_frequency_text FROM catalogue_datasets"
+        ).fetchone()
+        foreign_key_errors = migrated.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert tuple(row) == ("Legacy title", None)
+    assert foreign_key_errors == []
+
+
+def test_migration_five_rolls_back_all_columns_and_version_on_failure(tmp_path):
+    """Migration 5 leaves no partial schema when an ALTER statement fails."""
+    db_path = tmp_path / "migration-failure.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:4]:
+            conn.executescript(ddl)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
+        conn.execute("ALTER TABLE catalogue_datasets ADD COLUMN licence_title TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="duplicate column"):
+        run_migrations(db_path)
+
+    with sqlite3.connect(db_path) as failed:
+        columns = {
+            row[1]
+            for row in failed.execute("PRAGMA table_info(catalogue_datasets)").fetchall()
+        }
+        versions = {
+            row[0] for row in failed.execute("SELECT version FROM schema_version").fetchall()
+        }
+
+    assert "licence_title" in columns
+    assert "licence_identifier" not in columns
+    assert 5 not in versions
+
+
+def test_s5_persistence_roundtrip_for_frequency_fields(conn):
+    """S5: declared_update_frequency fields persist through the store."""
+    result = make_result()
+    result.datasets[0].declared_update_frequency = "weekly"
+    result.datasets[0].declared_update_frequency_text = "Weekly"
+    persist_catalogue_result(conn, result, "nged.json", "nged-hash")
+
+    stored = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    assert stored["declared_update_frequency"] == "weekly"
+    assert stored["declared_update_frequency_text"] == "Weekly"
+
+
+def test_s9_persistence_roundtrip_for_canonical_metadata(conn):
+    """S9: Canonical metadata fields persist through the store."""
+    result = make_result()
+    result.datasets[0].licence_identifier = "odc-odbl"
+    result.datasets[0].licence_title = "ODC Open Data License"
+    result.datasets[0].licence_url = "https://opendatacommons.org/licenses/odbl/"
+    result.datasets[0].attribution = "Test Publisher"
+    result.datasets[0].themes = ["flexibility", "networks"]
+    result.datasets[0].catalogue_page_url = "https://example.invalid/dataset/test"
+    persist_catalogue_result(conn, result, "nged.json", "nged-hash")
+
+    stored = get_catalogue_dataset(conn, "nged", "shared-source-id")
+    assert stored["licence_identifier"] == "odc-odbl"
+    assert stored["licence_title"] == "ODC Open Data License"
+    assert stored["licence_url"] == "https://opendatacommons.org/licenses/odbl/"
+    assert stored["attribution"] == "Test Publisher"
+    assert stored["themes"] == ["flexibility", "networks"]
+    assert stored["catalogue_page_url"] == "https://example.invalid/dataset/test"

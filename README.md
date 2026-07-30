@@ -5,11 +5,11 @@ data about Great Britain's electricity networks and local flexibility markets.
 It bridges energy-domain research with reproducible Python data pipelines, a
 FastAPI research API, and a small Next.js interface.
 
-The repository currently provides public catalogue ingestion foundations for
-NGED, SP Energy Networks, Electricity North West, and SSEN; SQLite storage;
-provenance-preserving normalisation models; postcode and geometry matching;
-data-quality utilities; synthetic portfolio examples; and directional report
-generation.
+The repository currently provides a catalogue intelligence registry for public
+metadata from NGED, SP Energy Networks, Electricity North West, SSEN, UK Power
+Networks, Northern Powergrid, and NESO; SQLite storage; provenance-preserving
+normalisation models; postcode and geometry matching; data-quality utilities;
+synthetic portfolio examples; and directional report generation.
 
 This is a research project, not a product. It does not bid, dispatch or control
 assets, establish eligibility, forecast revenue, or provide commercial advice.
@@ -23,9 +23,10 @@ as if they were current market facts. Normalised records should be created from
 public portal responses only after their schemas, provenance, licence, and
 limitations are verified.
 
-Downloaded records and generated SQLite databases stay local and are ignored by
-Git. See [public data sources](docs/public-data-sources.md) for the source
-register and verification status.
+Downloaded records, catalogue snapshots and queues, generated SQLite databases,
+caches, and reports stay local and are ignored by Git. See
+[public data sources](docs/public-data-sources.md) for the source register and
+verification status.
 
 ## Quick start
 
@@ -50,9 +51,44 @@ npm run dev
 Open `http://localhost:3000`. The frontend proxies `/api` to the backend on port
 8099.
 
-## Public ingestion
+## Public catalogue metadata
 
-Run from the repository root after adding any public portal tokens to `.env`:
+The catalogue intelligence workflow observes public metadata from all seven
+portals using anonymous, read-only GET requests. It does not establish that
+every underlying dataset resource is anonymously accessible or redistributable.
+
+Run these commands from the `backend/` directory. Sync every configured portal
+or select one:
+
+```powershell
+cd backend
+python -m app.catalogue_cli sync --portal all
+python -m app.catalogue_cli sync --portal nged
+```
+
+The default SQLite registry, JSON snapshots, cache, and review queue are local,
+Git-ignored outputs under `../data/cache/catalogue/` and
+`../data/snapshots/catalogues/`. Compare two local snapshots or inspect the
+unresolved evidence queue with:
+
+```powershell
+python -m app.catalogue_cli diff --before ../data/snapshots/catalogues/20260715T120000.000000Z/nged.json --after ../data/snapshots/catalogues/20260716T120000.000000Z/nged.json
+python -m app.catalogue_cli review-queue --format json
+```
+
+Maintenance remains unknown unless public evidence explicitly establishes an
+active lifecycle and a defensible freshness clock. Catalogue-edit timestamps do
+not stand in for data/release freshness, and the adapters do not infer missing
+lifecycle or access facts.
+
+See [public data sources](docs/public-data-sources.md) for portal-specific scope,
+licence cautions, and limitations.
+
+## Analytical portal ingestion (legacy)
+
+This is separate from catalogue metadata. The repository retains four portal
+pipelines for analytical records. Run from the repository root after adding any
+public portal tokens to `.env`:
 
 ```powershell
 python -m backend.app.ingest --nged

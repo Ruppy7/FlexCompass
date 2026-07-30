@@ -10,6 +10,10 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.catalogue_models import CATALOGUE_PORTALS, CataloguePortalConfig
+
+__all__ = ["CATALOGUE_PORTALS", "CataloguePortalConfig", "config"]
+
 # Load .env early so local public-portal settings are available.
 try:
     from dotenv import load_dotenv

@@ -1,0 +1,39 @@
+{
+  "total_count": 2,
+  "results": [
+    {
+      "dataset_id": "one",
+      "dataset_uid": "synthetic-ods-one",
+      "visibility": "domain",
+      "attachments": [
+        {
+          "id": "synthetic-attachment-one",
+          "title": "Synthetic attachment",
+          "mimetype": "text/csv",
+          "url": "https://example.invalid/synthetic-attachment.csv",
+          "source_only": "preserve me"
+        }
+      ],
+      "alternative_exports": [],
+      "metas": {
+        "default": {
+          "title": "Synthetic ODS dataset one",
+          "description": "Minimised public catalogue shape.",
+          "license": "Example licence",
+          "publisher": "Example Publisher",
+          "modified": "2026-01-02T11:00:00+00:00",
+          "records_count": 12,
+          "keyword": ["synthetic"]
+        }
+      },
+      "source_only": "preserve me"
+    },
+    {
+      "dataset_id": "two",
+      "dataset_uid": "synthetic-ods-two",
+      "attachments": [],
+      "alternative_exports": [],
+      "metas": {"default": {"title": "Synthetic ODS dataset two"}}
+    }
+  ]
+}

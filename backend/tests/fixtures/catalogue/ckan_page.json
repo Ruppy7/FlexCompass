@@ -1,0 +1,41 @@
+{
+  "success": true,
+  "result": {
+    "count": 2,
+    "results": [
+      {
+        "id": "synthetic-one-uuid",
+        "name": "one",
+        "title": "Synthetic CKAN dataset one",
+        "notes": "Minimised public catalogue shape.",
+        "license_title": "Example licence",
+        "metadata_created": "2026-01-01T10:00:00.000000",
+        "metadata_modified": "2026-01-02T11:00:00.000000",
+        "organization": {"name": "example-publisher", "title": "Example Publisher"},
+        "resources": [
+          {
+            "id": "synthetic-resource-one",
+            "name": "Example CSV",
+            "description": "Synthetic resource metadata.",
+            "format": "CSV",
+            "mimetype": "text/csv",
+            "size": 42,
+            "created": "2026-01-01T10:00:00.000000",
+            "last_modified": null,
+            "url": "https://example.invalid/one.csv",
+            "source_only": "preserve me"
+          }
+        ],
+        "tags": [{"name": "synthetic"}],
+        "source_only": "preserve me"
+      },
+      {
+        "id": "synthetic-two-uuid",
+        "name": "two",
+        "title": "Synthetic CKAN dataset two",
+        "resources": [],
+        "tags": []
+      }
+    ]
+  }
+}
