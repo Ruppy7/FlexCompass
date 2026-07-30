@@ -10,6 +10,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -1491,3 +1492,153 @@ def test_signed_r2_redirect_material_never_crosses_persistence_boundaries(
     assert "preserve ordinary failed warning" in sqlite_text
     assert "ordinary reject context" in sqlite_text
     assert "preserve reject evidence" in sqlite_text
+
+
+def test_encoded_signed_redirect_material_never_crosses_persistence_boundaries(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    def encode_every_byte(value: str) -> str:
+        return "".join(f"%{byte:02X}" for byte in value.encode())
+
+    host = "83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com"
+    path = (
+        "/dx-sse-prod/resources/"
+        "ab32515f-76f2-421d-8034-7d5b01325a33/encoded.csv"
+    )
+    signed_url = (
+        f"https://{host}{path}?"
+        "X-Amz-Date=ENCODED_DATE_MARKER&"
+        "X-Amz-Expires=ENCODED_EXPIRES_MARKER"
+    )
+    mixed_case_url = (
+        f"hTtPs://{host.upper()}{path}?"
+        "x-aMz-aLgOrItHm=MIXED_ALGORITHM_MARKER"
+    )
+    encoded_url = quote(signed_url, safe="")
+    double_encoded_url = quote(encoded_url, safe="")
+    encoded_mixed_url = quote(mixed_case_url, safe="")
+    fully_encoded_url = encode_every_byte(signed_url)
+    double_fully_encoded_url = quote(fully_encoded_url, safe="")
+    encoded_pair = encode_every_byte(
+        "X-Amz-Date=FULLY_ENCODED_VALUE_MARKER"
+    )
+    double_encoded_pair = quote(encoded_pair, safe="")
+    encoded_payload = {
+        "ordinary": "preserve encoded reject evidence",
+        "signed%5Furl": encoded_url,
+        "redirect%255Furl": double_encoded_url,
+        "X%2DAmz%2DDate": "ENCODED_KEY_MARKER",
+        "X%252DAmz%252DExpires": "DOUBLE_ENCODED_KEY_MARKER",
+        "x%2DaMz%2DdAtE": encode_every_byte("MIXED_KEY_VALUE_MARKER"),
+        "malformed_contamination": encoded_url + "%GG",
+        "nested": [
+            encoded_url,
+            {"value": double_encoded_url},
+            fully_encoded_url,
+            double_fully_encoded_url,
+            quote("X-Amz-Date=ENCODED_STRING_MARKER", safe=""),
+            quote(
+                quote(
+                    "x-AmZ-SignedHeaders=DOUBLE_ENCODED_STRING_MARKER",
+                    safe="",
+                ),
+                safe="",
+            ),
+            encoded_pair,
+            double_encoded_pair,
+        ],
+    }
+    reject = OutageReject(
+        run_id="run:encoded-completed",
+        source_resource_id=source_snapshot.source_resource_id,
+        row_number=3,
+        error_code="download_failed",
+        error_message=(
+            f"preserve encoded reject context: {double_encoded_url}"
+        ),
+        raw_row=encoded_payload,
+    )
+
+    completed = commit_ingestion_run(
+        run_id="run:encoded-completed",
+        resources_seen=1,
+        snapshots=[source_snapshot],
+        events=[parsed_event],
+        rejects=[reject],
+        snapshots_created=1,
+        snapshots_reused=0,
+        warnings=[
+            "preserve ordinary encoded completed warning",
+            encoded_url,
+            double_encoded_url,
+            encoded_mixed_url,
+            fully_encoded_url,
+            double_fully_encoded_url,
+            encoded_payload,
+        ],
+        db_path=temp_db,
+    )
+    failed = record_failed_ingestion_run(
+        run_id="run:encoded-failed",
+        resources_seen=1,
+        error=RuntimeError(double_encoded_url),
+        warnings=[
+            "preserve ordinary encoded failed warning",
+            encoded_url,
+            double_encoded_url,
+            encoded_mixed_url,
+            fully_encoded_url,
+            double_fully_encoded_url,
+            encoded_payload,
+        ],
+        db_path=temp_db,
+    )
+
+    with get_connection(temp_db) as connection:
+        sqlite_text = "\n".join(connection.iterdump())
+
+    assert completed.warnings[0] == (
+        "preserve ordinary encoded completed warning"
+    )
+    assert failed.warnings[0] == "preserve ordinary encoded failed warning"
+    result_text = json.dumps(
+        [completed.model_dump(), failed.model_dump()],
+        sort_keys=True,
+    )
+    for forbidden in (
+        host,
+        host.upper(),
+        path,
+        signed_url,
+        mixed_case_url,
+        encoded_url,
+        double_encoded_url,
+        encoded_mixed_url,
+        fully_encoded_url,
+        double_fully_encoded_url,
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "x-aMz-aLgOrItHm",
+        "X%2DAmz%2DDate",
+        "X%252DAmz%252DExpires",
+        "signed%5Furl",
+        "redirect%255Furl",
+        encoded_pair,
+        double_encoded_pair,
+        "ENCODED_DATE_MARKER",
+        "ENCODED_EXPIRES_MARKER",
+        "MIXED_ALGORITHM_MARKER",
+        "ENCODED_KEY_MARKER",
+        "DOUBLE_ENCODED_KEY_MARKER",
+        "ENCODED_STRING_MARKER",
+        "DOUBLE_ENCODED_STRING_MARKER",
+        "FULLY_ENCODED_VALUE_MARKER",
+        "MIXED_KEY_VALUE_MARKER",
+    ):
+        assert forbidden not in sqlite_text
+        assert forbidden not in result_text
+    assert "preserve ordinary encoded completed warning" in sqlite_text
+    assert "preserve ordinary encoded failed warning" in sqlite_text
+    assert "preserve encoded reject evidence" in sqlite_text
