@@ -1327,7 +1327,6 @@ def test_commit_ingestion_run_is_one_atomic_transaction(
     assert run[0] == "completed"
     assert json.loads(reject_json) == {
         "HV_INCIDENT_TIME": "not-a-date",
-        "signed_url": "[REDACTED]",
     }
     assert marker not in reject_json
 
@@ -1396,7 +1395,7 @@ def test_failed_run_records_only_redacted_safe_failure_state(
         ).fetchone()
         payload = "\n".join(connection.iterdump())
     assert tuple(row[:2]) == ("failed", "RuntimeError: operation failed")
-    assert json.loads(row[2]) == [{"signed_url": "[REDACTED]"}, "safe warning"]
+    assert json.loads(row[2]) == [{}, "safe warning"]
     assert marker not in payload
     assert "X-Amz-Signature" not in payload
     assert count_source_snapshots(db_path=temp_db) == 0
@@ -1490,7 +1489,6 @@ def test_signed_r2_redirect_material_never_crosses_persistence_boundaries(
         assert forbidden not in json.dumps(failed.model_dump())
     assert "preserve ordinary completed warning" in sqlite_text
     assert "preserve ordinary failed warning" in sqlite_text
-    assert "ordinary reject context" in sqlite_text
     assert "preserve reject evidence" in sqlite_text
 
 
@@ -1642,3 +1640,134 @@ def test_encoded_signed_redirect_material_never_crosses_persistence_boundaries(
     assert "preserve ordinary encoded completed warning" in sqlite_text
     assert "preserve ordinary encoded failed warning" in sqlite_text
     assert "preserve encoded reject evidence" in sqlite_text
+
+
+def test_default_port_signed_redirect_never_crosses_persistence_boundaries(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    host = "83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com"
+    path = (
+        "/dx-sse-prod/resources/"
+        "ab32515f-76f2-421d-8034-7d5b01325a33/port.csv"
+    )
+    signed_url = (
+        f"https://{host}:443{path}?"
+        "X-Amz-Date=PORT_DATE_MARKER&X-Amz-Signature=PORT_SIGNATURE_MARKER"
+    )
+    encoded_url = quote(signed_url, safe="")
+    double_encoded_url = quote(encoded_url, safe="")
+    reject = OutageReject(
+        run_id="run:port-completed",
+        source_resource_id=source_snapshot.source_resource_id,
+        row_number=4,
+        error_code="download_failed",
+        error_message=f"default-port redirect: {signed_url}",
+        raw_row={
+            "ordinary": "preserve default-port reject evidence",
+            "nested": [signed_url, encoded_url, {"value": double_encoded_url}],
+        },
+    )
+
+    completed = commit_ingestion_run(
+        run_id="run:port-completed",
+        resources_seen=1,
+        snapshots=[source_snapshot],
+        events=[parsed_event],
+        rejects=[reject],
+        snapshots_created=1,
+        snapshots_reused=0,
+        warnings=[
+            "preserve ordinary default-port completed warning",
+            signed_url,
+            encoded_url,
+            double_encoded_url,
+        ],
+        db_path=temp_db,
+    )
+    failed = record_failed_ingestion_run(
+        run_id="run:port-failed",
+        resources_seen=1,
+        error=RuntimeError(signed_url),
+        warnings=[
+            "preserve ordinary default-port failed warning",
+            signed_url,
+            encoded_url,
+            double_encoded_url,
+        ],
+        db_path=temp_db,
+    )
+
+    with get_connection(temp_db) as connection:
+        sqlite_text = "\n".join(connection.iterdump())
+    result_text = json.dumps(
+        [completed.model_dump(), failed.model_dump()],
+        sort_keys=True,
+    )
+
+    for forbidden in (
+        host,
+        f"{host}:443",
+        path,
+        signed_url,
+        encoded_url,
+        double_encoded_url,
+        "X-Amz-Date",
+        "X-Amz-Signature",
+        "PORT_DATE_MARKER",
+        "PORT_SIGNATURE_MARKER",
+    ):
+        assert forbidden not in sqlite_text
+        assert forbidden not in result_text
+    assert "preserve ordinary default-port completed warning" in sqlite_text
+    assert "preserve ordinary default-port failed warning" in sqlite_text
+    assert "preserve default-port reject evidence" in sqlite_text
+
+
+def test_benign_percent_and_multiline_warnings_survive_persistence(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    benign = [
+        "coverage is 95% complete",
+        "encoded coverage is 95%25 complete",
+        "malformed public label %GG",
+        "ordinary first line\nordinary second line",
+    ]
+
+    completed = commit_ingestion_run(
+        run_id="run:benign-completed",
+        resources_seen=1,
+        snapshots=[source_snapshot],
+        events=[parsed_event],
+        rejects=[],
+        snapshots_created=1,
+        snapshots_reused=0,
+        warnings=benign,
+        db_path=temp_db,
+    )
+    failed = record_failed_ingestion_run(
+        run_id="run:benign-failed",
+        resources_seen=1,
+        error=RuntimeError("ordinary public failure"),
+        warnings=benign,
+        db_path=temp_db,
+    )
+
+    with get_connection(temp_db) as connection:
+        persisted = {
+            row["run_id"]: json.loads(row["warnings_json"])
+            for row in connection.execute(
+                """SELECT run_id, warnings_json FROM ingestion_runs
+                   ORDER BY run_id"""
+            )
+        }
+
+    assert completed.warnings == benign
+    assert failed.warnings == benign
+    assert persisted == {
+        "run:benign-completed": benign,
+        "run:benign-failed": benign,
+    }

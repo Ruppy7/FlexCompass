@@ -42,14 +42,14 @@ _SNAPSHOT_FILTERS = {
 }
 _R2_SIGNED_TARGET = re.compile(
     r"https://83025b28472d6aa2bf5ae59f3724aa78"
-    r"\.r2\.cloudflarestorage\.com(?:/[^\s\"'<>]*)?",
+    r"\.r2\.cloudflarestorage\.com(?::443)?"
+    r"(?=/|[?#\s\"'<>]|$)(?:/[^\s\"'<>]*)?",
     re.IGNORECASE,
 )
 _X_AMZ_FIELD = re.compile(
     r"x-amz-[a-z0-9-]+(?:\s*[:=]\s*[^&,\s}\])\"']+)?",
     re.IGNORECASE,
 )
-_VALID_PERCENT_ESCAPE = re.compile(r"[0-9a-fA-F]{2}")
 _PERSISTENCE_DECODE_ROUNDS = 3
 
 
@@ -62,52 +62,31 @@ def _json(value: Any) -> str:
     )
 
 
-def _has_malformed_percent_escape(value: str) -> bool:
-    offset = 0
-    while True:
-        offset = value.find("%", offset)
-        if offset < 0:
-            return False
-        if not _VALID_PERCENT_ESCAPE.fullmatch(value[offset + 1 : offset + 3]):
-            return True
-        offset += 3
-
-
-def _decoded_layers(value: str) -> tuple[list[str], bool]:
+def _decoded_layers(value: str) -> list[str]:
     """Decode only for detection, with the Package 1 three-round budget."""
     layers = [value]
     decoded = value
-    complete = True
     for _ in range(_PERSISTENCE_DECODE_ROUNDS):
-        if _has_malformed_percent_escape(decoded):
-            complete = False
-        try:
-            further_decoded = unquote(decoded, errors="strict")
-        except (UnicodeDecodeError, ValueError):
-            return layers, False
-        layers.append(further_decoded)
-        if any(
-            ord(character) < 32 or ord(character) == 127
-            for character in further_decoded
-        ):
-            return layers, False
+        further_decoded = unquote(decoded)
         if further_decoded == decoded:
-            return layers, complete
+            break
+        layers.append(further_decoded)
         decoded = further_decoded
-    try:
-        fully_decoded = unquote(decoded, errors="strict") == decoded
-    except (UnicodeDecodeError, ValueError):
-        fully_decoded = False
-    return layers, complete and fully_decoded
+    return layers
 
 
-def _contaminated_layers(value: str) -> tuple[list[str], bool]:
-    layers, complete = _decoded_layers(value)
-    contaminated = any(
+def _has_signed_contamination(value: str, *, key: bool = False) -> bool:
+    layers = _decoded_layers(value)
+    return any(
         _R2_SIGNED_TARGET.search(layer) or _X_AMZ_FIELD.search(layer)
         for layer in layers
+    ) or (
+        key
+        and any(
+            layer.strip().casefold() in {"signed_url", "redirect_url"}
+            for layer in layers
+        )
     )
-    return layers, contaminated or not complete
 
 
 def _safe_failure_value(value: Any) -> Any:
@@ -115,50 +94,15 @@ def _safe_failure_value(value: Any) -> Any:
         safe_mapping: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            layers, unsafe = _contaminated_layers(key_text)
-            if unsafe:
+            if _has_signed_contamination(key_text, key=True):
                 continue
-            raw_sensitive_key = layers[0].strip().casefold() in {
-                "signed_url",
-                "redirect_url",
-            }
-            decoded_sensitive_key = any(
-                layer != layers[0]
-                and layer.strip().casefold()
-                in {"signed_url", "redirect_url"}
-                for layer in layers[1:]
-            )
-            if decoded_sensitive_key:
-                continue
-            if raw_sensitive_key:
-                safe_mapping[key_text] = "[REDACTED]"
-            else:
-                safe_mapping[key_text] = _safe_failure_value(item)
+            safe_mapping[key_text] = _safe_failure_value(item)
         return redact(safe_mapping)
     if isinstance(value, (list, tuple)):
         return [_safe_failure_value(item) for item in value]
     if isinstance(value, str):
-        layers, complete = _decoded_layers(value)
-        raw_contaminated = bool(
-            _R2_SIGNED_TARGET.search(layers[0])
-            or _X_AMZ_FIELD.search(layers[0])
-        )
-        decoded_contaminated = any(
-            layer != layers[0]
-            and (
-                _R2_SIGNED_TARGET.search(layer)
-                or _X_AMZ_FIELD.search(layer)
-            )
-            for layer in layers[1:]
-        )
-        if decoded_contaminated or not complete:
+        if _has_signed_contamination(value):
             return "[REDACTED SIGNED REDIRECT]"
-        if raw_contaminated:
-            without_target = _R2_SIGNED_TARGET.sub(
-                "[REDACTED SIGNED REDIRECT]",
-                value,
-            )
-            return redact(_X_AMZ_FIELD.sub("[REDACTED]", without_target))
         return redact(value)
     return redact(value)
 
