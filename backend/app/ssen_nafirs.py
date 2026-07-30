@@ -14,6 +14,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
+from pydantic import ValidationError
 
 from app.catalogue_sync import redact
 from app.outages import LicenceArea, OutageEvent, SourceResource
@@ -146,7 +147,14 @@ def _reporting_year(row: Mapping[str, str], raw_record: Mapping[str, Any]) -> in
             "reporting year is not a base-10 integer",
             raw_record=raw_record,
         )
-    year = int(value, 10)
+    try:
+        year = int(value, 10)
+    except ValueError as error:
+        raise OutageRowError(
+            "invalid_reporting_year",
+            "reporting year is not a supported base-10 integer",
+            raw_record=raw_record,
+        ) from error
     if not 1900 <= year <= 2100:
         raise OutageRowError(
             "invalid_reporting_year",
@@ -212,7 +220,11 @@ def _optional_non_negative_int(
     if _INTEGER_SYNTAX.fullmatch(value) is None:
         quality_flags.append(flag)
         return None
-    parsed = int(value, 10)
+    try:
+        parsed = int(value, 10)
+    except ValueError:
+        quality_flags.append(flag)
+        return None
     if parsed < 0:
         quality_flags.append(flag)
         return None
@@ -377,34 +389,43 @@ def iter_ssen_hv_csv(
             observed=observed_header,
         )
 
-    try:
-        for row_number, values in enumerate(reader, start=2):
-            if len(values) != len(expected_columns):
-                yield OutageRowError(
-                    "invalid_row_shape",
-                    "CSV row value count does not match the validated header",
-                    raw_record={"_row": values},
-                    row_number=row_number,
-                )
-                continue
-            row = dict(zip(expected_columns, values, strict=True))
-            try:
-                yield parse_ssen_hv_event(
-                    row,
-                    licence_area=licence_area,
-                    source_dataset_id=source_dataset_id,
-                    source_resource_id=resolved_resource_id,
-                    snapshot_id=snapshot_id,
-                )
-            except OutageRowError as error:
-                error.row_number = row_number
-                yield error
-    except csv.Error:
-        yield OutageRowError(
-            "invalid_row_shape",
-            "CSV row structure is malformed",
-            row_number=reader.line_num,
-        )
+    while True:
+        row_number = reader.line_num + 1
+        previous_line_number = reader.line_num
+        try:
+            values = next(reader)
+        except StopIteration:
+            break
+        except csv.Error:
+            yield OutageRowError(
+                "invalid_row_shape",
+                "CSV row structure is malformed",
+                row_number=row_number,
+            )
+            if reader.line_num <= previous_line_number:
+                break
+            continue
+
+        if len(values) != len(expected_columns):
+            yield OutageRowError(
+                "invalid_row_shape",
+                "CSV row value count does not match the validated header",
+                raw_record={"_row": values},
+                row_number=row_number,
+            )
+            continue
+        row = dict(zip(expected_columns, values, strict=True))
+        try:
+            yield parse_ssen_hv_event(
+                row,
+                licence_area=licence_area,
+                source_dataset_id=source_dataset_id,
+                source_resource_id=resolved_resource_id,
+                snapshot_id=snapshot_id,
+            )
+        except OutageRowError as error:
+            error.row_number = row_number
+            yield error
 
 
 def _resource_url_is_valid(url: Any, resource_id: str) -> bool:
@@ -531,8 +552,8 @@ def discover_ssen_hv_resources(client: httpx.Client) -> list[SourceResource]:
                     "datastore_active": resource.get("datastore_active"),
                 },
             )
-        discovered.append(
-            SourceResource(
+        try:
+            source_resource = SourceResource(
                 source_dataset_id=SOURCE_DATASET_ID,
                 package_id=PACKAGE_ID,
                 source_resource_id=resource_id,
@@ -545,5 +566,9 @@ def discover_ssen_hv_resources(client: httpx.Client) -> list[SourceResource]:
                 datastore_active=resource["datastore_active"],
                 raw_record=dict(resource),
             )
-        )
+        except ValidationError:
+            raise SourceContractError(
+                f"{licence_area} SSEN resource fields are invalid"
+            ) from None
+        discovered.append(source_resource)
     return discovered

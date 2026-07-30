@@ -549,6 +549,15 @@ def test_required_field_rejects_have_stable_codes(
         assert value not in caught.value.message
 
 
+def test_oversized_reporting_year_has_stable_row_error(
+    sample_row: dict[str, str],
+) -> None:
+    with pytest.raises(OutageRowError) as caught:
+        parse_sepd(sample_row | {"REPORTING_YEAR": "9" * 5000})
+
+    assert caught.value.code == "invalid_reporting_year"
+
+
 @pytest.mark.parametrize(
     ("field", "value", "attribute", "flag"),
     [
@@ -591,6 +600,29 @@ def test_invalid_optional_numeric_values_become_flagged_unknowns(
     flag: str,
 ) -> None:
     event = parse_sepd(sample_row | {field: value})
+
+    assert getattr(event, attribute) is None
+    assert event.quality_flags == [flag]
+
+
+@pytest.mark.parametrize(
+    ("field", "attribute", "flag"),
+    [
+        ("HV_CUST_AFF", "customers_affected", "invalid_customers_affected"),
+        (
+            "HV_CUST_MINS_LOST",
+            "customer_minutes_lost",
+            "invalid_customer_minutes_lost",
+        ),
+    ],
+)
+def test_oversized_optional_integer_is_a_flagged_unknown(
+    sample_row: dict[str, str],
+    field: str,
+    attribute: str,
+    flag: str,
+) -> None:
+    event = parse_sepd(sample_row | {field: "9" * 5000})
 
     assert getattr(event, attribute) is None
     assert event.quality_flags == [flag]
@@ -659,6 +691,75 @@ def test_one_bad_row_does_not_block_later_valid_row(
     assert len(results) == 2
     assert isinstance(results[0], OutageRowError)
     assert results[0].code == "invalid_row_shape"
+    assert isinstance(results[1], OutageEvent)
+    assert results[1].incident_started_local == "2026-07-12T16:15:00"
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_type", "expected_flag"),
+    [
+        ("REPORTING_YEAR", OutageRowError, None),
+        ("HV_CUST_AFF", OutageEvent, "invalid_customers_affected"),
+        (
+            "HV_CUST_MINS_LOST",
+            OutageEvent,
+            "invalid_customer_minutes_lost",
+        ),
+    ],
+)
+def test_oversized_integer_row_does_not_block_later_valid_row(
+    sepd_csv_bytes: bytes,
+    field: str,
+    expected_type: type[OutageRowError] | type[OutageEvent],
+    expected_flag: str | None,
+) -> None:
+    parsed_rows = list(csv.reader(io.StringIO(sepd_csv_bytes.decode())))
+    field_index = parsed_rows[0].index(field)
+    parsed_rows[1][field_index] = "9" * 5000
+    csv_text = io.StringIO(newline="")
+    csv.writer(csv_text, lineterminator="\n").writerows(parsed_rows)
+
+    results = list(
+        iter_ssen_hv_csv(
+            csv_text.getvalue().encode(),
+            licence_area="SEPD",
+            source_resource_id=SEPD_RESOURCE_ID,
+            snapshot_id="sha256:test",
+        )
+    )
+
+    assert len(results) == 2
+    assert isinstance(results[0], expected_type)
+    if expected_flag is None:
+        assert isinstance(results[0], OutageRowError)
+        assert results[0].code == "invalid_reporting_year"
+    else:
+        assert isinstance(results[0], OutageEvent)
+        assert results[0].quality_flags == [expected_flag]
+    assert isinstance(results[1], OutageEvent)
+    assert results[1].incident_started_local == "2026-07-12T16:15:00"
+
+
+def test_lexically_malformed_row_does_not_drop_later_valid_row(
+    sepd_csv_bytes: bytes,
+) -> None:
+    lines = sepd_csv_bytes.decode().splitlines()
+    malformed = lines[1].replace("Switchgear", '"bad"tail', 1)
+    csv_bytes = "\n".join((lines[0], malformed, lines[2])).encode()
+
+    results = list(
+        iter_ssen_hv_csv(
+            csv_bytes,
+            licence_area="SEPD",
+            source_resource_id=SEPD_RESOURCE_ID,
+            snapshot_id="sha256:test",
+        )
+    )
+
+    assert len(results) == 2
+    assert isinstance(results[0], OutageRowError)
+    assert results[0].code == "invalid_row_shape"
+    assert results[0].row_number == 2
     assert isinstance(results[1], OutageEvent)
     assert results[1].incident_started_local == "2026-07-12T16:15:00"
 
@@ -780,3 +881,32 @@ def test_discovery_accepts_mutable_dated_filename(
         resources = discover_ssen_hv_resources(client)
 
     assert resources[0].stable_url.endswith("/20300101_new_name.csv")
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        (
+            "last_modified",
+            "https://example.invalid/?X-Amz-Signature="
+            "SYNTHETIC_SIGNATURE_MUST_NOT_LEAK",
+        ),
+        (
+            "mimetype",
+            {"X-Amz-Signature": "SYNTHETIC_SIGNATURE_MUST_NOT_LEAK"},
+        ),
+    ],
+)
+def test_discovery_wraps_invalid_resource_model_fields_without_leakage(
+    package_show: dict[str, Any],
+    field: str,
+    invalid_value: Any,
+) -> None:
+    package_show["result"]["resources"][0][field] = invalid_value
+
+    with package_client(package_show, []) as client:
+        with pytest.raises(SourceContractError) as caught:
+            discover_ssen_hv_resources(client)
+
+    assert "SYNTHETIC_SIGNATURE_MUST_NOT_LEAK" not in str(caught.value)
+    assert "X-Amz-Signature" not in str(caught.value)
