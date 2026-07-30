@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
 import pytest
 from app.outages import (
@@ -14,7 +15,147 @@ from app.outages import (
     SourceSnapshotPublic,
     SyncResult,
 )
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
+
+LicenceArea = Literal["SEPD", "SHEPD"]
+
+EXPECTED_MODEL_FIELDS: dict[type[BaseModel], dict[str, object]] = {
+    SourceResource: {
+        "source_dataset_id": str,
+        "package_id": str,
+        "source_resource_id": str,
+        "licence_area": LicenceArea,
+        "name": str,
+        "stable_url": str,
+        "source_modified_at": datetime | None,
+        "format": str,
+        "media_type": str | None,
+        "datastore_active": bool,
+        "raw_record": dict[str, Any],
+    },
+    SourceSnapshot: {
+        "snapshot_id": str,
+        "source_dataset_id": str,
+        "package_id": str,
+        "source_resource_id": str,
+        "licence_area": LicenceArea,
+        "stable_source_url": str,
+        "source_modified_at": datetime | None,
+        "fetched_at": datetime,
+        "content_sha256": str,
+        "byte_size": int,
+        "row_count": int,
+        "observed_columns": list[str],
+        "licence_id": str,
+        "licence_title": str,
+        "licence_url": str,
+        "attribution": str,
+        "parser_version": str,
+        "local_snapshot_path": str,
+    },
+    SourceSnapshotPublic: {
+        "snapshot_id": str,
+        "source_dataset_id": str,
+        "package_id": str,
+        "source_resource_id": str,
+        "licence_area": LicenceArea,
+        "stable_source_url": str,
+        "source_modified_at": datetime | None,
+        "fetched_at": datetime,
+        "content_sha256": str,
+        "byte_size": int,
+        "row_count": int,
+        "observed_columns": list[str],
+        "licence_id": str,
+        "licence_title": str,
+        "licence_url": str,
+        "attribution": str,
+        "parser_version": str,
+    },
+    OutageEvent: {
+        "event_id": str,
+        "source_dataset_id": str,
+        "source_resource_id": str,
+        "source_snapshot_id": str,
+        "operator": str,
+        "licence_area": LicenceArea,
+        "incident_started_local": str,
+        "timezone_name": str | None,
+        "reporting_year": int,
+        "voltage_kv": float | None,
+        "district_short_code": str,
+        "district_hv_reference": str,
+        "network_reference": str,
+        "primary_nrn": str | None,
+        "primary_name": str | None,
+        "customers_affected": int | None,
+        "customer_minutes_lost": int | None,
+        "average_minutes_off_supply": float | None,
+        "equipment_code": str | None,
+        "equipment": str | None,
+        "component_code": str | None,
+        "component": str | None,
+        "cause_code": str | None,
+        "cause": str | None,
+        "contributory_cause_code": str | None,
+        "contributory_cause": str | None,
+        "damage": str | None,
+        "exceptional_event": str | None,
+        "quality_flags": list[str],
+        "raw_record": dict[str, Any],
+    },
+    OutageReject: {
+        "run_id": str,
+        "source_resource_id": str,
+        "row_number": int,
+        "error_code": str,
+        "error_message": str,
+        "raw_row": dict[str, Any],
+    },
+    SyncResult: {
+        "run_id": str,
+        "status": str,
+        "resources_seen": int,
+        "snapshots_created": int,
+        "snapshots_reused": int,
+        "events_written": int,
+        "rejects_written": int,
+        "warnings": list[str],
+    },
+    OutageSummary: {
+        "event_count": int,
+        "customers_affected_total": int | None,
+        "customer_minutes_lost_total": int | None,
+        "incident_started_local_min": str | None,
+        "incident_started_local_max": str | None,
+    },
+}
+
+NON_EMPTY_IDENTITY_FIELDS: dict[type[BaseModel], set[str]] = {
+    SourceResource: {"source_dataset_id", "package_id", "source_resource_id"},
+    SourceSnapshot: {
+        "snapshot_id",
+        "source_dataset_id",
+        "package_id",
+        "source_resource_id",
+        "content_sha256",
+    },
+    SourceSnapshotPublic: {
+        "snapshot_id",
+        "source_dataset_id",
+        "package_id",
+        "source_resource_id",
+        "content_sha256",
+    },
+    OutageEvent: {
+        "event_id",
+        "source_dataset_id",
+        "source_resource_id",
+        "source_snapshot_id",
+    },
+    OutageReject: {"run_id", "source_resource_id"},
+    SyncResult: {"run_id"},
+}
 
 
 def outage_event_data() -> dict[str, object]:
@@ -73,6 +214,31 @@ def source_snapshot_data() -> dict[str, object]:
         "parser_version": "1",
         "local_snapshot_path": "data/snapshots/ssen/nafirs-hv/example.csv",
     }
+
+
+@pytest.mark.parametrize(("model", "expected_fields"), EXPECTED_MODEL_FIELDS.items())
+def test_model_contract_has_exact_required_field_annotations(
+    model: type[BaseModel],
+    expected_fields: dict[str, object],
+) -> None:
+    assert list(model.model_fields) == list(expected_fields)
+    for field_name, expected_annotation in expected_fields.items():
+        field = model.model_fields[field_name]
+        assert field.annotation == expected_annotation, field_name
+        assert field.is_required(), field_name
+
+
+@pytest.mark.parametrize(("model", "field_names"), NON_EMPTY_IDENTITY_FIELDS.items())
+def test_every_identity_field_rejects_empty_strings(
+    model: type[BaseModel],
+    field_names: set[str],
+) -> None:
+    for field_name in field_names:
+        field = model.model_fields[field_name]
+        assert any(
+            getattr(constraint, "min_length", None) == 1
+            for constraint in field.metadata
+        ), field_name
 
 
 def test_outage_event_requires_complete_provenance() -> None:
