@@ -1400,3 +1400,94 @@ def test_failed_run_records_only_redacted_safe_failure_state(
     assert "X-Amz-Signature" not in payload
     assert count_source_snapshots(db_path=temp_db) == 0
     assert count_outage_events(db_path=temp_db) == 0
+
+
+def test_signed_r2_redirect_material_never_crosses_persistence_boundaries(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    host = "83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com"
+    path = (
+        "/dx-sse-prod/resources/"
+        "ab32515f-76f2-421d-8034-7d5b01325a33/synthetic.csv"
+    )
+    markers = {
+        "X-Amz-Algorithm": "ALGORITHM_MARKER",
+        "X-Amz-Date": "DATE_MARKER",
+        "X-Amz-Expires": "EXPIRES_MARKER",
+        "X-Amz-SignedHeaders": "SIGNED_HEADERS_MARKER",
+        "X-Amz-Signature": "SIGNATURE_MARKER",
+    }
+    query = "&".join(f"{key}={value}" for key, value in markers.items())
+    signed_url = f"https://{host}{path}?{query}"
+    nested_payload = {
+        "arbitrary": [
+            signed_url,
+            {"value": signed_url},
+            {"X-Amz-Date": markers["X-Amz-Date"]},
+        ]
+    }
+    reject = OutageReject(
+        run_id="run:signed-completed",
+        source_resource_id=source_snapshot.source_resource_id,
+        row_number=2,
+        error_code="download_failed",
+        error_message=f"ordinary reject context: {signed_url}",
+        raw_row={
+            "ordinary_raw_value": "preserve reject evidence",
+            "nested": nested_payload,
+            "standalone_field": (
+                f"X-Amz-Expires={markers['X-Amz-Expires']}"
+            ),
+        },
+    )
+
+    completed = commit_ingestion_run(
+        run_id="run:signed-completed",
+        resources_seen=1,
+        snapshots=[source_snapshot],
+        events=[parsed_event],
+        rejects=[reject],
+        snapshots_created=1,
+        snapshots_reused=0,
+        warnings=[
+            "preserve ordinary completed warning",
+            signed_url,
+            nested_payload,
+            f"prefix X-Amz-Algorithm={markers['X-Amz-Algorithm']} suffix",
+        ],
+        db_path=temp_db,
+    )
+    failed = record_failed_ingestion_run(
+        run_id="run:signed-failed",
+        resources_seen=1,
+        error=RuntimeError(signed_url),
+        warnings=[
+            "preserve ordinary failed warning",
+            signed_url,
+            nested_payload,
+            f"X-Amz-SignedHeaders={markers['X-Amz-SignedHeaders']}",
+        ],
+        db_path=temp_db,
+    )
+
+    with get_connection(temp_db) as connection:
+        sqlite_text = "\n".join(connection.iterdump())
+
+    assert completed.warnings[0] == "preserve ordinary completed warning"
+    assert failed.warnings[0] == "preserve ordinary failed warning"
+    for forbidden in (
+        signed_url,
+        host,
+        path,
+        *markers,
+        *markers.values(),
+    ):
+        assert forbidden not in sqlite_text
+        assert forbidden not in json.dumps(completed.model_dump())
+        assert forbidden not in json.dumps(failed.model_dump())
+    assert "preserve ordinary completed warning" in sqlite_text
+    assert "preserve ordinary failed warning" in sqlite_text
+    assert "ordinary reject context" in sqlite_text
+    assert "preserve reject evidence" in sqlite_text

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -39,6 +40,15 @@ _SNAPSHOT_FILTERS = {
     "source_dataset_id": "source_dataset_id",
     "source_resource_id": "source_resource_id",
 }
+_R2_SIGNED_TARGET = re.compile(
+    r"https://83025b28472d6aa2bf5ae59f3724aa78"
+    r"\.r2\.cloudflarestorage\.com(?:/[^\s\"'<>]*)?",
+    re.IGNORECASE,
+)
+_X_AMZ_FIELD = re.compile(
+    r"x-amz-[a-z0-9-]+(?:\s*[:=]\s*[^&,\s}\])\"']+)?",
+    re.IGNORECASE,
+)
 
 
 def _json(value: Any) -> str:
@@ -60,9 +70,16 @@ def _safe_failure_value(value: Any) -> Any:
                 else _safe_failure_value(item)
             )
             for key, item in redacted.items()
+            if not str(key).casefold().startswith("x-amz-")
         }
     if isinstance(redacted, (list, tuple)):
         return [_safe_failure_value(item) for item in redacted]
+    if isinstance(redacted, str):
+        without_target = _R2_SIGNED_TARGET.sub(
+            "[REDACTED SIGNED REDIRECT]",
+            redacted,
+        )
+        return _X_AMZ_FIELD.sub("[REDACTED]", without_target)
     return redacted
 
 
