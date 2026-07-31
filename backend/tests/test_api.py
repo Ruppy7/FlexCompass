@@ -1,177 +1,237 @@
-"""API integration tests — exercise endpoints against real DB."""
+"""API integration tests for the Phase 0 public surface."""
 
+import importlib
+import re
+
+import app.db as app_db
+import httpx
 import pytest
 from app.main import app
-from fastapi.testclient import TestClient
-
-
-@pytest.fixture(scope="module")
-def client():
-    """TestClient that triggers lifespan startup (migrations + data load)."""
-    with TestClient(app) as c:
-        yield c
+from app.seed_loader import load_example_portfolios
 
 
 class TestHealthEndpoints:
     def test_root_health(self, client):
-        r = client.get("/health")
-        assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "ok"
-        assert data["version"] == "0.1.0"
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "service": "flexcompass",
+            "version": "0.1.0",
+            "seed": 42,
+        }
 
     def test_api_health(self, client):
-        r = client.get("/api/health")
-        assert r.status_code == 200
-        assert r.json()["status"] == "ok"
-
-
-class TestPortalEndpoints:
-    def test_portal_datasets(self, client):
-        r = client.get("/api/portal/datasets")
-        assert r.status_code == 200
-        data = r.json()
-        datasets = data["items"]
-        assert data["total"] == 4
-        assert len(datasets) == 4
-        assert all("id" in d for d in datasets)
-
-    def test_portal_dataset_by_id(self, client):
-        r = client.get("/api/portal/datasets/catalog_nged")
-        assert r.status_code == 200
-        assert r.json()["id"] == "catalog_nged"
-
-    def test_portal_dataset_fields(self, client):
-        r = client.get("/api/portal/datasets/catalog_nged/fields")
-        assert r.status_code == 200
-        assert "fields" in r.json()
-
-
-class TestZoneEndpoints:
-    def test_list_zones(self, client):
-        r = client.get("/api/zones")
-        assert r.status_code == 200
-        data = r.json()
-        assert data["items"] == []
-        assert data["total"] == 0
-
-    def test_filter_zones_by_dso(self, client):
-        r = client.get("/api/zones?dso=NGED")
-        assert r.status_code == 200
-        data = r.json()
-        assert data["items"] == []
-        assert data["total"] == 0
-
-    def test_get_zone_by_id(self, client):
-        r = client.get("/api/zones/not-yet-normalised")
-        assert r.status_code == 404
-
-    def test_zone_not_found(self, client):
-        r = client.get("/api/zones/nonexistent")
-        assert r.status_code == 404
-
-
-class TestSignalEndpoints:
-    def test_list_signals(self, client):
-        r = client.get("/api/signals")
-        assert r.status_code == 200
-        data = r.json()
-        assert data["items"] == []
-        assert data["total"] == 0
-
-    def test_signals_by_zone(self, client):
-        r = client.get("/api/signals/by-zone/not-yet-normalised")
-        assert r.status_code == 200
-        assert r.json() == []
-
-
-class TestAnalysisEndpoints:
-    def test_list_portfolios(self, client):
-        r = client.get("/api/portfolios")
-        assert r.status_code == 200
-        assert len(r.json()) >= 2
-
-    def test_analyse_portfolio(self, client):
-        portfolio = {
-            "portfolio_id": "test_001",
-            "portfolio_name": "Test Portfolio",
-            "assets": [{
-                "asset_type": "ev_charger",
-                "asset_count": 1000,
-                "rated_power_kw": 7,
-                "controllable_power_kw": 4.5,
-                "availability_percent": 0.03,
-                "response_reliability_percent": 0.85,
-                "supported_service_types": ["demand_turn_down"],
-                "regional_distribution": {"NGED": 0.5},
-                "postcode_distribution": {},
-                "baseline_assumption": "test",
-                "metering_assumption": "test",
-                "operational_notes": [],
-            }],
+        response = client.get("/api/health")
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ok",
+            "data_status": "no_verified_analytical_data",
         }
-        r = client.post("/api/analyse", json={"portfolio": portfolio})
-        assert r.status_code == 200
-        data = r.json()
-        assert "assessments" in data
-        assert data["signals_considered"] == 0
-        assert data["assessments"] == []
-
-    def test_report_generation(self, client):
-        portfolio = {
-            "portfolio_id": "test_002",
-            "portfolio_name": "Test Report",
-            "assets": [{
-                "asset_type": "battery",
-                "asset_count": 50,
-                "rated_power_kw": 10,
-                "controllable_power_kw": 6,
-                "availability_percent": 0.5,
-                "response_reliability_percent": 0.9,
-                "supported_service_types": ["demand_turn_down", "generation_turn_up"],
-                "regional_distribution": {"SPEN": 0.8},
-                "postcode_distribution": {},
-                "baseline_assumption": "test",
-                "metering_assumption": "test",
-                "operational_notes": [],
-            }],
-        }
-        r = client.post("/api/report", json={"portfolio": portfolio})
-        assert r.status_code == 200
-        data = r.json()
-        assert "markdown" in data
-        assert "Flexibility Fit Report" in data["markdown"]
 
 
-class TestAssetGroupEndpoints:
-    def test_list_asset_groups(self, client):
-        r = client.get("/api/asset-groups")
-        assert r.status_code == 200
-        groups = r.json()
-        assert len(groups) >= 4
-
-    def test_generate_asset_group(self, client):
-        r = client.post("/api/asset-groups/generate",
-                       json={"asset_type": "battery", "count": 500, "region": "NGED"})
-        assert r.status_code == 200
-        data = r.json()
-        assert data["asset_group"]["asset_type"] == "battery"
-        assert data["estimated_available_kw"] > 0
+def test_phase_zero_public_api_contains_health_and_demo_only() -> None:
+    paths = set(app.openapi()["paths"])
+    assert paths == {
+        "/",
+        "/health",
+        "/api/health",
+        "/api/demo/portfolios",
+        "/api/demo/analyse",
+        "/api/demo/report",
+        "/api/demo/asset-groups/generate",
+    }
 
 
-class TestIngestEndpoints:
-    def test_ingest_status(self, client):
-        r = client.get("/api/ingest/status")
-        assert r.status_code == 200
-        data = r.json()
-        assert "ingested_tables" in data
-        assert data["total_records"] == 0
+def test_root_metadata_lists_the_complete_phase_zero_public_surface(
+    client,
+) -> None:
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.json()["endpoints"] == [
+        "/health",
+        "/api/health",
+        "/api/demo/portfolios",
+        "/api/demo/analyse",
+        "/api/demo/report",
+        "/api/demo/asset-groups/generate",
+    ]
 
 
-class TestDbStatsEndpoint:
-    def test_db_stats(self, client):
-        r = client.get("/api/db/stats")
-        assert r.status_code == 200
-        data = r.json()
-        assert data["source"] == "db"
-        assert "tables" in data
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/sources",
+        "/api/signals",
+        "/api/market-rules",
+        "/api/example-portfolios",
+        "/api/analyse",
+        "/api/report",
+        "/api/portal/datasets",
+        "/api/zones",
+        "/api/ingest/status",
+    ],
+)
+def test_unverified_product_routes_are_retired(path: str) -> None:
+    assert path not in app.openapi()["paths"]
+
+
+def test_application_starts_without_opening_a_database(
+    isolated_api_client,
+) -> None:
+    client, test_db = isolated_api_client
+
+    assert client.get("/api/health").status_code == 200
+    assert not test_db.exists()
+
+
+@pytest.fixture
+def demo_portfolio() -> dict[str, object]:
+    return load_example_portfolios()[0].model_dump(mode="json")
+
+
+def test_legacy_portfolios_route_is_absent(client) -> None:
+    assert client.get("/api/portfolios").status_code == 404
+
+
+def test_demo_portfolios_are_explicitly_synthetic(client) -> None:
+    response = client.get("/api/demo/portfolios")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workflow_kind"] == "synthetic_demo"
+    assert payload["portal_data_used"] is False
+    assert all(
+        asset["source"] == "synthetic"
+        for portfolio in payload["items"]
+        for asset in portfolio["assets"]
+    )
+    assert all(
+        "synthetic" in portfolio["portfolio_name"].lower()
+        for portfolio in payload["items"]
+    )
+
+
+def test_demo_report_states_no_portal_data_is_used(
+    client,
+    demo_portfolio,
+) -> None:
+    response = client.post(
+        "/api/demo/report",
+        json={"portfolio": demo_portfolio},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workflow_kind"] == "synthetic_demo"
+    assert payload["portal_data_used"] is False
+    assert payload["markdown"].startswith(
+        "# Synthetic Flexibility Fit Demonstration"
+    )
+    assert (
+        "no live or current portal data is used."
+        in payload["markdown"].lower()
+    )
+    assert "synthetic-only" in payload["markdown"].lower()
+    assert re.search(
+        (
+            r"\buses?\b[^.\n]{0,40}"
+            r"\b(?:public|curated|live|current)\b"
+            r"[^.\n]{0,20}\bdata\b"
+        ),
+        payload["markdown"],
+        flags=re.IGNORECASE,
+    ) is None
+
+
+@pytest.mark.parametrize("endpoint", ["analyse", "report"])
+def test_demo_rejects_real_asset_source(
+    client,
+    demo_portfolio,
+    endpoint: str,
+) -> None:
+    demo_portfolio["assets"][0]["source"] = "real"
+    response = client.post(
+        f"/api/demo/{endpoint}",
+        json={"portfolio": demo_portfolio},
+    )
+    assert response.status_code == 422
+    assert response.json()["workflow_kind"] == "synthetic_demo"
+    assert response.json()["portal_data_used"] is False
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/demo/portfolios"),
+        ("post", "/api/demo/analyse"),
+        ("post", "/api/demo/report"),
+        ("post", "/api/demo/asset-groups/generate"),
+    ],
+)
+def test_every_demo_response_is_labelled(
+    client,
+    demo_portfolio: dict[str, object],
+    method: str,
+    path: str,
+) -> None:
+    body = (
+        {"asset_type": "battery", "count": 2, "portal_id": "nged"}
+        if path.endswith("/generate")
+        else {"portfolio": demo_portfolio}
+    )
+    if method == "get":
+        body = None
+    kwargs = {"json": body} if body is not None else {}
+    response = getattr(client, method)(path, **kwargs)
+    assert response.json()["workflow_kind"] == "synthetic_demo"
+    assert response.json()["portal_data_used"] is False
+
+
+def test_demo_handlers_never_open_database_or_network(
+    client,
+    demo_portfolio,
+    monkeypatch,
+) -> None:
+    def unexpected(*args, **kwargs):
+        raise AssertionError("demo attempted external I/O")
+
+    test_client_send = client.send
+    monkeypatch.setattr(app_db.sqlite3, "connect", unexpected)
+    monkeypatch.setattr(httpx.Client, "send", unexpected)
+    monkeypatch.setattr(httpx.AsyncClient, "send", unexpected)
+    monkeypatch.setattr(client, "send", test_client_send)
+
+    assert client.get("/api/demo/portfolios").status_code == 200
+    assert client.post(
+        "/api/demo/analyse",
+        json={"portfolio": demo_portfolio},
+    ).status_code == 200
+    assert client.post(
+        "/api/demo/report",
+        json={"portfolio": demo_portfolio},
+    ).status_code == 200
+    assert client.post(
+        "/api/demo/asset-groups/generate",
+        json={"asset_type": "battery", "count": 2, "portal_id": "nged"},
+    ).status_code == 200
+
+
+def test_demo_internal_error_keeps_labels_and_redaction(
+    client,
+    demo_portfolio,
+    monkeypatch,
+) -> None:
+    demo_routes = importlib.import_module("app.demo_routes")
+    monkeypatch.setattr(
+        demo_routes,
+        "analyse_synthetic_portfolio",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("private-value")),
+    )
+    response = client.post(
+        "/api/demo/analyse",
+        json={"portfolio": demo_portfolio},
+    )
+    assert response.status_code == 500
+    assert response.json()["workflow_kind"] == "synthetic_demo"
+    assert response.json()["portal_data_used"] is False
+    assert "private-value" not in response.text

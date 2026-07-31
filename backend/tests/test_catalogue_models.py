@@ -1,9 +1,11 @@
 """Contract tests for the public catalogue registry models and portals."""
 
 from datetime import datetime, timedelta, timezone
+from importlib.util import find_spec
 
 import pytest
 from app.catalogue_models import (
+    CATALOGUE_PORTAL_IDS,
     CATALOGUE_PORTALS,
     AccessStatus,
     CatalogueDataset,
@@ -19,8 +21,8 @@ from app.config import config
 from pydantic import ValidationError
 
 
-def test_catalogue_portals_are_exactly_the_seven_approved_sources():
-    assert set(CATALOGUE_PORTALS) == {
+def test_canonical_portal_ids_match_exact_configuration() -> None:
+    assert CATALOGUE_PORTAL_IDS == (
         "nged",
         "spen",
         "enwl",
@@ -28,7 +30,17 @@ def test_catalogue_portals_are_exactly_the_seven_approved_sources():
         "ukpn",
         "npg",
         "neso",
-    }
+    )
+    assert tuple(CATALOGUE_PORTALS) == CATALOGUE_PORTAL_IDS
+
+
+def test_application_config_has_no_duplicate_portal_registry() -> None:
+    assert not hasattr(config, "portals")
+    assert not hasattr(config, "portal")
+
+
+def test_unverified_catalogue_fetcher_is_retired() -> None:
+    assert find_spec("app.portal_fetcher") is None
 
 
 def test_catalogue_portal_secrets_are_references_not_values():
@@ -75,10 +87,6 @@ def test_catalogue_portal_configuration_is_immutable():
 
     with pytest.raises(TypeError):
         CATALOGUE_PORTALS["nged"] = CATALOGUE_PORTALS["spen"]
-
-
-def test_legacy_portal_configuration_remains_available():
-    assert config.portal("nged") is config.portals["nged"]
 
 
 def test_canonical_classifications_default_to_unknown():

@@ -34,6 +34,13 @@ def _total_estimated_kw(portfolio: Portfolio) -> float:
     return sum(_estimate_available_kw(g) for g in portfolio.assets)
 
 
+def _signal_source_identity(signal: FlexSignal) -> str | None:
+    for value in (signal.source_id, signal.source_dataset_id):
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 1. Geography check
 # ---------------------------------------------------------------------------
@@ -41,6 +48,25 @@ def _total_estimated_kw(portfolio: Portfolio) -> float:
 def _check_geography(portfolio: Portfolio, signal: FlexSignal) -> tuple[RatingLevel, list[str]]:
     evidence: list[str] = []
     dso = signal.dso.upper()
+    has_regional_evidence = any(
+        group.regional_distribution for group in portfolio.assets
+    )
+    has_postcode_evidence = any(
+        group.postcode_distribution for group in portfolio.assets
+    )
+    if not has_regional_evidence:
+        if has_postcode_evidence:
+            evidence.append(
+                "Postcode distribution is present but remains unresolved "
+                "through verified regional geography."
+            )
+        else:
+            evidence.append(
+                "No verified regional or postcode distribution data found "
+                "for portfolio."
+            )
+        return RatingLevel.unknown, evidence
+
     if dso == "NESO":
         # National signal — partial if any regional presence
         has_presence = any(
@@ -80,6 +106,13 @@ def _check_asset_compatibility(
     portfolio: Portfolio, signal: FlexSignal
 ) -> tuple[CompatibilityLevel, list[str]]:
     evidence: list[str] = []
+    if signal.service_type is None:
+        evidence.append("Signal does not identify a service type.")
+        return CompatibilityLevel.unclear, evidence
+    if signal.eligible_asset_types is None:
+        evidence.append("Signal does not provide eligible asset type evidence.")
+        return CompatibilityLevel.unclear, evidence
+
     signal_assets = set(signal.eligible_asset_types)
     portfolio_types = {g.asset_type for g in portfolio.assets}
 
@@ -179,7 +212,13 @@ def _check_market_rule(
     signal: FlexSignal, rules: list[MarketRule]
 ) -> tuple[MarketRuleClarity, list[str]]:
     evidence: list[str] = []
-    sid = signal.source_id or signal.source_dataset_id or ""
+    sid = _signal_source_identity(signal)
+    if sid is None:
+        evidence.append(
+            "Signal has no source identity, so no market rule can be matched."
+        )
+        return MarketRuleClarity.unknown, evidence
+
     matching_rules = [r for r in rules if r.source_id == sid]
 
     if not matching_rules:
@@ -212,13 +251,30 @@ def _check_market_rule(
 
 def _check_data_completeness(signal: FlexSignal) -> tuple[DataCompleteness, list[str]]:
     evidence: list[str] = []
+    missing_provenance: list[str] = []
+    if _signal_source_identity(signal) is None:
+        missing_provenance.append("source identity")
+    if signal.raw_record is None:
+        missing_provenance.append("raw record")
+    if missing_provenance:
+        evidence.append(
+            "Analytical completeness is low because provenance is missing: "
+            + ", ".join(missing_provenance)
+            + "."
+        )
+        return DataCompleteness.low, evidence
+
     fields_present = 0
     total = 8
 
     checks = [
         ("DSO", bool(signal.dso)),
         ("service type", bool(signal.service_type)),
-        ("location", signal.location_type.value != "unknown"),
+        (
+            "location",
+            signal.location_type is not None
+            and signal.location_type.value != "unknown",
+        ),
         ("capacity", signal.capacity_kw is not None),
         ("price/payment", signal.guide_price is not None or signal.payment_type is not None),
         ("timing", signal.duration_minutes is not None or signal.window_start is not None),
@@ -355,8 +411,12 @@ def assess_portfolio(
         rule_level, rule_ev = _check_market_rule(signal, rules)
         dc_level, dc_ev = _check_data_completeness(signal)
 
-        sid = signal.source_id or signal.source_dataset_id or ""
-        matching_rules = [r for r in rules if r.source_id == sid]
+        sid = _signal_source_identity(signal)
+        matching_rules = (
+            [r for r in rules if r.source_id == sid]
+            if sid is not None
+            else []
+        )
         rule_obj = matching_rules[0] if matching_rules else None
         ops_level, ops_ev = _check_operational_complexity(portfolio, signal, rule_obj)
 
@@ -394,7 +454,10 @@ def assess_portfolio(
 
         next_steps: list[str] = []
         if band in (PriorityBand.high, PriorityBand.medium):
-            next_steps.append(f"Investigate {signal.dso} procurement process for {signal.area_name}.")
+            area_name = signal.area_name or "Unknown area"
+            next_steps.append(
+                f"Investigate {signal.dso} procurement process for {area_name}."
+            )
             if not signal.guide_price:
                 next_steps.append("Request indicative pricing from DSO.")
             next_steps.append("Validate metering and baseline requirements against current capabilities.")
@@ -404,9 +467,10 @@ def assess_portfolio(
             next_steps.append("Gather more data on this signal before assessing fit.")
 
         disclaimer = (
-            "This assessment uses curated public-source data and transparent heuristic "
-            "assumptions. It is not a bid recommendation, eligibility confirmation, "
-            "revenue forecast, or commercial decisioning tool."
+            "This assessment applies transparent heuristic checks to the supplied signal "
+            "and portfolio evidence. Evidence may be missing or unverified. It is not a "
+            "bid recommendation, eligibility confirmation, revenue forecast, or "
+            "commercial decisioning tool."
         )
 
         assessments.append(

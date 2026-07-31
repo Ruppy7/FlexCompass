@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import type { Portfolio, AssetGroup } from "@/lib/types";
-import { fetchPortfolios } from "@/lib/api";
+import { fetchDemoPortfolios } from "@/lib/api";
 
 interface Props {
   onAnalyse: (portfolio: Portfolio) => void;
@@ -13,6 +13,7 @@ const ASSET_TYPES = ["ev_charger", "battery", "generator", "heat_pump", "solar_p
 const SERVICE_TYPES = ["demand_turn_down", "demand_turn_up", "generation_turn_up", "generation_turn_down"] as const;
 
 const emptyAsset: AssetGroup = {
+  source: "synthetic",
   asset_type: "ev_charger",
   asset_count: 100,
   rated_power_kw: 7,
@@ -38,7 +39,7 @@ export default function PortfolioForm({ onAnalyse, loading }: Props) {
   const [mode, setMode] = useState<"select" | "custom">("select");
 
   useEffect(() => {
-    fetchPortfolios().then(setPortfolios).catch(console.error);
+    fetchDemoPortfolios().then(setPortfolios).catch(console.error);
   }, []);
 
   const handleSelect = (id: string) => {
@@ -150,9 +151,17 @@ export default function PortfolioForm({ onAnalyse, loading }: Props) {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500 mb-1">Availability (%)</label>
+                  <label
+                    htmlFor={`availability-${idx}`}
+                    className="block text-xs text-gray-500 mb-1"
+                  >
+                    Availability fraction (0–1)
+                  </label>
                   <input
+                    id={`availability-${idx}`}
                     type="number"
+                    min="0"
+                    max="1"
                     step="0.01"
                     value={asset.availability_percent}
                     onChange={(e) => updateAsset(idx, "availability_percent", Number(e.target.value))}
@@ -182,7 +191,7 @@ export default function PortfolioForm({ onAnalyse, loading }: Props) {
         disabled={loading || (mode === "select" && !selected)}
         className="w-full bg-brand-600 text-white py-2.5 px-4 rounded-lg font-medium transition-colors duration-150 hover:bg-brand-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
       >
-        {loading ? "Analysing…" : "Run Analysis & Generate Report"}
+        {loading ? "Analysing…" : "Run Analysis — Synthetic Demo"}
       </button>
     </div>
   );

@@ -5,11 +5,20 @@ data about Great Britain's electricity networks and local flexibility markets.
 It bridges energy-domain research with reproducible Python data pipelines, a
 FastAPI research API, and a small Next.js interface.
 
-The repository currently provides a catalogue intelligence registry for public
-metadata from NGED, SP Energy Networks, Electricity North West, SSEN, UK Power
-Networks, Northern Powergrid, and NESO; SQLite storage; provenance-preserving
-normalisation models; postcode and geometry matching; data-quality utilities;
-synthetic portfolio examples; and directional report generation.
+The active public-data workflow is the anonymous, read-only seven-portal
+catalogue CLI.
+
+The web application exposes a research-status overview and an explicitly
+synthetic demonstration. It does not yet expose the catalogue registry or
+verified analytical portal records.
+
+The legacy generic portal ingestors and browser-triggered mutation routes were
+retired because they lacked accepted source contracts and end-to-end
+provenance.
+
+The repository also contains SQLite storage, provenance-preserving models,
+postcode and geometry matching, data-quality utilities, synthetic portfolio
+examples, and directional report generation.
 
 This is a research project, not a product. It does not bid, dispatch or control
 assets, establish eligibility, forecast revenue, or provide commercial advice.
@@ -17,11 +26,10 @@ Any scores are heuristic and directional.
 
 ## Data status
 
-The checked-in `flex_zones.json`, `flex_signals.json`, and `market_rules.json`
-files are intentionally empty. FlexCompass does not publish hand-curated claims
-as if they were current market facts. Normalised records should be created from
-public portal responses only after their schemas, provenance, licence, and
-limitations are verified.
+No checked-in canonical zone, signal, or market-rule dataset is published.
+FlexCompass does not publish hand-curated claims as if they were current market
+facts. Normalised records should be created from public portal responses only
+after their schemas, provenance, licence, and limitations are verified.
 
 Downloaded records, catalogue snapshots and queues, generated SQLite databases,
 caches, and reports stay local and are ignored by Git. See
@@ -30,7 +38,7 @@ verification status.
 
 ## Quick start
 
-Python 3.11+ and Node.js 18+ are expected.
+Python 3.11+ and Node.js 20.9+ on the 20.x line, or Node.js 22+, are expected.
 
 ```powershell
 python -m venv .venv
@@ -53,9 +61,12 @@ Open `http://localhost:3000`. The frontend proxies `/api` to the backend on port
 
 ## Public catalogue metadata
 
-The catalogue intelligence workflow observes public metadata from all seven
-portals using anonymous, read-only GET requests. It does not establish that
-every underlying dataset resource is anonymously accessible or redistributable.
+`CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` is the sole active
+portal registry. It defines the seven canonical portal IDs and catalogue API
+bases used by the CLI. The catalogue intelligence workflow observes their
+public metadata using anonymous, read-only GET requests. It does not establish
+that every underlying dataset resource is anonymously accessible or
+redistributable.
 
 Run these commands from the `backend/` directory. Sync every configured portal
 or select one:
@@ -84,29 +95,12 @@ lifecycle or access facts.
 See [public data sources](docs/public-data-sources.md) for portal-specific scope,
 licence cautions, and limitations.
 
-## Analytical portal ingestion (legacy)
+## Current product boundary
 
-This is separate from catalogue metadata. The repository retains four portal
-pipelines for analytical records. Run from the repository root after adding any
-public portal tokens to `.env`:
-
-```powershell
-python -m backend.app.ingest --nged
-python -m backend.app.ingest --spen
-python -m backend.app.ingest --enwl
-python -m backend.app.ingest
-```
-
-The final command attempts all four implemented portal pipelines, including
-SSEN. Portal availability, account requirements, dataset identifiers, and
-schemas can change; inspect the output and validate the resulting records.
-
-To regenerate a local database from checked-in metadata and empty analytical
-seeds:
-
-```powershell
-python -m backend.app.db_seed
-```
+The catalogue registry is available through the local CLI only. The FastAPI and
+web surfaces do not provide catalogue sync, analytical portal ingestion, drift
+execution, bidding, dispatch, or asset control. No verified canonical
+flexibility-signal or zone dataset is exposed in this release.
 
 ## Verification
 
@@ -120,11 +114,11 @@ npm run build
 
 ## Project layout
 
-- `backend/app/`: API, public portal clients, storage, models, matching, reports.
+- `backend/app/`: research-status and synthetic-demo API, read-only catalogue
+  CLI, public portal adapters, storage, models, matching, and reports.
 - `backend/tests/`: API and unit tests using disposable data and explicit fixtures.
-- `frontend/`: public-data explorer and synthetic analysis interface.
-- `data/seed/`: conservative source metadata, empty normalised datasets, and
-  synthetic examples.
+- `frontend/`: research-status overview and explicitly synthetic demonstration.
+- `data/seed/`: explicitly synthetic demonstration portfolios only.
 - `docs/`: public data model, postcode-matching notes, and source register.
 - `scripts/`: repository privacy and generated-artifact checks.
 

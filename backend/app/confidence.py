@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from .config import config
-from .models import ConfidenceLevel
+from .models import AssetType, ConfidenceLevel
 
 
 class GeographyMatch(IntEnum):
@@ -150,7 +150,7 @@ def confidence_from_signal_fields(
     duration_minutes: float | None = None,
     window_start: str | None = None,
     lead_time: str | None = None,
-    eligible_asset_types: list | None = None,
+    eligible_asset_types: list[AssetType] | None = None,
     source_updated_at: str | None = None,
 ) -> tuple[ConfidenceLevel, float, list[str]]:
     """Convenience wrapper: compute confidence from raw signal fields."""

@@ -16,13 +16,17 @@ and catalogue access was last checked on 15 July 2026.
 | National Energy System Operator | https://www.neso.energy/data-portal | `https://api.neso.energy/api/3/action` (CKAN) | None observed; an account is optional for subscriptions and favourites | Verify per dataset; the current catalogue names the NESO Open Data Licence | National and transmission-system data is context, not a substitute for DSO outage or local-flexibility evidence |
 
 Anonymous catalogue access does not prove that every dataset resource is
-anonymous or redistributable. The repository stores curated catalogue metadata
-only. Generated snapshots, SQLite databases, caches, queues, and reports are
-ignored/local outputs and must not be committed.
+anonymous or redistributable. `CATALOGUE_PORTALS` in
+`backend/app/catalogue_models.py` is the sole active portal registry; its seven
+canonical IDs and API bases are the source of truth for the CLI. Generated
+snapshots, SQLite databases, caches, queues, and reports are ignored/local
+outputs and must not be committed.
 
 ## Catalogue intelligence workflow
 
-All commands run from the `backend/` working directory using the project venv.
+The active public-data workflow is the anonymous, read-only seven-portal
+catalogue CLI. All commands run from the `backend/` working directory using the
+project venv.
 
 ### Sync
 
@@ -89,7 +93,10 @@ confidence (`high`, `medium`, `low`, `unknown`). Unknown values are preserved.
 
 ## Provenance and secret redaction
 
-Every record retains `source_dataset_id`, `raw_record`, and `observed_at`.
+Catalogue dataset, resource, and classification-evidence records retain
+`source_dataset_id`, `raw_record`, and `observed_at`. A catalogue observation
+separately records its observation ID and time, portal ID, status, content hash,
+counts, completeness, warnings, and nullable request/response/retry facts.
 Content hashes (SHA-256 of the redacted source snapshot, separate from
 classifier assessments) support deduplication. Benign public URL query
 parameters are retained. All
@@ -105,6 +112,12 @@ Catalogue metadata is not analytical ingestion, eligibility assessment,
 bidding/dispatch/asset-control advice, forecasting, or commercial advice.
 Counts and metadata are dated observations, not stable facts. Licence and
 attribution must be verified before redistributing source data.
+
+The web application exposes a research-status overview and an explicitly
+synthetic demonstration. It does not yet expose the catalogue registry or
+verified analytical portal records. Legacy generic portal ingestors and
+browser-triggered mutation routes are retired; no active public route starts
+ingestion or drift processing.
 
 Live portal tests are opt-in via `FLEXCOMPASS_LIVE_PORTAL_TESTS=1`; seven
 parametrized cases are skipped by default with zero network calls. Enabled cases

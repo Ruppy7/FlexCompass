@@ -34,7 +34,10 @@ def generate_report(
     _add = lines.append
 
     # ── Title ──
-    _add("# Flexibility Fit Report\n")
+    _add("# Synthetic Flexibility Fit Demonstration\n")
+    _add(
+        "> Synthetic demonstration — no live or current portal data is used.\n"
+    )
 
     # ── 1. Portfolio Summary ──
     _add("## 1. Portfolio Summary\n")
@@ -100,13 +103,24 @@ def generate_report(
             sig = signal_map.get(assess.signal_id)
             if not sig:
                 continue
-            _add(f"### {i}. {sig.market_name} — {sig.area_name}\n")
+            market_name = sig.market_name or "Unknown market"
+            area_name = sig.area_name or "Unknown area"
+            location_type = (
+                sig.location_type.value if sig.location_type else "Unknown"
+            )
+            service_type = (
+                sig.service_type.value.replace("_", " ").title()
+                if sig.service_type
+                else "Unknown"
+            )
+            procurement_type = sig.procurement_type or "Unknown"
+            _add(f"### {i}. {market_name} — {area_name}\n")
 
             _add("#### Signal Summary\n")
             _add(f"- **DSO:** {sig.dso}")
-            _add(f"- **Area:** {sig.area_name} ({sig.location_type.value})")
-            _add(f"- **Service Type:** {sig.service_type.value.replace('_', ' ').title()}")
-            _add(f"- **Procurement:** {sig.procurement_type}")
+            _add(f"- **Area:** {area_name} ({location_type})")
+            _add(f"- **Service Type:** {service_type}")
+            _add(f"- **Procurement:** {procurement_type}")
             if sig.capacity_kw:
                 _add(f"- **Capacity Required:** {sig.capacity_kw:,.0f} kW")
             if sig.duration_minutes:
@@ -184,16 +198,22 @@ def generate_report(
         for a in others:
             sig = signal_map.get(a.signal_id)
             if sig:
+                area_name = sig.area_name or "Unknown"
+                service_type = (
+                    sig.service_type.value if sig.service_type else "Unknown"
+                )
                 _add(
-                    f"| {sig.signal_id} | {sig.dso} | {sig.area_name} | "
-                    f"{sig.service_type.value} | {a.investigation_priority_band.value} |"
+                    f"| {sig.signal_id} | {sig.dso} | {area_name} | "
+                    f"{service_type} | {a.investigation_priority_band.value} |"
                 )
         _add("")
 
     # ── 6. Disclaimer ──
     _add("## 6. Disclaimer\n")
     _add(
-        "This report uses curated public-source data and transparent heuristic assumptions. "
+        "This synthetic-only report is generated solely from the submitted "
+        "demonstration portfolio. No portal-derived signals, sources, market "
+        "evidence, or procurement records are used. "
         "It is **not** a bid recommendation, eligibility confirmation, revenue forecast, "
         "regulatory opinion, or commercial decisioning tool. All estimates are directional "
         "and should be validated against official DSO procurement documentation before "

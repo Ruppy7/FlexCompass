@@ -9,9 +9,11 @@ from app.matching import (
     _check_market_rule,
     _check_temporal,
     _determine_priority,
+    assess_portfolio,
 )
 from app.models import (
     AssetGroup,
+    AssetSource,
     AssetType,
     CompatibilityLevel,
     DataCompleteness,
@@ -26,6 +28,7 @@ from app.models import (
     ServiceType,
     TemporalLevel,
 )
+from app.report_generator import generate_report
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -35,7 +38,7 @@ def _make_portfolio(**overrides) -> Portfolio:
     defaults = dict(
         portfolio_id="p1",
         portfolio_name="Test Portfolio",
-        assets=[],
+        assets=[_make_asset_group()],
     )
     defaults.update(overrides)
     return Portfolio(**defaults)
@@ -43,6 +46,7 @@ def _make_portfolio(**overrides) -> Portfolio:
 
 def _make_asset_group(**overrides) -> AssetGroup:
     defaults = dict(
+        source=AssetSource.synthetic,
         asset_type=AssetType.ev_charger,
         asset_count=1000,
         rated_power_kw=7.0,
@@ -134,6 +138,26 @@ class TestCheckGeography:
         level, evidence = _check_geography(portfolio, signal)
         assert level == RatingLevel.weak
 
+    def test_postcode_only_dso_evidence_is_unresolved(self):
+        """Postcodes need verified geography before they can prove a DSO match."""
+        asset = _make_asset_group(postcode_distribution={"B1": 1.0})
+        portfolio = _make_portfolio(assets=[asset])
+
+        level, evidence = _check_geography(portfolio, _make_signal(dso="NGED"))
+
+        assert level == RatingLevel.unknown
+        assert any("unresolved" in item.lower() for item in evidence)
+
+    def test_postcode_only_neso_evidence_is_unresolved(self):
+        """Postcodes alone do not yet prove GB-wide regional presence."""
+        asset = _make_asset_group(postcode_distribution={"B1": 1.0})
+        portfolio = _make_portfolio(assets=[asset])
+
+        level, evidence = _check_geography(portfolio, _make_signal(dso="NESO"))
+
+        assert level == RatingLevel.unknown
+        assert any("unresolved" in item.lower() for item in evidence)
+
 
 # ---------------------------------------------------------------------------
 # 2. Asset compatibility
@@ -205,7 +229,7 @@ class TestCheckCapacity:
     def test_strong(self):
         """Estimated kw >= signal capacity → strong."""
         asset = _make_asset_group(
-            asset_count=10000, controllable_power_kw=10.0,
+            asset_count=10000, rated_power_kw=10.0, controllable_power_kw=10.0,
             availability_percent=0.5, response_reliability_percent=0.9,
         )
         portfolio = _make_portfolio(assets=[asset])
@@ -218,7 +242,7 @@ class TestCheckCapacity:
         # 100 * 10 * 0.05 * 0.9 = 45 → 45/100 = 45% → weak
         # Need >= 50%: 100 * 10 * 0.06 * 0.9 = 54
         asset = _make_asset_group(
-            asset_count=100, controllable_power_kw=10.0,
+            asset_count=100, rated_power_kw=10.0, controllable_power_kw=10.0,
             availability_percent=0.06, response_reliability_percent=0.9,
         )
         portfolio = _make_portfolio(assets=[asset])
@@ -340,7 +364,9 @@ class TestCheckDataCompleteness:
             guide_price=18.0,
             duration_minutes=60.0,
             eligible_asset_types=[AssetType.ev_charger],
+            source_id="src_test",
             source_updated_at="2026-01-01",
+            raw_record={"record": "verified"},
         )
         level, evidence = _check_data_completeness(signal)
         assert level == DataCompleteness.high
@@ -355,7 +381,9 @@ class TestCheckDataCompleteness:
             duration_minutes=None,
             window_start=None,
             eligible_asset_types=[AssetType.ev_charger],
+            source_id="src_test",
             source_updated_at=None,
+            raw_record={"record": "verified"},
         )
         level, evidence = _check_data_completeness(signal)
         assert level == DataCompleteness.medium
@@ -373,6 +401,39 @@ class TestCheckDataCompleteness:
         )
         level, evidence = _check_data_completeness(signal)
         assert level == DataCompleteness.low
+
+    def test_missing_source_identity_gates_completeness_to_low(self):
+        signal = _make_signal(
+            location_type=LocationType.dso_region,
+            capacity_kw=100.0,
+            guide_price=18.0,
+            duration_minutes=60.0,
+            eligible_asset_types=[AssetType.ev_charger],
+            source_updated_at="2026-01-01",
+            raw_record={"record": "verified"},
+        )
+
+        level, evidence = _check_data_completeness(signal)
+
+        assert level == DataCompleteness.low
+        assert any("source identity" in item.lower() for item in evidence)
+
+    def test_missing_raw_record_gates_completeness_to_low(self):
+        signal = _make_signal(
+            location_type=LocationType.dso_region,
+            capacity_kw=100.0,
+            guide_price=18.0,
+            duration_minutes=60.0,
+            eligible_asset_types=[AssetType.ev_charger],
+            source_updated_at="2026-01-01",
+            source_id="src_test",
+            raw_record=None,
+        )
+
+        level, evidence = _check_data_completeness(signal)
+
+        assert level == DataCompleteness.low
+        assert any("raw record" in item.lower() for item in evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -457,3 +518,136 @@ class TestDeterminePriority:
             ops_complexity=OperationalComplexity.medium,
         )
         assert band == PriorityBand.insufficient_evidence
+
+
+def test_missing_service_evidence_is_unclear_not_incompatible() -> None:
+    signal = _make_signal(service_type=None)
+    level, _ = _check_asset_compatibility(_make_portfolio(), signal)
+    assert level == CompatibilityLevel.unclear
+
+
+def test_missing_eligibility_evidence_is_unclear_not_incompatible() -> None:
+    signal = _make_signal(eligible_asset_types=None)
+    level, _ = _check_asset_compatibility(_make_portfolio(), signal)
+    assert level == CompatibilityLevel.unclear
+
+
+def test_missing_region_evidence_is_unknown_not_weak() -> None:
+    portfolio = _make_portfolio(
+        assets=[_make_asset_group(regional_distribution={})]
+    )
+    level, _ = _check_geography(portfolio, _make_signal(dso="NGED"))
+    assert level == RatingLevel.unknown
+
+
+def test_unprovenanced_signal_cannot_match_blank_source_rule() -> None:
+    portfolio = _make_portfolio(
+        assets=[_make_asset_group(regional_distribution={"NGED": 0.5})]
+    )
+    signal = _make_signal(
+        location_type=LocationType.dso_region,
+        capacity_kw=100.0,
+        guide_price=18.0,
+        duration_minutes=60.0,
+        eligible_asset_types=[AssetType.ev_charger],
+        source_updated_at="2026-01-01",
+        source_id=None,
+        source_dataset_id=None,
+        raw_record=None,
+    )
+    blank_source_rule = _make_rule().model_copy(update={"source_id": ""})
+
+    assessment = assess_portfolio(portfolio, [signal], [blank_source_rule])[0]
+
+    assert assessment.market_rule_clarity == MarketRuleClarity.unknown
+    assert assessment.operational_complexity == OperationalComplexity.unknown
+    assert assessment.data_completeness == DataCompleteness.low
+    assert (
+        assessment.investigation_priority_band
+        == PriorityBand.insufficient_evidence
+    )
+
+
+def test_provenanced_signal_preserves_legitimate_rule_match() -> None:
+    portfolio = _make_portfolio(
+        assets=[_make_asset_group(regional_distribution={"NGED": 0.5})]
+    )
+    signal = _make_signal(
+        location_type=LocationType.dso_region,
+        capacity_kw=100.0,
+        guide_price=18.0,
+        duration_minutes=60.0,
+        eligible_asset_types=[AssetType.ev_charger],
+        source_updated_at="2026-01-01",
+        source_dataset_id="src_test",
+        raw_record={"record": "verified"},
+    )
+
+    assessment = assess_portfolio(portfolio, [signal], [_make_rule()])[0]
+
+    assert assessment.market_rule_clarity == MarketRuleClarity.clear
+    assert assessment.operational_complexity == OperationalComplexity.medium
+    assert assessment.data_completeness == DataCompleteness.high
+    assert assessment.investigation_priority_band == PriorityBand.high
+
+
+def test_assess_portfolio_handles_all_nullable_signal_evidence() -> None:
+    signal = _make_signal(
+        service_type=None,
+        market_name=None,
+        area_name=None,
+        location_type=None,
+        location_reference=None,
+        requirement_type=None,
+        procurement_type=None,
+        eligible_asset_types=None,
+        platform=None,
+    )
+    assessment = assess_portfolio(_make_portfolio(), [signal], [])[0]
+    assert assessment.asset_type_compatibility == CompatibilityLevel.unclear
+    assert "None" not in "\n".join(
+        assessment.evidence_summary + assessment.next_steps
+    )
+
+
+def test_report_renders_nullable_signal_evidence_as_unknown() -> None:
+    portfolio = _make_portfolio()
+    signal = _make_signal(
+        service_type=None,
+        market_name=None,
+        area_name=None,
+        location_type=None,
+        location_reference=None,
+        requirement_type=None,
+        procurement_type=None,
+        eligible_asset_types=None,
+        platform=None,
+    )
+    assessment = assess_portfolio(portfolio, [signal], [])[0]
+
+    report = generate_report(portfolio, [assessment], [signal], [])
+
+    assert "Unknown" in report
+    assert "None" not in report
+
+
+def test_assessment_disclaimer_does_not_invent_signal_provenance() -> None:
+    signal = _make_signal(
+        confidence_level="unknown",
+        source_id=None,
+        source_dataset_id=None,
+        raw_record=None,
+    )
+
+    assessment = assess_portfolio(_make_portfolio(), [signal], [])[0]
+
+    assert "curated public-source data" not in assessment.disclaimer
+    assert "supplied signal and portfolio evidence" in assessment.disclaimer
+    assert "may be missing or unverified" in assessment.disclaimer
+    assert "not a bid recommendation" in assessment.disclaimer
+    assert "eligibility confirmation" in assessment.disclaimer
+    assert "revenue forecast" in assessment.disclaimer
+    assert "commercial decisioning tool" in assessment.disclaimer
+    assert signal.source_id is None
+    assert signal.source_dataset_id is None
+    assert signal.raw_record is None
