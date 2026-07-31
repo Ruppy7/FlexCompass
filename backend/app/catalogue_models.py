@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -68,6 +68,11 @@ class CataloguePortalConfig(BaseModel):
     rate_limit_rps: float
     timeout_seconds: int
     max_pages: int
+
+
+PortalId: TypeAlias = Literal[
+    "nged", "spen", "enwl", "ssen", "ukpn", "npg", "neso"
+]
 
 
 class _UtcTimestampModel(BaseModel):
@@ -253,4 +258,14 @@ CATALOGUE_PORTALS: Mapping[str, CataloguePortalConfig] = MappingProxyType(
             max_pages=1000,
         ),
     }
+)
+
+CATALOGUE_PORTAL_IDS: tuple[PortalId, ...] = (
+    "nged",
+    "spen",
+    "enwl",
+    "ssen",
+    "ukpn",
+    "npg",
+    "neso",
 )

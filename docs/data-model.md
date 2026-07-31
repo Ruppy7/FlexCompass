@@ -4,6 +4,12 @@ FlexCompass uses a zone-authoritative model: a postcode or coordinate is a looku
 key into a network zone, and a signal refers to that zone when the public source
 provides enough evidence.
 
+The active public-data workflow is the anonymous, read-only seven-portal
+catalogue CLI. `CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` is the
+sole active portal registry. The web application does not expose this registry
+or verified analytical portal records; it presents research status and a
+separate, explicitly synthetic demonstration.
+
 ## Core records
 
 - `PortalDataset` records public catalogue metadata, API location, known fields,
@@ -113,3 +119,10 @@ parametrized cases are skipped by default with zero network calls. When enabled,
 each case requires a complete snapshot whose unique usable dataset count matches
 the portal's reported count. Licence and attribution must be verified before
 redistributing source data.
+
+## Retired legacy surfaces
+
+The legacy generic portal ingestors and browser-triggered mutation routes were
+retired because they lacked accepted source contracts and end-to-end
+provenance. The active API therefore has no route that starts catalogue or
+analytical ingestion, drift processing, or database population.

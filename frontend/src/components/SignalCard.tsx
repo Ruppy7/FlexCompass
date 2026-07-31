@@ -39,6 +39,10 @@ const CHECKS: [string, keyof FitAssessment][] = [
   ["Ops Complexity", "operational_complexity"],
 ];
 
+function evidenceLabel(value: string | null): string {
+  return value ? value.replace(/_/g, " ") : "Unknown";
+}
+
 export default function SignalCard({ assessment, signal, rank }: Props) {
   const band = assessment.investigation_priority_band;
 
@@ -47,7 +51,9 @@ export default function SignalCard({ assessment, signal, rank }: Props) {
       <div className="flex justify-between items-start mb-3">
         <h3 className="font-bold text-gray-900">
           <span className="text-gray-400 font-normal mr-1.5">#{rank}</span>
-          {signal ? `${signal.dso} — ${signal.area_name}` : assessment.signal_id}
+          {signal
+            ? `${signal.dso} — ${signal.area_name ?? "Unknown"}`
+            : assessment.signal_id}
         </h3>
         <span className="flex items-center gap-1.5 text-sm font-semibold px-2.5 py-1 rounded-full bg-surface shadow-sm whitespace-nowrap">
           <span className={`w-2 h-2 rounded-full ${BAND_DOTS[band]}`} />
@@ -58,10 +64,12 @@ export default function SignalCard({ assessment, signal, rank }: Props) {
       {signal && (
         <div className="text-sm text-gray-600 mb-3 flex flex-wrap items-center gap-x-2 gap-y-1">
           <span className="font-medium capitalize">
-            {signal.service_type.replace(/_/g, " ")}
+            {evidenceLabel(signal.service_type)}
           </span>
           <span className="text-gray-300">·</span>
-          <span className="capitalize">{signal.procurement_type}</span>
+          <span className="capitalize">
+            {evidenceLabel(signal.procurement_type)}
+          </span>
           {signal.capacity_kw && (
             <>
               <span className="text-gray-300">·</span>

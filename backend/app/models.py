@@ -14,10 +14,13 @@ Entities from the brief:
 
 from __future__ import annotations
 
+import math
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from .catalogue_models import PortalId
 
 # ---------------------------------------------------------------------------
 # Enums — existing (v0)
@@ -152,9 +155,9 @@ class AssetSource(str, Enum):
 
 class GenerateAssetGroupRequest(BaseModel):
     """Request body for /api/asset-groups/generate."""
-    asset_type: str
-    count: int
-    region: str
+    asset_type: AssetType
+    count: int = Field(ge=1, le=1_000_000)
+    portal_id: PortalId
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +183,8 @@ class FlexZone(BaseModel):
     zone_id: str
     dso: str
     platform: Optional[str] = None  # e.g. "Electron"
-    area_name: str
-    zone_type: str = "unknown"  # e.g. "constraint_zone", "substation_area"
+    area_name: Optional[str] = None
+    zone_type: Optional[str] = None
     postcode_prefixes: list[str] = Field(default_factory=list)
     postcodes: list[str] = Field(default_factory=list)
     geometry: Optional[dict[str, Any]] = None  # GeoJSON geometry or ref
@@ -198,16 +201,16 @@ class FlexSignal(BaseModel):
     zone_id: Optional[str] = None
     dso: str
     platform: Optional[str] = None
-    market_name: str
-    area_name: str
-    location_type: LocationType = LocationType.unknown
-    location_reference: str
-    service_type: ServiceType
+    market_name: Optional[str] = None
+    area_name: Optional[str] = None
+    location_type: Optional[LocationType] = None
+    location_reference: Optional[str] = None
+    service_type: Optional[ServiceType] = None
     direction: Optional[Direction] = None
     requirement_type: Optional[RequirementType] = None
     tender_round: Optional[str] = None
     historic_current_future_status: HistoricCurrentFuture = HistoricCurrentFuture.unknown
-    procurement_type: str
+    procurement_type: Optional[str] = None
     window_start: Optional[str] = None
     window_end: Optional[str] = None
     duration_minutes: Optional[float] = None
@@ -217,7 +220,7 @@ class FlexSignal(BaseModel):
     price_unit: Optional[str] = None
     utilisation_estimate: Optional[str] = None
     payment_type: Optional[str] = None
-    eligible_asset_types: list[AssetType] = Field(default_factory=list)
+    eligible_asset_types: Optional[list[AssetType]] = None
     source_id: Optional[str] = None  # v0 compat — maps to source_dataset_id
     source_updated_at: Optional[str] = None
     source_dataset_id: Optional[str] = None
@@ -234,21 +237,42 @@ class AssetGroup(BaseModel):
     for v0 portfolio matching.
     """
     asset_group_id: Optional[str] = None
-    source: AssetSource = AssetSource.synthetic
+    source: AssetSource
     asset_type: AssetType
-    asset_count: int
+    asset_count: int = Field(ge=1, le=1_000_000)
     postcode: Optional[str] = None
     postcode_prefix: Optional[str] = None
-    rated_power_kw: float
-    controllable_power_kw: float
-    availability_percent: float
-    response_reliability_percent: float
+    rated_power_kw: float = Field(ge=0, le=1_000_000, allow_inf_nan=False)
+    controllable_power_kw: float = Field(
+        ge=0, le=1_000_000, allow_inf_nan=False
+    )
+    availability_percent: float = Field(ge=0, le=1, allow_inf_nan=False)
+    response_reliability_percent: float = Field(
+        ge=0, le=1, allow_inf_nan=False
+    )
     supported_service_types: list[ServiceType] = Field(default_factory=list)
     regional_distribution: dict[str, float] = Field(default_factory=dict)
     postcode_distribution: dict[str, float] = Field(default_factory=dict)
-    baseline_assumption: str = ""
-    metering_assumption: str = ""
-    operational_notes: list[str] = Field(default_factory=list)
+    baseline_assumption: str = Field(default="", max_length=2_000)
+    metering_assumption: str = Field(default="", max_length=2_000)
+    operational_notes: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_capacity_and_distributions(self) -> "AssetGroup":
+        if self.controllable_power_kw > self.rated_power_kw:
+            raise ValueError("controllable_power_kw cannot exceed rated_power_kw")
+        for name, values in (
+            ("regional_distribution", self.regional_distribution),
+            ("postcode_distribution", self.postcode_distribution),
+        ):
+            if any(
+                not math.isfinite(value) or value < 0 or value > 1
+                for value in values.values()
+            ):
+                raise ValueError(f"{name} shares must be between zero and one")
+            if sum(values.values()) > 1.0 + 1e-9:
+                raise ValueError(f"{name} shares cannot total more than one")
+        return self
 
 
 class AssetSignalMatch(BaseModel):
@@ -303,14 +327,14 @@ class MarketRule(BaseModel):
     baseline_requirements: str
     stacking_notes: str
     participation_notes: str
-    source_id: str
+    source_id: str = Field(min_length=1, pattern=r"\S")
     confidence_level: ConfidenceLevel = ConfidenceLevel.unknown
 
 
 class Portfolio(BaseModel):
-    portfolio_id: str
-    portfolio_name: str
-    assets: list[AssetGroup]
+    portfolio_id: str = Field(min_length=1, max_length=200)
+    portfolio_name: str = Field(min_length=1, max_length=200)
+    assets: list[AssetGroup] = Field(min_length=1, max_length=1_000)
 
 
 class FitAssessment(BaseModel):
@@ -358,3 +382,53 @@ class ReportResponse(BaseModel):
     markdown: str
     portfolio: Portfolio
     assessments: list[FitAssessment]
+
+
+def require_synthetic_portfolio(portfolio: Portfolio) -> Portfolio:
+    """Reject non-synthetic assets at the demonstration boundary."""
+    if any(
+        asset.source is not AssetSource.synthetic
+        for asset in portfolio.assets
+    ):
+        raise ValueError("demo workflow accepts synthetic assets only")
+    return portfolio
+
+
+class DemoAnalyseRequest(BaseModel):
+    portfolio: Portfolio
+
+    @model_validator(mode="after")
+    def require_synthetic_assets(self) -> "DemoAnalyseRequest":
+        require_synthetic_portfolio(self.portfolio)
+        return self
+
+
+class DemoReportRequest(BaseModel):
+    portfolio: Portfolio
+
+    @model_validator(mode="after")
+    def require_synthetic_assets(self) -> "DemoReportRequest":
+        require_synthetic_portfolio(self.portfolio)
+        return self
+
+
+class DemoPortfolioListResponse(BaseModel):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+    items: list[Portfolio]
+
+
+class DemoAnalyseResponse(AnalyseResponse):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+
+
+class DemoReportResponse(ReportResponse):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+
+
+class DemoAssetGroupResponse(BaseModel):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+    item: AssetGroup
