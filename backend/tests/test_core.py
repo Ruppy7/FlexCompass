@@ -3,6 +3,7 @@
 Coverage: confidence rubric, resolver, normaliser, capacity maths, config.
 """
 
+from app.catalogue_models import CATALOGUE_PORTAL_IDS
 from app.confidence import (
     GeographyMatch,
     confidence_from_signal_fields,
@@ -232,10 +233,15 @@ class TestConfig:
         assert config.default_seed == 42
 
     def test_portals_configured(self):
-        assert "nged" in config.portals
-        assert "spen" in config.portals
-        assert "enwl" in config.portals
-        assert "ssen" in config.portals
+        assert CATALOGUE_PORTAL_IDS == (
+            "nged",
+            "spen",
+            "enwl",
+            "ssen",
+            "ukpn",
+            "npg",
+            "neso",
+        )
 
     def test_capacity_method_version(self):
         assert config.capacity_method_version == "v0.1"
