@@ -134,6 +134,13 @@ def _total_deadline_error() -> SourceContractError:
     )
 
 
+def _worker_cleanup_error() -> SourceContractError:
+    return SourceContractError(
+        "SSEN resource worker cleanup failed",
+        error_code="worker_cleanup_failed",
+    )
+
+
 def _create_https_connection(
     host: str,
     port: int,
@@ -304,13 +311,12 @@ def _download_resource_in_child(
         declared = second.getheader("content-length")
         declared_size: int | None = None
         if declared is not None:
-            try:
-                declared_size = int(declared, 10)
-            except ValueError:
+            if re.fullmatch(r"[0-9]+", declared) is None:
                 raise SourceContractError(
                     "SSEN resource content length is invalid",
                     error_code="invalid_content_length",
-                ) from None
+                )
+            declared_size = int(declared, 10)
             if declared_size < 0 or declared_size > SOURCE_MAX_RESPONSE_BYTES:
                 raise SourceContractError(
                     "SSEN resource exceeds the response size limit",
@@ -421,24 +427,45 @@ def _safe_process_entry(
 
 def _terminate_and_join(process: multiprocessing.Process) -> None:
     cleanup_deadline = time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS
-    if process.is_alive():
-        process.terminate()
-        process.join(
-            min(
-                PROCESS_CLEANUP_GRACE_SECONDS / 2,
-                max(0.0, cleanup_deadline - time.monotonic()),
-            )
+    cleanup_failed = False
+
+    def is_alive() -> bool:
+        nonlocal cleanup_failed
+        try:
+            return process.is_alive()
+        except BaseException:
+            cleanup_failed = True
+            return True
+
+    def bounded_join(maximum: float) -> None:
+        nonlocal cleanup_failed
+        timeout = min(
+            maximum,
+            max(0.0, cleanup_deadline - time.monotonic()),
         )
-    if process.is_alive():
-        process.kill()
-        process.join(max(0.0, cleanup_deadline - time.monotonic()))
+        try:
+            process.join(timeout)
+        except BaseException:
+            cleanup_failed = True
+
+    if is_alive():
+        try:
+            process.terminate()
+        except BaseException:
+            cleanup_failed = True
+        bounded_join(PROCESS_CLEANUP_GRACE_SECONDS / 2)
+    if is_alive():
+        try:
+            process.kill()
+        except BaseException:
+            cleanup_failed = True
+        bounded_join(PROCESS_CLEANUP_GRACE_SECONDS)
     else:
-        process.join(0)
-    if process.is_alive():
-        raise SourceContractError(
-            "SSEN resource worker cleanup failed",
-            error_code="worker_cleanup_failed",
-        )
+        bounded_join(0.0)
+    if is_alive():
+        cleanup_failed = True
+    if cleanup_failed:
+        raise _worker_cleanup_error()
 
 
 class OwnedProcessSsenTransport:
@@ -555,16 +582,32 @@ class OwnedProcessSsenTransport:
                 "SSEN resource worker protocol failed"
             ) from None
         finally:
-            process_was_started = started or process.pid is not None
-            if process_was_started:
-                _terminate_and_join(process)
-            if not process.is_alive():
-                process.close()
-            receive_connection.close()
+            cleanup_failed = False
             try:
-                send_connection.close()
+                process_was_started = started or process.pid is not None
             except BaseException:
-                pass
+                process_was_started = True
+                cleanup_failed = True
+            try:
+                if process_was_started:
+                    _terminate_and_join(process)
+            except BaseException:
+                cleanup_failed = True
+            finally:
+                try:
+                    process.close()
+                except BaseException:
+                    cleanup_failed = True
+                try:
+                    receive_connection.close()
+                except BaseException:
+                    cleanup_failed = True
+                try:
+                    send_connection.close()
+                except BaseException:
+                    cleanup_failed = True
+            if cleanup_failed:
+                raise _worker_cleanup_error()
 
     def _decode_message(self, message: bytes) -> bytes:
         if not message:

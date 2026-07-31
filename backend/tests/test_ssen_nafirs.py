@@ -191,6 +191,94 @@ class TerminateResistantProcessDouble:
         if timeout is not None:
             time.sleep(timeout)
 
+
+class CleanupExceptionProcessDouble:
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.alive = True
+        self._pid = 12345
+        self.exitcode: int | None = None
+        self.start_calls = 0
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.join_timeouts: list[float | None] = []
+        self.close_calls = 0
+
+    @property
+    def pid(self) -> int:
+        if self.failure == "pid":
+            raise OSError("RAW_PID_DETAIL_MUST_NOT_LEAK")
+        return self._pid
+
+    def start(self) -> None:
+        self.start_calls += 1
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        if self.failure == "terminate":
+            raise OSError("RAW_TERMINATE_DETAIL_MUST_NOT_LEAK")
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self.failure == "kill":
+            raise OSError("RAW_KILL_DETAIL_MUST_NOT_LEAK")
+        self.alive = False
+        self.exitcode = -1
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
+        if self.failure == "join":
+            raise OSError("RAW_JOIN_DETAIL_MUST_NOT_LEAK")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.alive:
+            raise ValueError("cannot close a running process")
+
+
+class RecordingReceiveConnection:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        del timeout
+        return True
+
+    def recv_bytes(self, maxlength: int) -> bytes:
+        del maxlength
+        raise OSError("RAW_PIPE_DETAIL_MUST_NOT_LEAK")
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class RecordingSendConnection:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class RecordingProcessContext:
+    def __init__(self, process: CleanupExceptionProcessDouble) -> None:
+        self.process = process
+        self.receive = RecordingReceiveConnection()
+        self.send = RecordingSendConnection()
+
+    def Pipe(
+        self, *, duplex: bool
+    ) -> tuple[RecordingReceiveConnection, RecordingSendConnection]:
+        assert duplex is False
+        return self.receive, self.send
+
+    def Process(self, **kwargs: Any) -> CleanupExceptionProcessDouble:
+        del kwargs
+        return self.process
+
 EXPECTED_MODEL_FIELDS: dict[type[BaseModel], dict[str, object]] = {
     SourceResource: {
         "source_dataset_id": str,
@@ -3272,6 +3360,129 @@ def test_process_cleanup_bounds_terminate_and_kill_joins_inside_one_grace(
     assert elapsed <= outage_source.PROCESS_CLEANUP_GRACE_SECONDS + 0.1
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_alive"),
+    [("terminate", False), ("kill", True), ("join", False)],
+)
+def test_process_cleanup_contains_control_and_join_exceptions(
+    failure: str,
+    expected_alive: bool,
+) -> None:
+    process = CleanupExceptionProcessDouble(failure)
+    started = time.monotonic()
+
+    with pytest.raises(SourceContractError) as caught:
+        outage_source._terminate_and_join(process)  # type: ignore[arg-type]
+
+    elapsed = time.monotonic() - started
+    assert str(caught.value) == "SSEN resource worker cleanup failed"
+    assert caught.value.code == "worker_cleanup_failed"
+    assert "RAW_" not in str(caught.value)
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.alive is expected_alive
+    assert process.join_timeouts
+    assert all(timeout is not None for timeout in process.join_timeouts)
+    assert elapsed <= outage_source.PROCESS_CLEANUP_GRACE_SECONDS + 0.1
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_alive"),
+    [("terminate", False), ("kill", True), ("join", False)],
+)
+def test_transport_closes_every_parent_handle_when_cleanup_fails(
+    failure: str,
+    expected_alive: bool,
+) -> None:
+    process = CleanupExceptionProcessDouble(failure)
+    context = RecordingProcessContext(process)
+    transport = OwnedProcessSsenTransport(worker_target=_spawn_success_worker)
+    transport._context = context  # type: ignore[assignment]
+    transport._start_process = lambda item: item.start()  # type: ignore[attr-defined]
+
+    with pytest.raises(SourceContractError) as caught:
+        transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        )
+
+    assert str(caught.value) == "SSEN resource worker cleanup failed"
+    assert caught.value.code == "worker_cleanup_failed"
+    assert "RAW_" not in str(caught.value)
+    assert process.kill_calls == 1
+    assert process.alive is expected_alive
+    assert process.close_calls == 1
+    assert context.receive.close_calls == 1
+    assert context.send.close_calls >= 1
+
+
+def test_unknown_pid_after_start_failure_is_treated_as_may_have_started() -> None:
+    process = CleanupExceptionProcessDouble("pid")
+    context = RecordingProcessContext(process)
+    transport = OwnedProcessSsenTransport(worker_target=_spawn_success_worker)
+    transport._context = context  # type: ignore[assignment]
+
+    def start_then_fail(item: CleanupExceptionProcessDouble) -> None:
+        item.start()
+        raise OSError("RAW_START_DETAIL_MUST_NOT_LEAK")
+
+    transport._start_process = start_then_fail  # type: ignore[assignment]
+    with pytest.raises(SourceContractError) as caught:
+        transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        )
+
+    assert str(caught.value) == "SSEN resource worker cleanup failed"
+    assert caught.value.code == "worker_cleanup_failed"
+    assert "RAW_" not in str(caught.value)
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.alive is False
+    assert process.close_calls == 1
+    assert context.receive.close_calls == 1
+    assert context.send.close_calls >= 1
+
+
+def test_real_child_is_killed_after_terminate_raises() -> None:
+    marker = "RAW_REAL_TERMINATE_DETAIL_MUST_NOT_LEAK"
+    before = _active_child_pids()
+    started_processes: list[multiprocessing.Process] = []
+    transport = OwnedProcessSsenTransport(
+        worker_target=_spawn_non_cooperative_worker,
+        poll_interval_seconds=0.005,
+    )
+
+    def start_with_failing_terminate(process: multiprocessing.Process) -> None:
+        started_processes.append(process)
+        process.start()
+
+        def fail_terminate() -> None:
+            raise OSError(marker)
+
+        process.terminate = fail_terminate  # type: ignore[method-assign]
+
+    transport._start_process = start_with_failing_terminate  # type: ignore[attr-defined]
+    started = time.monotonic()
+    try:
+        with pytest.raises(SourceContractError) as caught:
+            transport.download(
+                ssen_resource("SEPD"), deadline=started + 0.2
+            )
+        assert str(caught.value) == "SSEN resource worker cleanup failed"
+        assert caught.value.code == "worker_cleanup_failed"
+        assert marker not in str(caught.value)
+        assert time.monotonic() - started < 0.7
+        assert _active_child_pids() == before
+    finally:
+        for process in started_processes:
+            try:
+                if process.is_alive():
+                    process.kill()
+                    process.join(1)
+                process.close()
+            except ValueError:
+                pass
+
+
 def test_process_startup_is_checked_immediately_after_slow_start() -> None:
     before = _active_child_pids()
     transport = OwnedProcessSsenTransport(worker_target=_spawn_success_worker)
@@ -3560,6 +3771,66 @@ def test_download_requires_body_to_match_declared_content_length(
         assert str(caught.value) == "SSEN resource content length is invalid"
         assert caught.value.code == "invalid_content_length"
 
+    assert final.closed is True
+    assert all(connection.closed for connection in factory.connections)
+
+
+@pytest.mark.parametrize(
+    "declared_size",
+    ["+3", "-3", "-0", " 3", "3 ", "\t3", "3,3", "3, 3", "３"],
+)
+def test_download_rejects_non_ascii_digit_content_length_before_body_read(
+    declared_size: str,
+) -> None:
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+    final = ScriptedHTTPResponse(
+        200,
+        headers={
+            "content-type": "text/csv",
+            "content-length": declared_size,
+        },
+        chunks=[b"must-not-be-read"],
+    )
+    factory = ScriptedConnectionFactory([_scripted_redirect(location), final])
+
+    with pytest.raises(SourceContractError) as caught:
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
+
+    assert str(caught.value) == "SSEN resource content length is invalid"
+    assert caught.value.code == "invalid_content_length"
+    assert final._chunks == [b"must-not-be-read"]
+    assert final.closed is True
+    assert all(connection.closed for connection in factory.connections)
+
+
+@pytest.mark.parametrize(
+    ("declared_size", "content"),
+    [("3", b"abc"), ("003", b"abc"), ("0", b"")],
+)
+def test_download_accepts_exact_ascii_digit_content_length(
+    declared_size: str,
+    content: bytes,
+) -> None:
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+    final = ScriptedHTTPResponse(
+        200,
+        headers={
+            "content-type": "text/csv",
+            "content-length": declared_size,
+        },
+        chunks=[content] if content else [],
+    )
+    factory = ScriptedConnectionFactory([_scripted_redirect(location), final])
+
+    assert _download_resource_in_child(
+        ssen_resource("SEPD").model_dump(mode="python"),
+        time.monotonic() + 180,
+        connection_factory=factory,
+    ) == content
     assert final.closed is True
     assert all(connection.closed for connection in factory.connections)
 
