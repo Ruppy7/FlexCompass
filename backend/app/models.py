@@ -327,7 +327,7 @@ class MarketRule(BaseModel):
     baseline_requirements: str
     stacking_notes: str
     participation_notes: str
-    source_id: str
+    source_id: str = Field(min_length=1, pattern=r"\S")
     confidence_level: ConfidenceLevel = ConfidenceLevel.unknown
 
 

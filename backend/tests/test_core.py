@@ -14,6 +14,7 @@ from app.models import (
     AssetType,
     ConfidenceLevel,
     FlexZone,
+    HistoricCurrentFuture,
     LocationType,
     RequirementType,
     ServiceType,
@@ -203,6 +204,48 @@ class TestNormaliser:
         assert sig.dso == "SPEN"
         assert sig.platform == "Electron"
         assert sig.capacity_kw == 150.0
+
+    @pytest.mark.parametrize("status", ["inactive", "not active"])
+    def test_nged_unsupported_status_remains_unknown(self, status: str):
+        sig = normalise_nged_signal({"trade_id": "T-status", "status": status})
+        assert (
+            sig.historic_current_future_status
+            is HistoricCurrentFuture.unknown
+        )
+
+    def test_nged_supported_status_uses_trimmed_casefolded_exact_match(self):
+        sig = normalise_nged_signal(
+            {"trade_id": "T-active", "status": "  ACTIVE  "}
+        )
+        assert (
+            sig.historic_current_future_status
+            is HistoricCurrentFuture.current
+        )
+
+    def test_spen_preserves_explicit_zero_capacity_and_price(self):
+        sig = normalise_spen_signal(
+            {
+                "record_id": "SPEN-zero",
+                "capacity_kw": 0,
+                "capacity_mw": 2,
+                "guide_price": 0,
+                "price": 99,
+            }
+        )
+        assert sig.capacity_kw == 0
+        assert sig.guide_price == 0
+
+    def test_spen_converts_explicit_capacity_mw_to_kw(self):
+        sig = normalise_spen_signal(
+            {"record_id": "SPEN-mw", "capacity_mw": 1.25}
+        )
+        assert sig.capacity_kw == 1250
+
+    def test_spen_does_not_consume_ambiguous_mw_requirement(self):
+        sig = normalise_spen_signal(
+            {"record_id": "SPEN-ambiguous", "mw_requirement": 1.5}
+        )
+        assert sig.capacity_kw is None
 
     def test_normalise_handles_none_values(self):
         """Normaliser should handle None/missing fields gracefully."""

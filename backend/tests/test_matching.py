@@ -138,6 +138,26 @@ class TestCheckGeography:
         level, evidence = _check_geography(portfolio, signal)
         assert level == RatingLevel.weak
 
+    def test_postcode_only_dso_evidence_is_unresolved(self):
+        """Postcodes need verified geography before they can prove a DSO match."""
+        asset = _make_asset_group(postcode_distribution={"B1": 1.0})
+        portfolio = _make_portfolio(assets=[asset])
+
+        level, evidence = _check_geography(portfolio, _make_signal(dso="NGED"))
+
+        assert level == RatingLevel.unknown
+        assert any("unresolved" in item.lower() for item in evidence)
+
+    def test_postcode_only_neso_evidence_is_unresolved(self):
+        """Postcodes alone do not yet prove GB-wide regional presence."""
+        asset = _make_asset_group(postcode_distribution={"B1": 1.0})
+        portfolio = _make_portfolio(assets=[asset])
+
+        level, evidence = _check_geography(portfolio, _make_signal(dso="NESO"))
+
+        assert level == RatingLevel.unknown
+        assert any("unresolved" in item.lower() for item in evidence)
+
 
 # ---------------------------------------------------------------------------
 # 2. Asset compatibility
@@ -344,7 +364,9 @@ class TestCheckDataCompleteness:
             guide_price=18.0,
             duration_minutes=60.0,
             eligible_asset_types=[AssetType.ev_charger],
+            source_id="src_test",
             source_updated_at="2026-01-01",
+            raw_record={"record": "verified"},
         )
         level, evidence = _check_data_completeness(signal)
         assert level == DataCompleteness.high
@@ -359,7 +381,9 @@ class TestCheckDataCompleteness:
             duration_minutes=None,
             window_start=None,
             eligible_asset_types=[AssetType.ev_charger],
+            source_id="src_test",
             source_updated_at=None,
+            raw_record={"record": "verified"},
         )
         level, evidence = _check_data_completeness(signal)
         assert level == DataCompleteness.medium
@@ -377,6 +401,39 @@ class TestCheckDataCompleteness:
         )
         level, evidence = _check_data_completeness(signal)
         assert level == DataCompleteness.low
+
+    def test_missing_source_identity_gates_completeness_to_low(self):
+        signal = _make_signal(
+            location_type=LocationType.dso_region,
+            capacity_kw=100.0,
+            guide_price=18.0,
+            duration_minutes=60.0,
+            eligible_asset_types=[AssetType.ev_charger],
+            source_updated_at="2026-01-01",
+            raw_record={"record": "verified"},
+        )
+
+        level, evidence = _check_data_completeness(signal)
+
+        assert level == DataCompleteness.low
+        assert any("source identity" in item.lower() for item in evidence)
+
+    def test_missing_raw_record_gates_completeness_to_low(self):
+        signal = _make_signal(
+            location_type=LocationType.dso_region,
+            capacity_kw=100.0,
+            guide_price=18.0,
+            duration_minutes=60.0,
+            eligible_asset_types=[AssetType.ev_charger],
+            source_updated_at="2026-01-01",
+            source_id="src_test",
+            raw_record=None,
+        )
+
+        level, evidence = _check_data_completeness(signal)
+
+        assert level == DataCompleteness.low
+        assert any("raw record" in item.lower() for item in evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +538,57 @@ def test_missing_region_evidence_is_unknown_not_weak() -> None:
     )
     level, _ = _check_geography(portfolio, _make_signal(dso="NGED"))
     assert level == RatingLevel.unknown
+
+
+def test_unprovenanced_signal_cannot_match_blank_source_rule() -> None:
+    portfolio = _make_portfolio(
+        assets=[_make_asset_group(regional_distribution={"NGED": 0.5})]
+    )
+    signal = _make_signal(
+        location_type=LocationType.dso_region,
+        capacity_kw=100.0,
+        guide_price=18.0,
+        duration_minutes=60.0,
+        eligible_asset_types=[AssetType.ev_charger],
+        source_updated_at="2026-01-01",
+        source_id=None,
+        source_dataset_id=None,
+        raw_record=None,
+    )
+    blank_source_rule = _make_rule().model_copy(update={"source_id": ""})
+
+    assessment = assess_portfolio(portfolio, [signal], [blank_source_rule])[0]
+
+    assert assessment.market_rule_clarity == MarketRuleClarity.unknown
+    assert assessment.operational_complexity == OperationalComplexity.unknown
+    assert assessment.data_completeness == DataCompleteness.low
+    assert (
+        assessment.investigation_priority_band
+        == PriorityBand.insufficient_evidence
+    )
+
+
+def test_provenanced_signal_preserves_legitimate_rule_match() -> None:
+    portfolio = _make_portfolio(
+        assets=[_make_asset_group(regional_distribution={"NGED": 0.5})]
+    )
+    signal = _make_signal(
+        location_type=LocationType.dso_region,
+        capacity_kw=100.0,
+        guide_price=18.0,
+        duration_minutes=60.0,
+        eligible_asset_types=[AssetType.ev_charger],
+        source_updated_at="2026-01-01",
+        source_dataset_id="src_test",
+        raw_record={"record": "verified"},
+    )
+
+    assessment = assess_portfolio(portfolio, [signal], [_make_rule()])[0]
+
+    assert assessment.market_rule_clarity == MarketRuleClarity.clear
+    assert assessment.operational_complexity == OperationalComplexity.medium
+    assert assessment.data_completeness == DataCompleteness.high
+    assert assessment.investigation_priority_band == PriorityBand.high
 
 
 def test_assess_portfolio_handles_all_nullable_signal_evidence() -> None:

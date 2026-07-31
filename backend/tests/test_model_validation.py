@@ -1,5 +1,5 @@
 import pytest
-from app.models import AssetGroup, AssetSource, AssetType, Portfolio
+from app.models import AssetGroup, AssetSource, AssetType, MarketRule, Portfolio
 from app.seed_loader import load_example_portfolios
 from pydantic import ValidationError
 
@@ -15,6 +15,24 @@ def valid_asset(**overrides: object) -> dict[str, object]:
         "response_reliability_percent": 0.9,
         "regional_distribution": {"nged": 0.5},
         "postcode_distribution": {},
+    }
+    value.update(overrides)
+    return value
+
+
+def valid_market_rule(**overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "rule_id": "rule",
+        "market_name": "Market",
+        "buyer": "Buyer",
+        "procurement_method": "competitive",
+        "payment_type": "utilisation",
+        "minimum_capacity_kw": 50,
+        "metering_requirements": "half-hourly",
+        "baseline_requirements": "required",
+        "stacking_notes": "",
+        "participation_notes": "",
+        "source_id": "source",
     }
     value.update(overrides)
     return value
@@ -59,6 +77,12 @@ def test_checked_in_examples_use_explicit_synthetic_sources() -> None:
         for portfolio in portfolios
         for asset in portfolio.assets
     )
+
+
+@pytest.mark.parametrize("source_id", ["", " ", "\t\n"])
+def test_market_rule_rejects_blank_source_id(source_id: str) -> None:
+    with pytest.raises(ValidationError):
+        MarketRule(**valid_market_rule(source_id=source_id))
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])

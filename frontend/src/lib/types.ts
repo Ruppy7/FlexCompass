@@ -105,12 +105,13 @@ export interface FlexSignal {
 export interface FlexZone {
   zone_id: string;
   dso: string;
-  platform?: string;
-  area_name: string;
-  zone_type: string;
+  platform: string | null;
+  area_name: string | null;
+  zone_type: string | null;
   postcode_prefixes: string[];
   postcodes: string[];
-  source_dataset_id?: string;
+  geometry: Record<string, unknown> | null;
+  source_dataset_id: string | null;
 }
 
 export interface PortalDataset {
@@ -168,9 +169,4 @@ export interface DemoPortfolioListResponse {
   workflow_kind: "synthetic_demo";
   portal_data_used: false;
   items: Portfolio[];
-}
-
-export interface IngestStatus {
-  ingested_tables: Record<string, number>;
-  total_records: number;
 }

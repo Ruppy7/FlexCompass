@@ -172,15 +172,18 @@ def normalise_nged_signal(
     status = _safe_str(raw.get("status"), "unknown")
 
     # Map status to historic/current/future
-    status_lower = status.lower()
-    if "historic" in status_lower or "completed" in status_lower:
-        hcfs = HistoricCurrentFuture.historic
-    elif "current" in status_lower or "active" in status_lower:
-        hcfs = HistoricCurrentFuture.current
-    elif "future" in status_lower or "upcoming" in status_lower:
-        hcfs = HistoricCurrentFuture.future
-    else:
-        hcfs = HistoricCurrentFuture.unknown
+    status_mapping = {
+        "historic": HistoricCurrentFuture.historic,
+        "completed": HistoricCurrentFuture.historic,
+        "current": HistoricCurrentFuture.current,
+        "active": HistoricCurrentFuture.current,
+        "future": HistoricCurrentFuture.future,
+        "upcoming": HistoricCurrentFuture.future,
+    }
+    hcfs = status_mapping.get(
+        status.casefold().strip(),
+        HistoricCurrentFuture.unknown,
+    )
 
     zone = _optional_str(raw.get("zone"))
     resolved_zone_id = _optional_str(zone_id)
@@ -267,12 +270,21 @@ def normalise_spen_signal(
         raw.get("eligible_asset_types")
     )
     direction = _map_direction(raw.get("direction"))
-    capacity_kw = _safe_float(raw.get("capacity_kw") or raw.get("mw_requirement"))
-    if capacity_kw is None:
+    if raw.get("capacity_kw") is not None:
+        capacity_kw = _safe_float(raw.get("capacity_kw"))
+    elif raw.get("capacity_mw") is not None:
         capacity_mw = _safe_float(raw.get("capacity_mw"))
-        if capacity_mw is not None:
-            capacity_kw = capacity_mw * 1000
-    guide_price = _safe_float(raw.get("guide_price") or raw.get("price"))
+        capacity_kw = (
+            capacity_mw * 1000 if capacity_mw is not None else None
+        )
+    else:
+        capacity_kw = None
+    guide_price_raw = (
+        raw.get("guide_price")
+        if raw.get("guide_price") is not None
+        else raw.get("price")
+    )
+    guide_price = _safe_float(guide_price_raw)
 
     zone = _optional_str(raw.get("zone") or raw.get("constraint_zone"))
     resolved_zone_id = _optional_str(zone_id)
