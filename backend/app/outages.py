@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -9,6 +10,26 @@ from pydantic import BaseModel, Field, field_validator
 
 LicenceArea = Literal["SEPD", "SHEPD"]
 NonEmptyStr = Annotated[str, Field(min_length=1)]
+PARSER_VERSION = "ssen-nafirs-hv-v1"
+CANONICAL_EVENT_SCHEMA_VERSION = 1
+
+
+def source_snapshot_id(source_resource_id: str, content_sha256: str) -> str:
+    """Return the immutable identity of one resource-specific source observation."""
+    return f"ssen-nafirs-hv:{source_resource_id}:sha256:{content_sha256}"
+
+
+def outage_reject_id(
+    snapshot_id: str,
+    row_number: int,
+    reason_code: str,
+    safe_detail_sha256: str,
+) -> str:
+    """Return a stable identity for one snapshot-scoped parse reject."""
+    evidence = "\n".join(
+        (snapshot_id, str(row_number), reason_code, safe_detail_sha256)
+    )
+    return hashlib.sha256(evidence.encode()).hexdigest()
 
 
 class SourceResource(BaseModel):
@@ -119,6 +140,58 @@ class SyncResult(BaseModel):
     events_written: int
     rejects_written: int
     warnings: list[str]
+
+
+class OutageEvidenceScopeV1(BaseModel):
+    """An explicit immutable snapshot set used by analytical queries."""
+
+    snapshot_ids: tuple[str, ...]
+    source_resource_ids: tuple[str, ...]
+    resolution: Literal["current_atomic_set", "explicit_snapshot_set"]
+
+
+class OutageFetchAttemptPublicV1(BaseModel):
+    """Safe public evidence for one resource fetch attempt."""
+
+    attempt_id: NonEmptyStr
+    run_id: NonEmptyStr
+    source_resource_id: NonEmptyStr
+    attempted_at: datetime
+    status: Literal["completed", "failed"]
+    response_status: int | None
+    source_modified_at: datetime | None
+    source_snapshot_id: str | None
+    content_sha256: str | None
+    byte_size: int | None
+    error_code: str | None
+
+    @field_validator("attempted_at", "source_modified_at")
+    @classmethod
+    def normalise_optional_timestamp_to_utc(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("fetch attempt timestamps must include a timezone")
+        return value.astimezone(timezone.utc)
+
+
+class SsenFetchManifestV1(BaseModel):
+    """Safe manifest for every attempted resource in one local sync run."""
+
+    schema_version: Literal[1] = 1
+    run_id: NonEmptyStr
+    source_contract_version: Literal["ssen-nafirs-hv-v1"]
+    attempted_at: datetime
+    attempts: tuple[OutageFetchAttemptPublicV1, ...]
+
+    @field_validator("attempted_at")
+    @classmethod
+    def normalise_attempted_at_to_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("attempted_at must include a timezone")
+        return value.astimezone(timezone.utc)
 
 
 class OutageSummary(BaseModel):

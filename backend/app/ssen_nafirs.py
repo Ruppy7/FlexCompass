@@ -17,7 +17,14 @@ import httpx
 from pydantic import ValidationError
 
 from app.catalogue_sync import redact
-from app.outages import LicenceArea, OutageEvent, SourceResource
+from app.outages import (
+    PARSER_VERSION as OUTAGE_PARSER_VERSION,
+)
+from app.outages import (
+    LicenceArea,
+    OutageEvent,
+    SourceResource,
+)
 from app.persistence_safety import (
     UNSAFE_VALUE_SENTINEL,
     UnsafePersistenceValueError,
@@ -26,6 +33,7 @@ from app.persistence_safety import (
 )
 
 SOURCE_DATASET_ID = "nafirs-hv-faults"
+PARSER_VERSION = OUTAGE_PARSER_VERSION
 PACKAGE_ID = "b0a58349-2ce6-4fa8-9238-a5564f966433"
 PACKAGE_SHOW_URL = (
     "https://data-api.ssen.co.uk/api/3/action/"
@@ -94,8 +102,17 @@ _INTEGER_SYNTAX = re.compile(r"[+-]?[0-9]+\Z")
 class SourceContractError(ValueError):
     """A fail-closed mismatch in public source metadata or schema."""
 
-    def __init__(self, message: str, *, observed: Any = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        observed: Any = None,
+        response_status: int | None = None,
+        error_code: str = "source_contract_error",
+    ) -> None:
         self.observed = redact(observed)
+        self.response_status = response_status
+        self.code = error_code
         suffix = (
             ""
             if observed is None

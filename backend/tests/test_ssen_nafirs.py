@@ -6,7 +6,10 @@ import csv
 import hashlib
 import io
 import json
+import shutil
 import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -15,15 +18,30 @@ from urllib.parse import quote
 import httpx
 import pytest
 from app.db import MIGRATIONS, get_connection, run_migrations
+from app.outage_cli import main as outage_cli_main
+from app.outage_source import (
+    SOURCE_CONNECT_TIMEOUT_SECONDS,
+    SOURCE_READ_TIMEOUT_SECONDS,
+    SourceLicenceEvidenceArtifactV1,
+    download_ssen_hv_resource,
+    load_ssen_source_manifest,
+    sync_ssen_nafirs_hv,
+)
 from app.outage_store import (
+    build_ssen_fetch_manifest,
     commit_ingestion_run,
     count_outage_events,
     count_source_snapshots,
+    current_outage_snapshot_ids,
     get_outage_event,
+    list_ingestion_run_snapshots,
+    list_outage_event_versions,
     list_outage_events,
     list_source_snapshots,
     record_failed_ingestion_run,
+    resolve_outage_evidence_scope,
     save_snapshot,
+    source_observation_exists,
     summarise_outage_events,
     upsert_outage_events,
 )
@@ -35,6 +53,8 @@ from app.outages import (
     SourceSnapshot,
     SourceSnapshotPublic,
     SyncResult,
+    outage_reject_id,
+    source_snapshot_id,
 )
 from app.persistence_safety import (
     MAX_CONTAINER_DEPTH,
@@ -1012,7 +1032,7 @@ def _event_with(
 def test_outage_schema_migrates_with_required_tables_and_indexes(
     temp_db: Path,
 ) -> None:
-    assert run_migrations(temp_db) == 6
+    assert run_migrations(temp_db) == 7
     with get_connection(temp_db) as connection:
         tables = {
             row[0]
@@ -1063,8 +1083,8 @@ def test_migration_six_upgrades_populated_version_five_without_data_loss(
         )
         connection.commit()
 
-    assert run_migrations(temp_db) == 6
-    assert run_migrations(temp_db) == 6
+    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == 7
     with get_connection(temp_db) as connection:
         row = connection.execute(
             "SELECT name FROM portal_datasets WHERE id = ?", ("legacy",)
@@ -1184,7 +1204,7 @@ def test_outage_and_snapshot_queries_reject_limits_outside_contract(
         list_source_snapshots(limit=limit, db_path=temp_db)
 
 
-def test_event_upsert_round_trips_json_and_updates_evidence(
+def test_event_version_helper_round_trips_json_and_rejects_mutation(
     temp_db: Path,
     source_snapshot: SourceSnapshot,
     parsed_event: OutageEvent,
@@ -1205,13 +1225,23 @@ def test_event_upsert_round_trips_json_and_updates_evidence(
     )
 
     assert upsert_outage_events([first], db_path=temp_db) == 1
-    assert upsert_outage_events([updated], db_path=temp_db) == 1
+    with pytest.raises(ValueError, match="immutable"):
+        upsert_outage_events([updated], db_path=temp_db)
 
-    rows = list_outage_events(db_path=temp_db)
+    snapshot_ids = (source_snapshot.snapshot_id,)
+    rows = list_outage_events(
+        source_snapshot_ids=snapshot_ids, db_path=temp_db
+    )
     assert len(rows) == 1
-    assert rows[0] == updated
-    assert get_outage_event(updated.event_id, db_path=temp_db) == updated
-    assert get_outage_event("missing", db_path=temp_db) is None
+    assert rows[0] == first
+    assert get_outage_event(
+        first.event_id,
+        db_path=temp_db,
+        source_snapshot_ids=snapshot_ids,
+    ) == first
+    assert get_outage_event(
+        "missing", db_path=temp_db, source_snapshot_ids=snapshot_ids
+    ) is None
 
 
 def test_event_queries_share_filters_and_have_deterministic_page_boundaries(
@@ -1246,26 +1276,35 @@ def test_event_queries_share_filters_and_have_deterministic_page_boundaries(
         ),
     ]
     upsert_outage_events(events, db_path=temp_db)
+    snapshot_ids = (source_snapshot.snapshot_id,)
 
     assert [item.event_id for item in list_outage_events(
-        limit=2, offset=0, db_path=temp_db
+        source_snapshot_ids=snapshot_ids, limit=2, offset=0, db_path=temp_db
     )] == ["event-a", "event-b"]
     assert [item.event_id for item in list_outage_events(
-        limit=2, offset=2, db_path=temp_db
+        source_snapshot_ids=snapshot_ids, limit=2, offset=2, db_path=temp_db
     )] == ["event-c"]
-    assert list_outage_events(limit=2, offset=3, db_path=temp_db) == []
-    assert list_outage_events(limit=2, offset=9, db_path=temp_db) == []
+    assert list_outage_events(
+        source_snapshot_ids=snapshot_ids, limit=2, offset=3, db_path=temp_db
+    ) == []
+    assert list_outage_events(
+        source_snapshot_ids=snapshot_ids, limit=2, offset=9, db_path=temp_db
+    ) == []
     filters = {
         "licence_area": "SHEPD",
         "district_short_code": "SWIN",
         "reporting_year": 2025,
         "cause_code": "11",
+        "source_snapshot_ids": snapshot_ids,
         "db_path": temp_db,
     }
     assert count_outage_events(**filters) == 1
     assert [item.event_id for item in list_outage_events(**filters)] == ["event-b"]
     assert summarise_outage_events(
-        licence_area="SHEPD", reporting_year=2025, db_path=temp_db
+        source_snapshot_ids=snapshot_ids,
+        licence_area="SHEPD",
+        reporting_year=2025,
+        db_path=temp_db,
     ).customers_affected_total == 220
 
 
@@ -1286,7 +1325,10 @@ def test_summary_preserves_all_null_sums(
     upsert_outage_events([event], db_path=temp_db)
 
     summary = summarise_outage_events(
-        licence_area="SEPD", reporting_year=2026, db_path=temp_db
+        source_snapshot_ids=(source_snapshot.snapshot_id,),
+        licence_area="SEPD",
+        reporting_year=2026,
+        db_path=temp_db,
     )
 
     assert summary == OutageSummary(
@@ -1333,11 +1375,12 @@ def test_commit_ingestion_run_is_one_atomic_transaction(
             "SELECT status FROM ingestion_runs WHERE run_id = ?", ("run:complete",)
         ).fetchone()
         reject_json = connection.execute(
-            "SELECT raw_row_json FROM outage_rejects"
+            "SELECT safe_detail_json FROM outage_reject_versions"
         ).fetchone()[0]
     assert run[0] == "completed"
     assert json.loads(reject_json) == {
-        "HV_INCIDENT_TIME": "not-a-date",
+        "error_message": "invalid local incident timestamp",
+        "raw_row": {"HV_INCIDENT_TIME": "not-a-date"},
     }
     assert marker not in reject_json
 
@@ -1410,7 +1453,8 @@ def test_failed_run_records_only_redacted_safe_failure_state(
     assert marker not in payload
     assert "X-Amz-Signature" not in payload
     assert count_source_snapshots(db_path=temp_db) == 0
-    assert count_outage_events(db_path=temp_db) == 0
+    with pytest.raises(ValueError, match="current atomic"):
+        count_outage_events(db_path=temp_db)
 
 
 def test_signed_r2_redirect_material_never_crosses_persistence_boundaries(
@@ -2216,3 +2260,1022 @@ def test_exact_safe_raw_record_round_trips_without_mutation(
 
     assert require_exact_safe_raw_record(sample_row) is None
     assert sample_row == before
+
+
+def ssen_resource(licence_area: LicenceArea) -> SourceResource:
+    resource_id = SEPD_RESOURCE_ID if licence_area == "SEPD" else SHEPD_RESOURCE_ID
+    name = f"NaFIRS HV Faults {licence_area} (CSV)"
+    url = (
+        "https://data-api.ssen.co.uk/dataset/"
+        "b0a58349-2ce6-4fa8-9238-a5564f966433/resource/"
+        f"{resource_id}/download/20260728_nafirs_hv_{licence_area.lower()}_csv.csv"
+    )
+    return SourceResource(
+        source_dataset_id="nafirs-hv-faults",
+        package_id="b0a58349-2ce6-4fa8-9238-a5564f966433",
+        source_resource_id=resource_id,
+        licence_area=licence_area,
+        name=name,
+        stable_url=url,
+        source_modified_at=datetime(2026, 7, 28, 6, 7, tzinfo=timezone.utc),
+        format="CSV",
+        media_type="text/csv",
+        datastore_active=True,
+        raw_record={
+            "id": resource_id,
+            "name": name,
+            "url": url,
+            "format": "CSV",
+            "mimetype": "text/csv",
+            "datastore_active": True,
+        },
+    )
+
+
+class TimedByteStream(httpx.SyncByteStream):
+    def __init__(
+        self,
+        chunks: list[bytes],
+        *,
+        tick: Any | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.tick = tick
+
+    def __iter__(self) -> Any:
+        for chunk in self.chunks:
+            if self.tick is not None:
+                self.tick()
+            yield chunk
+
+
+def response_client(
+    responses: list[httpx.Response],
+    requests: list[httpx.Request] | None = None,
+) -> httpx.Client:
+    queued = list(responses)
+    captured = requests if requests is not None else []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if not queued:
+            raise AssertionError("unexpected request")
+        return queued.pop(0)
+
+    return httpx.Client(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    )
+
+
+def redirect_for(resource_id: str, token: str = "secret") -> httpx.Response:
+    return httpx.Response(
+        302,
+        headers={
+            "location": (
+                "https://83025b28472d6aa2bf5ae59f3724aa78."
+                "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+                f"{resource_id}/sample.csv?X-Amz-Signature={token}"
+            )
+        },
+    )
+
+
+def csv_response(content: bytes, **headers: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=content,
+        headers={"content-type": "text/csv", **headers},
+    )
+
+
+def sync_client(
+    sepd: bytes,
+    shepd: bytes,
+    *,
+    token: str = "secret",
+    fail_resource_id: str | None = None,
+) -> httpx.Client:
+    payloads = {SEPD_RESOURCE_ID: sepd, SHEPD_RESOURCE_ID: shepd}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        resource_id = next(
+            item for item in payloads if f"/{item}/" in path
+        )
+        if request.url.host == "data-api.ssen.co.uk":
+            if resource_id == fail_resource_id:
+                return httpx.Response(503)
+            return redirect_for(resource_id, token)
+        return csv_response(payloads[resource_id])
+
+    return httpx.Client(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    )
+
+
+def first_csv_row_only(content: bytes) -> bytes:
+    rows = content.decode().splitlines()
+    return ("\n".join(rows[:2]) + "\n").encode()
+
+
+def csv_with_invalid_first_row(content: bytes) -> bytes:
+    rows = content.decode().splitlines()
+    values = rows[1].split(",")
+    values[1] = "not-a-year"
+    rows[1] = ",".join(values)
+    return ("\n".join(rows) + "\n").encode()
+
+
+def test_download_accepts_only_exact_one_hop_r2_redirect() -> None:
+    requests: list[httpx.Request] = []
+    with response_client(
+        [redirect_for(SEPD_RESOURCE_ID), csv_response(b"A,B\n1,2\n")],
+        requests,
+    ) as client:
+        assert download_ssen_hv_resource(client, ssen_resource("SEPD")) == (
+            b"A,B\n1,2\n"
+        )
+    assert [request.method for request in requests] == ["GET", "GET"]
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com/x",
+        "https://127.0.0.1/x",
+        "https://example.test/x",
+        "/relative",
+    ],
+)
+def test_download_rejects_unapproved_redirects(location: str) -> None:
+    with response_client(
+        [httpx.Response(302, headers={"location": location})]
+    ) as client:
+        with pytest.raises(SourceContractError):
+            download_ssen_hv_resource(client, ssen_resource("SEPD"))
+
+
+def test_download_rejects_second_redirect_without_following() -> None:
+    requests: list[httpx.Request] = []
+    with response_client(
+        [redirect_for(SEPD_RESOURCE_ID), redirect_for(SEPD_RESOURCE_ID)],
+        requests,
+    ) as client:
+        with pytest.raises(SourceContractError):
+            download_ssen_hv_resource(client, ssen_resource("SEPD"))
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("size", "accepted"),
+    [(7, True), (8, True), (9, False)],
+)
+def test_download_stream_size_boundaries_at_limit_minus_one_limit_and_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    accepted: bool,
+) -> None:
+    monkeypatch.setattr("app.outage_source.SOURCE_MAX_RESPONSE_BYTES", 8)
+    with response_client(
+        [redirect_for(SEPD_RESOURCE_ID), csv_response(b"x" * size)]
+    ) as client:
+        if accepted:
+            assert len(download_ssen_hv_resource(client, ssen_resource("SEPD"))) == size
+        else:
+            with pytest.raises(SourceContractError):
+                download_ssen_hv_resource(client, ssen_resource("SEPD"))
+
+
+def test_download_rejects_oversize_content_length_before_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.outage_source.SOURCE_MAX_RESPONSE_BYTES", 8)
+    stream = TimedByteStream([b"must-not-be-read"])
+    final = httpx.Response(
+        200,
+        headers={"content-type": "text/csv", "content-length": "9"},
+        stream=stream,
+    )
+    with response_client([redirect_for(SEPD_RESOURCE_ID), final]) as client:
+        with pytest.raises(SourceContractError):
+            download_ssen_hv_resource(client, ssen_resource("SEPD"))
+
+
+def test_download_uses_exact_connect_and_read_timeouts() -> None:
+    requests: list[httpx.Request] = []
+    with response_client(
+        [redirect_for(SEPD_RESOURCE_ID), csv_response(b"x")], requests
+    ) as client:
+        download_ssen_hv_resource(client, ssen_resource("SEPD"))
+    for request in requests:
+        timeout = request.extensions["timeout"]
+        assert timeout["connect"] == SOURCE_CONNECT_TIMEOUT_SECONDS
+        assert timeout["read"] == SOURCE_READ_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "accepted"),
+    [(179.999, True), (180.0, False), (180.001, False)],
+)
+def test_download_enforces_total_deadline_across_redirects_and_slow_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    elapsed: float,
+    accepted: bool,
+) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr("app.outage_source.time.monotonic", lambda: clock["now"])
+    final = httpx.Response(
+        200,
+        headers={"content-type": "text/csv"},
+        stream=TimedByteStream([b"x"], tick=lambda: clock.update(now=elapsed)),
+    )
+    with response_client([redirect_for(SEPD_RESOURCE_ID), final]) as client:
+        if accepted:
+            assert download_ssen_hv_resource(client, ssen_resource("SEPD")) == b"x"
+        else:
+            with pytest.raises(SourceContractError, match="deadline"):
+                download_ssen_hv_resource(client, ssen_resource("SEPD"))
+
+
+def _install_schema_through_six(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as connection:
+        for version, ddl in MIGRATIONS[:6]:
+            connection.executescript(ddl)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
+        connection.commit()
+
+
+def test_migration_seven_adds_immutable_snapshot_version_tables(temp_db: Path) -> None:
+    assert run_migrations(temp_db) == 7
+    with get_connection(temp_db) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert {
+        "outage_content_blobs",
+        "outage_source_observations",
+        "outage_event_versions",
+        "outage_reject_versions",
+        "current_outage_snapshots",
+        "ingestion_run_snapshots",
+        "outage_fetch_attempts",
+    } <= tables
+
+
+def test_migration_seven_backfills_legacy_rows_without_inventing_current_state(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    _install_schema_through_six(temp_db)
+    with sqlite3.connect(temp_db) as connection:
+        connection.execute(
+            """INSERT INTO source_snapshots VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source_snapshot.snapshot_id,
+                source_snapshot.source_dataset_id,
+                source_snapshot.package_id,
+                source_snapshot.source_resource_id,
+                source_snapshot.licence_area,
+                source_snapshot.stable_source_url,
+                source_snapshot.source_modified_at,
+                source_snapshot.fetched_at.isoformat(),
+                source_snapshot.content_sha256,
+                source_snapshot.byte_size,
+                source_snapshot.row_count,
+                json.dumps(source_snapshot.observed_columns),
+                source_snapshot.licence_id,
+                source_snapshot.licence_title,
+                source_snapshot.licence_url,
+                source_snapshot.attribution,
+                source_snapshot.parser_version,
+                source_snapshot.local_snapshot_path,
+            ),
+        )
+        values = parsed_event.model_dump()
+        values["quality_flags"] = json.dumps(values["quality_flags"])
+        values["raw_record"] = json.dumps(values["raw_record"])
+        columns = [
+            "quality_flags_json" if item == "quality_flags" else
+            "raw_record_json" if item == "raw_record" else item
+            for item in OutageEvent.model_fields
+        ]
+        connection.execute(
+            f"INSERT INTO outage_events ({','.join(columns)}) VALUES "
+            f"({','.join('?' for _ in columns)})",
+            tuple(values[item] for item in OutageEvent.model_fields),
+        )
+        connection.commit()
+
+    assert run_migrations(temp_db) == 7
+    with get_connection(temp_db) as connection:
+        observation = connection.execute(
+            "SELECT snapshot_id FROM outage_source_observations"
+        ).fetchone()
+        blob = connection.execute(
+            "SELECT available, relative_snapshot_path FROM outage_content_blobs"
+        ).fetchone()
+        current = connection.execute(
+            "SELECT COUNT(*) FROM current_outage_snapshots"
+        ).fetchone()[0]
+    assert observation[0] == source_snapshot_id(SEPD_RESOURCE_ID, "abc")
+    assert tuple(blob) == (0, None)
+    assert current == 0
+
+
+def test_migration_seven_rejects_conflicting_legacy_snapshot_identity(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+) -> None:
+    _install_schema_through_six(temp_db)
+    base = (
+        source_snapshot.source_dataset_id,
+        source_snapshot.package_id,
+        source_snapshot.source_resource_id,
+        source_snapshot.licence_area,
+        source_snapshot.stable_source_url,
+        source_snapshot.source_modified_at,
+        source_snapshot.fetched_at.isoformat(),
+        source_snapshot.content_sha256,
+        source_snapshot.byte_size,
+        source_snapshot.row_count,
+        json.dumps(source_snapshot.observed_columns),
+        source_snapshot.licence_id,
+        source_snapshot.licence_title,
+        source_snapshot.licence_url,
+        source_snapshot.attribution,
+        source_snapshot.parser_version,
+        source_snapshot.local_snapshot_path,
+    )
+    conflicting = list(base)
+    conflicting[11] = "different-licence"
+    with sqlite3.connect(temp_db) as connection:
+        connection.executemany(
+            """INSERT INTO source_snapshots VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                ("legacy:first", *base),
+                ("legacy:second", *conflicting),
+            ],
+        )
+        connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        run_migrations(temp_db)
+
+    with sqlite3.connect(temp_db) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM schema_version WHERE version=7"
+        ).fetchone()[0] == 0
+
+
+def test_sync_records_two_snapshots_events_and_rejects_atomically(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(
+        csv_with_invalid_first_row(sepd_csv_bytes), shepd_csv_bytes
+    ) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    assert result.status == "completed"
+    assert result.resources_seen == 2
+    assert result.rejects_written == 1
+    assert len(list_ingestion_run_snapshots(result.run_id, db_path=temp_db)) == 2
+    assert len(current_outage_snapshot_ids(db_path=temp_db)) == 2
+
+
+def test_reject_versions_are_snapshot_scoped_and_stable_across_identical_fetches(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    sepd = csv_with_invalid_first_row(sepd_csv_bytes)
+    results = []
+    for _ in range(2):
+        with sync_client(sepd, shepd_csv_bytes) as client:
+            results.append(sync_ssen_nafirs_hv(
+                db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+            ))
+    with get_connection(temp_db) as connection:
+        rejects = connection.execute(
+            "SELECT snapshot_id, reject_id, reject_sha256 FROM outage_reject_versions"
+        ).fetchall()
+    assert len(rejects) == 1
+    assert results[0].rejects_written == results[1].rejects_written == 1
+
+
+def test_bootstrap_reparse_recreates_exact_reject_ids_and_hashes() -> None:
+    detail = json.dumps(
+        {"error_message": "invalid", "raw_row": {"value": "bad"}},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    detail_hash = hashlib.sha256(detail.encode()).hexdigest()
+    first = outage_reject_id("snapshot", 2, "invalid_row", detail_hash)
+    second = outage_reject_id("snapshot", 2, "invalid_row", detail_hash)
+    assert first == second
+
+
+def test_completed_run_persists_exact_snapshot_associations(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    run_ids = tuple(
+        item.snapshot_id
+        for item in list_ingestion_run_snapshots(result.run_id, db_path=temp_db)
+    )
+    assert run_ids == current_outage_snapshot_ids(db_path=temp_db)
+
+
+def test_sync_reuses_identical_content_without_rewriting_snapshot(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        first = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    mtimes = {path: path.stat().st_mtime_ns for path in snapshot_dir.rglob("*.csv")}
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        second = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    assert first.snapshots_created == 2
+    assert second.snapshots_reused == 2
+    assert mtimes == {path: path.stat().st_mtime_ns for path in mtimes}
+
+
+def test_same_content_in_two_resources_has_distinct_source_snapshot_ids() -> None:
+    digest = "a" * 64
+    assert source_snapshot_id(SEPD_RESOURCE_ID, digest) != source_snapshot_id(
+        SHEPD_RESOURCE_ID, digest
+    )
+
+
+def test_source_observation_existence_is_an_exact_identity_lookup(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+) -> None:
+    save_snapshot(source_snapshot, db_path=temp_db)
+
+    assert source_observation_exists(
+        source_snapshot.snapshot_id, db_path=temp_db
+    ) is True
+    assert source_observation_exists("missing", db_path=temp_db) is False
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["licence_title", "row_count", "observed_columns_json", "stable_source_url"],
+)
+def test_snapshot_reuse_validates_every_immutable_field(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+    field: str,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    snapshot_id = current_outage_snapshot_ids(db_path=temp_db)[0]
+    with get_connection(temp_db) as connection:
+        connection.execute(
+            f"UPDATE outage_source_observations SET {field} = ? WHERE snapshot_id = ?",
+            ("corrupt" if field != "row_count" else 999, snapshot_id),
+        )
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    assert result.status == "failed"
+
+
+def test_snapshot_reuse_ignores_later_fetch_and_source_modified_times(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        first = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        second = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    assert first.run_id != second.run_id
+    assert second.snapshots_reused == 2
+
+
+def test_snapshot_reuse_cannot_add_to_an_empty_immutable_materialisation(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    commit_ingestion_run(
+        run_id="run:empty-materialisation",
+        resources_seen=1,
+        snapshots=[source_snapshot],
+        events=[],
+        rejects=[],
+        snapshots_created=1,
+        snapshots_reused=0,
+        warnings=[],
+        db_path=temp_db,
+    )
+
+    with pytest.raises(ValueError, match="immutable"):
+        commit_ingestion_run(
+            run_id="run:mutated-materialisation",
+            resources_seen=1,
+            snapshots=[source_snapshot],
+            events=[parsed_event],
+            rejects=[],
+            snapshots_created=0,
+            snapshots_reused=1,
+            warnings=[],
+            db_path=temp_db,
+        )
+
+
+def test_changed_parser_or_canonical_schema_cannot_overwrite_v1_materialization(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    snapshot_id = current_outage_snapshot_ids(db_path=temp_db)[0]
+    with get_connection(temp_db) as connection:
+        connection.execute(
+            "UPDATE outage_source_observations SET parser_version='v2' "
+            "WHERE snapshot_id=?",
+            (snapshot_id,),
+        )
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        assert sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        ).status == "failed"
+
+
+def test_unavailable_legacy_blob_becomes_available_only_after_hash_verification(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    _install_schema_through_six(temp_db)
+    resource = ssen_resource("SEPD")
+    digest = hashlib.sha256(sepd_csv_bytes).hexdigest()
+    legacy_snapshot = SourceSnapshot(
+        snapshot_id="legacy:sepd",
+        source_dataset_id=resource.source_dataset_id,
+        package_id=resource.package_id,
+        source_resource_id=resource.source_resource_id,
+        licence_area=resource.licence_area,
+        stable_source_url=resource.stable_url,
+        source_modified_at=None,
+        fetched_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        content_sha256=digest,
+        byte_size=len(sepd_csv_bytes),
+        row_count=2,
+        observed_columns=list(SEPD_COLUMNS),
+        licence_id="CC-BY-4.0",
+        licence_title="Creative Commons Attribution 4.0",
+        licence_url="https://creativecommons.org/licenses/by/4.0/",
+        attribution="SSEN Distribution",
+        parser_version="ssen-nafirs-hv-v1",
+        local_snapshot_path="C:/legacy/untrusted.csv",
+    )
+    with sqlite3.connect(temp_db) as connection:
+        connection.execute(
+            """INSERT INTO source_snapshots VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                legacy_snapshot.snapshot_id,
+                legacy_snapshot.source_dataset_id,
+                legacy_snapshot.package_id,
+                legacy_snapshot.source_resource_id,
+                legacy_snapshot.licence_area,
+                legacy_snapshot.stable_source_url,
+                None,
+                legacy_snapshot.fetched_at.isoformat(),
+                legacy_snapshot.content_sha256,
+                legacy_snapshot.byte_size,
+                legacy_snapshot.row_count,
+                json.dumps(legacy_snapshot.observed_columns),
+                legacy_snapshot.licence_id,
+                legacy_snapshot.licence_title,
+                legacy_snapshot.licence_url,
+                legacy_snapshot.attribution,
+                legacy_snapshot.parser_version,
+                legacy_snapshot.local_snapshot_path,
+            ),
+        )
+        connection.commit()
+    assert run_migrations(temp_db) == 7
+
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db,
+            snapshot_dir=tmp_path / "snapshots",
+            client=client,
+        )
+
+    assert result.status == "completed"
+    with get_connection(temp_db) as connection:
+        blob = connection.execute(
+            """SELECT available, relative_snapshot_path
+               FROM outage_content_blobs WHERE content_sha256=?""",
+            (digest,),
+        ).fetchone()
+    assert blob[0] == 1
+    assert blob[1] == f"blobs/{digest[:2]}/{digest}.csv"
+
+
+def test_repeated_fetch_records_attempt_without_mutating_snapshot(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    for _ in range(2):
+        with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+            sync_ssen_nafirs_hv(
+                db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+            )
+    with get_connection(temp_db) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM outage_source_observations"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM outage_fetch_attempts"
+        ).fetchone()[0] == 4
+
+
+def test_fetch_manifest_is_complete_safe_and_contains_no_request_query(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes, token="TOPSECRET") as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    manifest = build_ssen_fetch_manifest(result.run_id, db_path=temp_db)
+    text = manifest.model_dump_json()
+    assert len(manifest.attempts) == 2
+    assert "TOPSECRET" not in text
+    assert "X-Amz" not in text
+
+
+def test_changed_event_is_versioned_in_both_old_and_new_snapshots(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        first = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    changed_rows = list(csv.reader(io.StringIO(sepd_csv_bytes.decode())))
+    customers_index = changed_rows[0].index("HV_CUST_AFF")
+    changed_rows[1][customers_index] = "4"
+    changed_stream = io.StringIO(newline="")
+    csv.writer(changed_stream, lineterminator="\n").writerows(changed_rows)
+    changed = changed_stream.getvalue().encode()
+    with sync_client(changed, shepd_csv_bytes) as client:
+        second = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    old_ids = tuple(item.snapshot_id for item in list_ingestion_run_snapshots(
+        first.run_id, db_path=temp_db
+    ))
+    new_ids = tuple(item.snapshot_id for item in list_ingestion_run_snapshots(
+        second.run_id, db_path=temp_db
+    ))
+    old = {item.event_id: item for item in list_outage_event_versions(old_ids, db_path=temp_db)}
+    new = {item.event_id: item for item in list_outage_event_versions(new_ids, db_path=temp_db)}
+    common = set(old) & set(new)
+    assert common
+    assert any(old[item].customers_affected != new[item].customers_affected for item in common)
+
+
+def test_removed_event_disappears_from_current_but_remains_in_old_snapshot(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        first = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    old_ids = tuple(item.snapshot_id for item in list_ingestion_run_snapshots(
+        first.run_id, db_path=temp_db
+    ))
+    with sync_client(first_csv_row_only(sepd_csv_bytes), shepd_csv_bytes) as client:
+        sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    old_events = list_outage_event_versions(old_ids, db_path=temp_db)
+    current = resolve_outage_evidence_scope(db_path=temp_db)
+    current_events = list_outage_event_versions(current.snapshot_ids, db_path=temp_db)
+    assert len(old_events) == len(current_events) + 1
+
+
+def test_old_manifest_snapshot_set_replays_after_later_sync(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        first = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    old = tuple(item.snapshot_id for item in list_ingestion_run_snapshots(
+        first.run_id, db_path=temp_db
+    ))
+    before = [item.model_dump() for item in list_outage_event_versions(old, db_path=temp_db)]
+    with sync_client(first_csv_row_only(sepd_csv_bytes), shepd_csv_bytes) as client:
+        sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    assert before == [item.model_dump() for item in list_outage_event_versions(old, db_path=temp_db)]
+
+
+def test_current_snapshot_pointer_advances_for_both_resources_atomically(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        first = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    old = current_outage_snapshot_ids(db_path=temp_db)
+    with sync_client(first_csv_row_only(sepd_csv_bytes), shepd_csv_bytes) as client:
+        second = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    new = current_outage_snapshot_ids(db_path=temp_db)
+    assert old != new
+    with get_connection(temp_db) as connection:
+        assert {row[0] for row in connection.execute(
+            "SELECT run_id FROM current_outage_snapshots"
+        )} == {second.run_id}
+    assert first.run_id != second.run_id
+
+
+def test_sync_cleans_first_snapshot_when_second_download_fails(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    with sync_client(
+        sepd_csv_bytes,
+        shepd_csv_bytes,
+        fail_resource_id=SEPD_RESOURCE_ID,
+    ) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    assert result.status == "failed"
+    assert list(snapshot_dir.rglob("*.csv")) == []
+
+
+def test_sync_cleans_new_files_but_preserves_preexisting_snapshot(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    before = {path: path.read_bytes() for path in snapshot_dir.rglob("*.csv")}
+    with sync_client(
+        sepd_csv_bytes,
+        shepd_csv_bytes,
+        fail_resource_id=SEPD_RESOURCE_ID,
+    ) as client:
+        sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    assert before == {path: path.read_bytes() for path in before}
+
+
+def test_sync_persistence_failure_leaves_only_one_failed_run(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    monkeypatch.setattr(
+        "app.outage_source.commit_ingestion_run",
+        lambda **_: (_ for _ in ()).throw(sqlite3.OperationalError("synthetic")),
+    )
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=tmp_path / "snapshots", client=client
+        )
+    with get_connection(temp_db) as connection:
+        runs = connection.execute(
+            "SELECT run_id, status FROM ingestion_runs"
+        ).fetchall()
+    assert [tuple(row) for row in runs] == [(result.run_id, "failed")]
+
+
+def test_sync_signed_target_never_crosses_output_log_file_or_sqlite(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "SYNTHETIC_SIGNED_TARGET_MUST_NOT_PERSIST"
+    snapshot_dir = tmp_path / "snapshots"
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes, token=marker) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db, snapshot_dir=snapshot_dir, client=client
+        )
+    with get_connection(temp_db) as connection:
+        sqlite_text = "\n".join(connection.iterdump())
+    output = result.model_dump_json() + caplog.text + sqlite_text
+    output += "".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in snapshot_dir.rglob("*")
+        if path.is_file()
+    )
+    assert marker not in output
+    assert "X-Amz-Signature" not in output
+
+
+def test_source_manifest_matches_exact_reviewed_contract() -> None:
+    manifest = load_ssen_source_manifest()
+    assert manifest.source_dataset_id == "nafirs-hv-faults"
+    assert manifest.package_id == "b0a58349-2ce6-4fa8-9238-a5564f966433"
+    assert manifest.request_method == "GET"
+    assert manifest.timezone_name is None
+    assert manifest.publisher_cadence is None
+    assert {item.source_resource_id for item in manifest.resources} == {
+        SEPD_RESOURCE_ID,
+        SHEPD_RESOURCE_ID,
+    }
+
+
+def test_source_manifest_explicitly_permits_attributed_source_byte_redistribution() -> None:
+    manifest = load_ssen_source_manifest()
+    assert manifest.source_byte_redistribution == "permitted_with_attribution"
+    assert manifest.licence_evidence.source_byte_redistribution == (
+        "permitted_with_attribution"
+    )
+
+
+def test_source_manifest_binds_exact_licence_evidence_hash_and_observation() -> None:
+    evidence = load_ssen_source_manifest().licence_evidence
+    assert evidence.catalogue_observation_id == (
+        "ssen:725a8a6de949f32e6b5680e04fc447f8e80814ed7412f26129fca75c9014d6a7"
+    )
+    assert evidence.catalogue_observation_content_sha256 == (
+        "592181ea19d3d8550539441a8674179488cc2409b0b970307fb883ebdf6eecae"
+    )
+    assert evidence.observed_at == datetime(
+        2026, 7, 31, 10, 6, 47, 336819, tzinfo=timezone.utc
+    )
+
+
+def test_source_manifest_verifies_hash_addressed_licence_evidence_artifact() -> None:
+    manifest = load_ssen_source_manifest()
+    artifact_path = Path(manifest.licence_evidence.evidence_artifact_path)
+    artifact_bytes = artifact_path.read_bytes()
+    assert artifact_bytes.endswith(b"\n")
+    assert not artifact_bytes.endswith(b"\n\n")
+    assert hashlib.sha256(artifact_bytes).hexdigest() == (
+        manifest.licence_evidence.evidence_artifact_sha256
+    )
+    assert SourceLicenceEvidenceArtifactV1.model_validate_json(
+        artifact_bytes
+    ).model_dump(mode="json") == {
+        key: value
+        for key, value in manifest.licence_evidence.model_dump(mode="json").items()
+        if key not in {"evidence_artifact_path", "evidence_artifact_sha256", "evidence_sha256"}
+    }
+
+
+def test_licence_evidence_git_materialisation_preserves_exact_lf_bytes(
+    tmp_path: Path,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    source_artifact = (
+        repository_root / "data/sources/evidence/ssen-nafirs-hv-licence.json"
+    )
+    source_attributes = repository_root / ".gitattributes"
+    isolated = tmp_path / "git-materialisation"
+    artifact = isolated / "data/sources/evidence/ssen-nafirs-hv-licence.json"
+    artifact.parent.mkdir(parents=True)
+    shutil.copy2(source_artifact, artifact)
+    shutil.copy2(source_attributes, isolated / ".gitattributes")
+    expected = source_artifact.read_bytes()
+
+    subprocess.run(["git", "init", "-q"], cwd=isolated, check=True)
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "true"], cwd=isolated, check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "--",
+            ".gitattributes",
+            "data/sources/evidence/ssen-nafirs-hv-licence.json",
+        ],
+        cwd=isolated,
+        check=True,
+    )
+    artifact.unlink()
+    subprocess.run(
+        [
+            "git",
+            "checkout-index",
+            "-f",
+            "--",
+            "data/sources/evidence/ssen-nafirs-hv-licence.json",
+        ],
+        cwd=isolated,
+        check=True,
+    )
+
+    materialised = artifact.read_bytes()
+    assert materialised == expected
+    assert materialised.endswith(b"\n")
+    assert b"\r" not in materialised
+    assert hashlib.sha256(materialised).hexdigest() == (
+        "1b169f3a400a5b6c17962d8a6ad1d27b897c9fa231d3b880bd6a269c54528f68"
+    )
+
+
+def test_outage_cli_exposes_only_local_sync(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as caught:
+        outage_cli_main(["--help"])
+    output = capsys.readouterr().out
+    assert caught.value.code == 0
+    assert "sync" in output
+    assert "ssen-nafirs-hv" in output
+    for forbidden in ("bid", "dispatch", "login", "oauth", "write"):
+        assert forbidden not in output.lower()
+
+
+def test_outage_cli_help_runs_as_module() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "app.outage_cli", "--help"],
+        env={**dict(__import__("os").environ), "PYTHONPATH": "backend"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "sync" in completed.stdout
+    assert "ssen-nafirs-hv" in completed.stdout
+    current_outage_snapshot_ids,
+    list_ingestion_run_snapshots,
+    list_outage_event_versions,

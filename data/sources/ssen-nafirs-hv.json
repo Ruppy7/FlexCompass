@@ -1,0 +1,96 @@
+{
+  "analytical_role": "historical_hv_outage_evidence",
+  "attribution": "SSEN Distribution",
+  "connect_timeout_seconds": 10,
+  "licence_evidence": {
+    "attribution": "SSEN Distribution",
+    "catalogue_observation_content_sha256": "592181ea19d3d8550539441a8674179488cc2409b0b970307fb883ebdf6eecae",
+    "catalogue_observation_id": "ssen:725a8a6de949f32e6b5680e04fc447f8e80814ed7412f26129fca75c9014d6a7",
+    "evidence_artifact_path": "data/sources/evidence/ssen-nafirs-hv-licence.json",
+    "evidence_artifact_sha256": "1b169f3a400a5b6c17962d8a6ad1d27b897c9fa231d3b880bd6a269c54528f68",
+    "evidence_sha256": "80df5d8f736b052d24c824350bfd4106ef2b239c55bbd6e929eb2f6e184aa9a9",
+    "evidence_url": "https://data.ssen.co.uk/dataset/nafirs-hv-faults",
+    "licence_id": "CC-BY-4.0",
+    "licence_title": "Creative Commons Attribution 4.0",
+    "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+    "observed_at": "2026-07-31T10:06:47.336819+00:00",
+    "package_id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+    "portal_id": "ssen",
+    "schema_version": 1,
+    "source_byte_redistribution": "permitted_with_attribution",
+    "source_dataset_id": "nafirs-hv-faults",
+    "source_resource_ids": [
+      "673578c9-f531-41a5-a17c-0b35bc0fae4c",
+      "ab32515f-76f2-421d-8034-7d5b01325a33"
+    ]
+  },
+  "licence_id": "CC-BY-4.0",
+  "licence_title": "Creative Commons Attribution 4.0",
+  "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+  "limitations": [
+    "Historical HV outage evidence only; not a real-time operational status feed.",
+    "Publisher timezone for local incident timestamps is unknown.",
+    "Publisher cadence is intentionally unasserted in this source contract.",
+    "Not for bidding, dispatch, asset control, settlement, or commercial advice."
+  ],
+  "max_response_bytes": 134217728,
+  "package_id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+  "publisher_cadence": null,
+  "read_timeout_seconds": 60,
+  "redirect_host": "83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com",
+  "redirect_path_prefix": "/dx-sse-prod/resources/",
+  "request_method": "GET",
+  "resources": [
+    {
+      "datastore_active": true,
+      "format": "CSV",
+      "licence_area": "SHEPD",
+      "media_type": "text/csv",
+      "name": "NaFIRS HV Faults SHEPD (CSV)",
+      "package_id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+      "raw_record": {
+        "datastore_active": true,
+        "format": "CSV",
+        "id": "673578c9-f531-41a5-a17c-0b35bc0fae4c",
+        "last_modified": "2026-07-28T06:07:44.657353",
+        "mimetype": "text/csv",
+        "name": "NaFIRS HV Faults SHEPD (CSV)",
+        "package_id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+        "url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/673578c9-f531-41a5-a17c-0b35bc0fae4c/download/20260728_nafirs_hv_shepd_csv.csv"
+      },
+      "source_dataset_id": "nafirs-hv-faults",
+      "source_modified_at": null,
+      "source_resource_id": "673578c9-f531-41a5-a17c-0b35bc0fae4c",
+      "stable_url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/673578c9-f531-41a5-a17c-0b35bc0fae4c/download/20260728_nafirs_hv_shepd_csv.csv"
+    },
+    {
+      "datastore_active": true,
+      "format": "CSV",
+      "licence_area": "SEPD",
+      "media_type": "text/csv",
+      "name": "NaFIRS HV Faults SEPD (CSV)",
+      "package_id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+      "raw_record": {
+        "datastore_active": true,
+        "format": "CSV",
+        "id": "ab32515f-76f2-421d-8034-7d5b01325a33",
+        "last_modified": "2026-07-28T06:07:34.107076",
+        "mimetype": "text/csv",
+        "name": "NaFIRS HV Faults SEPD (CSV)",
+        "package_id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+        "url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/ab32515f-76f2-421d-8034-7d5b01325a33/download/20260728_nafirs_hv_sepd_csv.csv"
+      },
+      "source_dataset_id": "nafirs-hv-faults",
+      "source_modified_at": null,
+      "source_resource_id": "ab32515f-76f2-421d-8034-7d5b01325a33",
+      "stable_url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/ab32515f-76f2-421d-8034-7d5b01325a33/download/20260728_nafirs_hv_sepd_csv.csv"
+    }
+  ],
+  "schema_version": 1,
+  "source_byte_redistribution": "permitted_with_attribution",
+  "source_contract_version": "ssen-nafirs-hv-v1",
+  "source_dataset_id": "nafirs-hv-faults",
+  "source_id": "ssen-nafirs-hv",
+  "timezone_name": null,
+  "total_deadline_seconds": 180
+}
