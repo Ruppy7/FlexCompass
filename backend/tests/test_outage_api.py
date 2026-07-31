@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 MIGRATION_MESSAGE = "Outage API moved to /api/v1/outages."
 DATASET_ID = "nafirs-hv-faults"
 PACKAGE_ID = "nafirs-hv-faults"
+ALLOWED_ORIGIN = "http://localhost:3000"
 
 
 def _snapshot(
@@ -518,6 +519,75 @@ def test_outage_openapi_contains_no_write_method(client: TestClient) -> None:
         "/api/v1/outages/snapshots",
     ):
         assert set(paths[path]) == {"get"}
+
+
+@pytest.mark.parametrize("requested_method", ["GET", "POST", "DELETE"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/outages/events",
+        "/api/v1/outages/summary",
+        "/api/v1/outages/events/event-1",
+        "/api/v1/outages/snapshots",
+    ],
+)
+def test_versioned_outage_preflight_preserves_fixed_405(
+    client: TestClient,
+    path: str,
+    requested_method: str,
+) -> None:
+    response = client.options(
+        path,
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": requested_method,
+        },
+    )
+    assert response.status_code == 405
+    assert response.json() == {"detail": "Request failed", "code": "http_error"}
+    assert "access-control-allow-methods" not in response.headers
+
+
+@pytest.mark.parametrize("requested_method", ["GET", "POST", "DELETE"])
+@pytest.mark.parametrize(
+    "path", ["/api/outages", "/api/outage-snapshots"]
+)
+def test_legacy_outage_preflight_preserves_fixed_410(
+    client: TestClient,
+    path: str,
+    requested_method: str,
+) -> None:
+    response = client.options(
+        path,
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": requested_method,
+        },
+    )
+    assert response.status_code == 410
+    assert response.json() == {"detail": MIGRATION_MESSAGE}
+    assert "access-control-allow-methods" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("path", "requested_method"),
+    [("/api/health", "GET"), ("/api/demo/analyse", "POST")],
+)
+def test_non_outage_preflight_keeps_global_cors_behavior(
+    client: TestClient,
+    path: str,
+    requested_method: str,
+) -> None:
+    response = client.options(
+        path,
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": requested_method,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == ALLOWED_ORIGIN
+    assert requested_method in response.headers["access-control-allow-methods"]
 
 
 def test_root_info_lists_the_versioned_outage_get_surface(client: TestClient) -> None:
