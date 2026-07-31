@@ -49,6 +49,7 @@ SOURCE_MAX_RESPONSE_BYTES = 134_217_728
 SOURCE_CONNECT_TIMEOUT_SECONDS = 10
 SOURCE_READ_TIMEOUT_SECONDS = 60
 SOURCE_TOTAL_DEADLINE_SECONDS = 180
+PROCESS_CLEANUP_GRACE_SECONDS = 0.25
 _REDIRECT_HOST = (
     "83025b28472d6aa2bf5ae59f3724aa78.r2.cloudflarestorage.com"
 )
@@ -124,6 +125,13 @@ def _remaining_timeout(deadline: float, maximum: float) -> float:
             error_code="total_deadline_exceeded",
         )
     return min(maximum, remaining)
+
+
+def _total_deadline_error() -> SourceContractError:
+    return SourceContractError(
+        "SSEN resource total deadline exceeded",
+        error_code="total_deadline_exceeded",
+    )
 
 
 def _create_https_connection(
@@ -294,6 +302,7 @@ def _download_resource_in_child(
                 error_code="unexpected_media_type",
             )
         declared = second.getheader("content-length")
+        declared_size: int | None = None
         if declared is not None:
             try:
                 declared_size = int(declared, 10)
@@ -334,6 +343,11 @@ def _download_resource_in_child(
                     error_code="response_size_exceeded",
                 )
             chunks.append(chunk)
+        if declared_size is not None and total != declared_size:
+            raise SourceContractError(
+                "SSEN resource content length is invalid",
+                error_code="invalid_content_length",
+            )
     finally:
         second.close()
         second_connection.close()
@@ -344,9 +358,14 @@ def _ssen_download_process_worker(
     send_connection: Connection,
     resource_payload: dict[str, Any],
     deadline: float,
+    connection_factory: ConnectionFactory | None = None,
 ) -> None:
     try:
-        content = _download_resource_in_child(resource_payload, deadline)
+        content = _download_resource_in_child(
+            resource_payload,
+            deadline,
+            connection_factory=connection_factory,
+        )
     except SourceContractError as error:
         error_id = _PROCESS_ERROR_IDS.get(
             error.code,
@@ -372,10 +391,19 @@ def _safe_process_entry(
     send_connection: Connection,
     resource_payload: dict[str, Any],
     deadline: float,
+    connection_factory: ConnectionFactory | None,
 ) -> None:
     """Run an importable child target without reflecting child exception state."""
     try:
-        worker_target(send_connection, resource_payload, deadline)
+        if connection_factory is None:
+            worker_target(send_connection, resource_payload, deadline)
+        else:
+            _ssen_download_process_worker(
+                send_connection,
+                resource_payload,
+                deadline,
+                connection_factory,
+            )
     except BaseException:
         try:
             send_connection.send_bytes(
@@ -392,34 +420,60 @@ def _safe_process_entry(
 
 
 def _terminate_and_join(process: multiprocessing.Process) -> None:
+    cleanup_deadline = time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS
     if process.is_alive():
         process.terminate()
-        process.join(1)
+        process.join(
+            min(
+                PROCESS_CLEANUP_GRACE_SECONDS / 2,
+                max(0.0, cleanup_deadline - time.monotonic()),
+            )
+        )
     if process.is_alive():
         process.kill()
-        process.join()
-    elif process.exitcode is None:
-        process.join()
+        process.join(max(0.0, cleanup_deadline - time.monotonic()))
+    else:
+        process.join(0)
+    if process.is_alive():
+        raise SourceContractError(
+            "SSEN resource worker cleanup failed",
+            error_code="worker_cleanup_failed",
+        )
 
 
 class OwnedProcessSsenTransport:
-    """Spawn-owned hard-deadline boundary for synchronous HTTPS collection."""
+    """Spawn-owned synchronous HTTPS boundary on spawn-capable platforms.
+
+    The absolute deadline ends network and child work. Synchronous process
+    startup is a supported-platform boundary that cannot itself be cancelled;
+    it is checked immediately on return. Final cleanup may then use only the
+    separate bounded ``PROCESS_CLEANUP_GRACE_SECONDS`` allowance.
+    """
 
     def __init__(
         self,
         *,
         worker_target: ProcessWorker | None = None,
+        connection_factory: ConnectionFactory | None = None,
         max_response_bytes: int = SOURCE_MAX_RESPONSE_BYTES,
         poll_interval_seconds: float = 0.05,
     ) -> None:
+        if worker_target is not None and connection_factory is not None:
+            raise ValueError(
+                "worker_target and connection_factory cannot be combined"
+            )
         self._worker_target = worker_target or _ssen_download_process_worker
+        self._connection_factory = connection_factory
         self._max_response_bytes = max_response_bytes
         self._poll_interval_seconds = poll_interval_seconds
         self._context = multiprocessing.get_context("spawn")
+        self._start_process: Callable[[multiprocessing.Process], None] = (
+            lambda process: process.start()
+        )
 
     def download(self, resource: SourceResource, *, deadline: float) -> bytes:
         if time.monotonic() >= deadline:
-            raise SourceContractError("SSEN resource total deadline exceeded")
+            raise _total_deadline_error()
         receive_connection, send_connection = self._context.Pipe(duplex=False)
         process = self._context.Process(
             target=_safe_process_entry,
@@ -428,21 +482,28 @@ class OwnedProcessSsenTransport:
                 send_connection,
                 resource.model_dump(mode="python"),
                 deadline,
+                self._connection_factory,
             ),
             name="ssen-download-worker",
         )
         started = False
         message: bytes | None = None
         try:
-            process.start()
+            try:
+                self._start_process(process)
+            except BaseException:
+                raise SourceContractError(
+                    "SSEN resource process startup is unsupported",
+                    error_code="process_startup_unsupported",
+                ) from None
             started = True
             send_connection.close()
+            if time.monotonic() >= deadline:
+                raise _total_deadline_error()
             while message is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise SourceContractError(
-                        "SSEN resource total deadline exceeded"
-                    )
+                    raise _total_deadline_error()
                 if receive_connection.poll(
                     min(remaining, self._poll_interval_seconds)
                 ):
@@ -455,9 +516,7 @@ class OwnedProcessSsenTransport:
                             "SSEN resource worker protocol failed"
                         ) from None
                     if time.monotonic() >= deadline:
-                        raise SourceContractError(
-                            "SSEN resource total deadline exceeded"
-                        )
+                        raise _total_deadline_error()
                     break
                 if not process.is_alive():
                     raise SourceContractError(
@@ -466,14 +525,10 @@ class OwnedProcessSsenTransport:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise SourceContractError(
-                    "SSEN resource total deadline exceeded"
-                )
+                raise _total_deadline_error()
             process.join(remaining)
             if process.is_alive() or time.monotonic() >= deadline:
-                raise SourceContractError(
-                    "SSEN resource total deadline exceeded"
-                )
+                raise _total_deadline_error()
             duplicate_message = False
             try:
                 has_trailing_data = receive_connection.poll(0)
@@ -500,8 +555,10 @@ class OwnedProcessSsenTransport:
                 "SSEN resource worker protocol failed"
             ) from None
         finally:
-            if started:
+            process_was_started = started or process.pid is not None
+            if process_was_started:
                 _terminate_and_join(process)
+            if not process.is_alive():
                 process.close()
             receive_connection.close()
             try:

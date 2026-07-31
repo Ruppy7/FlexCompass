@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import http.client
 import io
 import json
 import logging
@@ -20,6 +21,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+from app import outage_source
 from app.db import MIGRATIONS, get_connection, run_migrations
 from app.outage_cli import main as outage_cli_main
 from app.outage_source import (
@@ -165,6 +167,29 @@ def _spawn_marker_failure_worker(
     raise RuntimeError(
         "X-Amz-Signature=SYNTHETIC_CHILD_FAILURE_MUST_NOT_LEAK"
     )
+
+
+class TerminateResistantProcessDouble:
+    def __init__(self) -> None:
+        self.alive = True
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.join_timeouts: list[float | None] = []
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.alive = False
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_timeouts.append(timeout)
+        if timeout is not None:
+            time.sleep(timeout)
 
 EXPECTED_MODEL_FIELDS: dict[type[BaseModel], dict[str, object]] = {
     SourceResource: {
@@ -1586,6 +1611,14 @@ def test_commit_ingestion_run_is_one_atomic_transaction(
         "event_resource_mismatch",
         "duplicate_event",
         "duplicate_reject",
+        "short_hash",
+        "long_hash",
+        "uppercase_hash",
+        "nonhex_hash",
+        "negative_byte_size",
+        "negative_row_count",
+        "malformed_snapshot_id",
+        "noncanonical_blob_path",
     ],
 )
 def test_commit_ingestion_run_rejects_malformed_exact_run_before_mutation(
@@ -1604,6 +1637,7 @@ def test_commit_ingestion_run_rejects_malformed_exact_run_before_mutation(
     with get_connection(temp_db) as connection:
         before_dump = "\n".join(connection.iterdump())
     before_current = current_outage_snapshot_ids(db_path=temp_db)
+    before_bytes = temp_db.read_bytes()
 
     invalid = _exact_run_payload(
         source_snapshot,
@@ -1664,6 +1698,53 @@ def test_commit_ingestion_run_rejects_malformed_exact_run_before_mutation(
         )
         invalid["rejects"] = [reject, reject]
         snapshots[0] = snapshots[0].model_copy(update={"row_count": 3})
+    elif invalid_case in {
+        "short_hash",
+        "long_hash",
+        "uppercase_hash",
+        "nonhex_hash",
+    }:
+        digest = {
+            "short_hash": "a" * 63,
+            "long_hash": "a" * 65,
+            "uppercase_hash": "A" * 64,
+            "nonhex_hash": "g" * 64,
+        }[invalid_case]
+        snapshot = snapshots[0].model_copy(
+            update={
+                "snapshot_id": source_snapshot_id(SEPD_RESOURCE_ID, digest),
+                "content_sha256": digest,
+                "local_snapshot_path": f"blobs/{digest[:2]}/{digest}.csv",
+            }
+        )
+        snapshots[0] = snapshot
+        attempts[0] = attempts[0].model_copy(
+            update={
+                "source_snapshot_id": snapshot.snapshot_id,
+                "content_sha256": digest,
+            }
+        )
+        invalid["events"][0] = invalid["events"][0].model_copy(
+            update={"source_snapshot_id": snapshot.snapshot_id}
+        )
+    elif invalid_case == "negative_byte_size":
+        snapshots[0] = snapshots[0].model_copy(update={"byte_size": -1})
+        attempts[0] = attempts[0].model_copy(update={"byte_size": -1})
+    elif invalid_case == "negative_row_count":
+        snapshots[1] = snapshots[1].model_copy(update={"row_count": -1})
+    elif invalid_case == "malformed_snapshot_id":
+        malformed_id = f"ssen-nafirs-hv:{SEPD_RESOURCE_ID}:sha256x:{'a' * 64}"
+        snapshots[0] = snapshots[0].model_copy(update={"snapshot_id": malformed_id})
+        attempts[0] = attempts[0].model_copy(
+            update={"source_snapshot_id": malformed_id}
+        )
+        invalid["events"][0] = invalid["events"][0].model_copy(
+            update={"source_snapshot_id": malformed_id}
+        )
+    elif invalid_case == "noncanonical_blob_path":
+        snapshots[0] = snapshots[0].model_copy(
+            update={"local_snapshot_path": f"blobs/bb/{'a' * 64}.csv"}
+        )
 
     fresh_db = tmp_path / f"invalid-{invalid_case}.sqlite3"
     with pytest.raises(ValueError, match="exact completed run"):
@@ -1676,6 +1757,7 @@ def test_commit_ingestion_run_rejects_malformed_exact_run_before_mutation(
         after_dump = "\n".join(connection.iterdump())
     assert after_dump == before_dump
     assert current_outage_snapshot_ids(db_path=temp_db) == before_current
+    assert temp_db.read_bytes() == before_bytes
 
 
 def test_commit_ingestion_run_rolls_back_running_row_and_all_payloads(
@@ -2652,6 +2734,68 @@ class ScriptedConnectionFactory:
         return connection
 
 
+class BlockedHeaderHTTPSConnection(ScriptedHTTPSConnection):
+    def getresponse(self) -> ScriptedHTTPResponse:
+        time.sleep(60)
+        raise AssertionError("blocked header unexpectedly returned")
+
+
+def _block_spawned_body_read() -> None:
+    time.sleep(60)
+
+
+class SpawnedProductionConnectionFactory:
+    """Pickle-safe, no-network factory for the real spawned worker path."""
+
+    def __init__(self, mode: str, *, payload_size: int = 3) -> None:
+        self.mode = mode
+        self.payload_size = payload_size
+        self._calls = 0
+
+    def __call__(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+    ) -> ScriptedHTTPSConnection:
+        del host, port, timeout
+        self._calls += 1
+        marker = "SPAWNED_SIGNED_MARKER_MUST_NOT_LEAK"
+        location = (
+            "https://83025b28472d6aa2bf5ae59f3724aa78."
+            "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+            f"{SEPD_RESOURCE_ID}/sample.csv?X-Amz-Signature={marker}"
+        )
+        if self._calls == 1:
+            if self.mode == "fixed_failure":
+                return ScriptedHTTPSConnection(ScriptedHTTPResponse(503))
+            return ScriptedHTTPSConnection(_scripted_redirect(location))
+        if self.mode == "blocked_header":
+            return BlockedHeaderHTTPSConnection(
+                ScriptedHTTPResponse(200, headers={"content-type": "text/csv"})
+            )
+        if self.mode == "marker_failure":
+            return ScriptedHTTPSConnection(
+                RuntimeError(f"failed signed request {location}")
+            )
+        content = b"x" * self.payload_size
+        return ScriptedHTTPSConnection(
+            ScriptedHTTPResponse(
+                200,
+                headers={
+                    "content-type": "text/csv",
+                    "content-length": str(len(content)),
+                },
+                chunks=[content],
+                on_read=(
+                    _block_spawned_body_read
+                    if self.mode == "blocked_body"
+                    else None
+                ),
+            )
+        )
+
+
 def response_client(
     responses: list[httpx.Response],
     requests: list[httpx.Request] | None = None,
@@ -2890,6 +3034,101 @@ def test_production_child_worker_uses_bounded_safe_protocol(
 
 
 @pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [("success", None), ("fixed_failure", "unexpected_initial_status")],
+)
+def test_spawned_production_worker_no_network_success_and_fixed_failure(
+    mode: str,
+    expected_code: str | None,
+) -> None:
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        connection_factory=SpawnedProductionConnectionFactory(mode),
+    )
+
+    if expected_code is None:
+        assert transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        ) == b"xxx"
+    else:
+        with pytest.raises(SourceContractError) as caught:
+            transport.download(
+                ssen_resource("SEPD"), deadline=time.monotonic() + 5
+            )
+        assert caught.value.code == expected_code
+
+    assert _active_child_pids() == before
+
+
+@pytest.mark.parametrize("blocked_operation", ["blocked_header", "blocked_body"])
+def test_spawned_production_worker_distinct_header_and_body_deadlines(
+    blocked_operation: str,
+) -> None:
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        connection_factory=SpawnedProductionConnectionFactory(blocked_operation),
+        poll_interval_seconds=0.005,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(SourceContractError, match="deadline") as caught:
+        transport.download(ssen_resource("SEPD"), deadline=started + 0.3)
+
+    assert caught.value.code == "total_deadline_exceeded"
+    assert time.monotonic() - started < 0.7
+    assert _active_child_pids() == before
+
+
+def test_spawned_production_worker_hides_child_traceback_and_signed_marker(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    marker = "SPAWNED_SIGNED_MARKER_MUST_NOT_LEAK"
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        connection_factory=SpawnedProductionConnectionFactory("marker_failure"),
+    )
+
+    with pytest.raises(SourceContractError) as caught:
+        transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        )
+
+    captured = capfd.readouterr()
+    surfaces = str(caught.value) + captured.out + captured.err
+    assert marker not in surfaces
+    assert "X-Amz-Signature" not in surfaces
+    assert _active_child_pids() == before
+
+
+@pytest.mark.parametrize("extra_bytes", [0, 1])
+def test_spawned_production_worker_large_pipe_exact_cap_and_plus_one(
+    extra_bytes: int,
+) -> None:
+    cap = 1024 * 1024
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        connection_factory=SpawnedProductionConnectionFactory(
+            "success", payload_size=cap + extra_bytes
+        ),
+        max_response_bytes=cap,
+    )
+
+    if extra_bytes == 0:
+        assert len(
+            transport.download(
+                ssen_resource("SEPD"), deadline=time.monotonic() + 5
+            )
+        ) == cap
+    else:
+        with pytest.raises(SourceContractError, match="protocol"):
+            transport.download(
+                ssen_resource("SEPD"), deadline=time.monotonic() + 5
+            )
+
+    assert _active_child_pids() == before
+
+
+@pytest.mark.parametrize(
     "filename",
     [
         ".",
@@ -2999,11 +3238,8 @@ def test_owned_process_transport_failure_is_fixed_and_does_not_trace_request(
     assert _active_child_pids() == before
 
 
-@pytest.mark.parametrize("blocked_operation", ["header", "body"])
-def test_owned_process_transport_terminates_non_cooperative_io_at_deadline(
-    blocked_operation: str,
+def test_owned_process_transport_terminates_non_cooperative_worker_at_deadline(
 ) -> None:
-    del blocked_operation
     before = _active_child_pids()
     transport = OwnedProcessSsenTransport(
         worker_target=_spawn_non_cooperative_worker,
@@ -3011,13 +3247,144 @@ def test_owned_process_transport_terminates_non_cooperative_io_at_deadline(
     )
     started = time.monotonic()
 
-    with pytest.raises(SourceContractError, match="deadline"):
+    with pytest.raises(SourceContractError, match="deadline") as caught:
         transport.download(
             ssen_resource("SEPD"), deadline=started + 0.5
         )
 
-    assert time.monotonic() - started < 2
+    assert caught.value.code == "total_deadline_exceeded"
+    assert time.monotonic() - started < 1
     assert _active_child_pids() == before
+
+
+def test_process_cleanup_bounds_terminate_and_kill_joins_inside_one_grace(
+) -> None:
+    process = TerminateResistantProcessDouble()
+    started = time.monotonic()
+
+    outage_source._terminate_and_join(process)  # type: ignore[arg-type]
+
+    elapsed = time.monotonic() - started
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.join_timeouts
+    assert all(timeout is not None for timeout in process.join_timeouts)
+    assert elapsed <= outage_source.PROCESS_CLEANUP_GRACE_SECONDS + 0.1
+
+
+def test_process_startup_is_checked_immediately_after_slow_start() -> None:
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(worker_target=_spawn_success_worker)
+
+    def slow_start(process: multiprocessing.Process) -> None:
+        time.sleep(0.08)
+        process.start()
+
+    transport._start_process = slow_start  # type: ignore[attr-defined]
+    started = time.monotonic()
+    with pytest.raises(SourceContractError, match="deadline") as caught:
+        transport.download(ssen_resource("SEPD"), deadline=started + 0.02)
+
+    assert caught.value.code == "total_deadline_exceeded"
+    assert time.monotonic() - started >= 0.08
+    assert _active_child_pids() == before
+
+
+def test_process_startup_platform_failure_is_fixed_safe_and_child_free() -> None:
+    marker = "UNSUPPORTED_START_DETAIL_MUST_NOT_LEAK"
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(worker_target=_spawn_success_worker)
+
+    def unsupported_start(process: multiprocessing.Process) -> None:
+        del process
+        raise OSError(marker)
+
+    transport._start_process = unsupported_start  # type: ignore[attr-defined]
+    with pytest.raises(SourceContractError) as caught:
+        transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        )
+
+    assert str(caught.value) == "SSEN resource process startup is unsupported"
+    assert caught.value.code == "process_startup_unsupported"
+    assert marker not in str(caught.value)
+    assert _active_child_pids() == before
+
+
+def test_process_start_failure_after_spawn_still_cleans_the_child() -> None:
+    before = _active_child_pids()
+    started_processes: list[multiprocessing.Process] = []
+    transport = OwnedProcessSsenTransport(
+        worker_target=_spawn_non_cooperative_worker
+    )
+
+    def start_then_fail(process: multiprocessing.Process) -> None:
+        started_processes.append(process)
+        process.start()
+        raise OSError("synthetic post-start failure")
+
+    transport._start_process = start_then_fail  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(SourceContractError) as caught:
+            transport.download(
+                ssen_resource("SEPD"), deadline=time.monotonic() + 5
+            )
+        assert caught.value.code == "process_startup_unsupported"
+        assert _active_child_pids() == before
+    finally:
+        for process in started_processes:
+            try:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(1)
+                process.close()
+            except ValueError:
+                pass
+
+
+def test_process_cleanup_kills_child_when_terminate_does_not_stop_it() -> None:
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        worker_target=_spawn_non_cooperative_worker,
+        poll_interval_seconds=0.005,
+    )
+
+    def ignore_terminate(process: multiprocessing.Process) -> None:
+        process.start()
+        process.terminate = lambda: None  # type: ignore[method-assign]
+
+    transport._start_process = ignore_terminate  # type: ignore[attr-defined]
+    started = time.monotonic()
+    with pytest.raises(SourceContractError, match="deadline") as caught:
+        transport.download(ssen_resource("SEPD"), deadline=started + 0.2)
+
+    assert caught.value.code == "total_deadline_exceeded"
+    assert time.monotonic() - started < 0.7
+    assert _active_child_pids() == before
+
+
+def test_parent_deadline_code_is_persisted_in_failed_sync_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    temp_db: Path,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("app.outage_source.SOURCE_TOTAL_DEADLINE_SECONDS", 0.2)
+    transport = OwnedProcessSsenTransport(
+        worker_target=_spawn_non_cooperative_worker,
+        poll_interval_seconds=0.005,
+    )
+
+    result = sync_ssen_nafirs_hv(
+        db_path=temp_db,
+        snapshot_dir=tmp_path / "snapshots",
+        client=transport,
+    )
+
+    assert result.status == "failed"
+    manifest = build_ssen_fetch_manifest(result.run_id, db_path=temp_db)
+    assert len(manifest.attempts) == 1
+    assert manifest.attempts[0].status == "failed"
+    assert manifest.attempts[0].error_code == "total_deadline_exceeded"
 
 
 @pytest.mark.parametrize(
@@ -3151,6 +3518,77 @@ def test_download_rejects_oversize_content_length_before_streaming(
         )
 
     assert final._chunks == [b"must-not-be-read"]
+
+
+@pytest.mark.parametrize(
+    ("declared_size", "chunks", "accepted"),
+    [
+        (6, [b"abc", b"def"], True),
+        (7, [b"abc", b"def"], False),
+        (5, [b"abc", b"def"], False),
+    ],
+)
+def test_download_requires_body_to_match_declared_content_length(
+    declared_size: int,
+    chunks: list[bytes],
+    accepted: bool,
+) -> None:
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+    final = ScriptedHTTPResponse(
+        200,
+        headers={
+            "content-type": "text/csv",
+            "content-length": str(declared_size),
+        },
+        chunks=chunks,
+    )
+    factory = ScriptedConnectionFactory([_scripted_redirect(location), final])
+
+    if accepted:
+        assert _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        ) == b"abcdef"
+    else:
+        with pytest.raises(SourceContractError) as caught:
+            _download_resource_in_child(
+                ssen_resource("SEPD").model_dump(mode="python"),
+                time.monotonic() + 180,
+                connection_factory=factory,
+            )
+        assert str(caught.value) == "SSEN resource content length is invalid"
+        assert caught.value.code == "invalid_content_length"
+
+    assert final.closed is True
+    assert all(connection.closed for connection in factory.connections)
+
+
+def test_download_maps_body_protocol_failure_to_fixed_safe_error_and_cleans_up(
+) -> None:
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+
+    def raise_protocol_failure() -> None:
+        raise http.client.IncompleteRead(b"partial", 10)
+
+    final = ScriptedHTTPResponse(
+        200,
+        headers={"content-type": "text/csv", "content-length": "10"},
+        on_read=raise_protocol_failure,
+    )
+    factory = ScriptedConnectionFactory([_scripted_redirect(location), final])
+
+    with pytest.raises(SourceContractError) as caught:
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
+
+    assert str(caught.value) == "SSEN resource request failed"
+    assert caught.value.code == "request_failed"
+    assert final.closed is True
+    assert all(connection.closed for connection in factory.connections)
 
 
 @pytest.mark.parametrize(

@@ -28,6 +28,7 @@ from app.outages import (
     SsenFetchManifestV1,
     SyncResult,
     outage_reject_id,
+    source_snapshot_id,
 )
 from app.persistence_safety import (
     UNSAFE_VALUE_SENTINEL,
@@ -795,15 +796,19 @@ def _validate_completed_run_payload(
     snapshot_by_resource: dict[str, SourceSnapshot] = {}
     snapshot_ids: set[str] = set()
     for snapshot in snapshots:
+        digest = snapshot.content_sha256
         if (
             snapshot.source_resource_id not in _EXPECTED_RESOURCE_IDS
             or snapshot.source_resource_id in snapshot_by_resource
             or snapshot.snapshot_id in snapshot_ids
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
             or snapshot.snapshot_id
-            != (
-                f"ssen-nafirs-hv:{snapshot.source_resource_id}:"
-                f"sha256:{snapshot.content_sha256}"
-            )
+            != source_snapshot_id(snapshot.source_resource_id, digest)
+            or snapshot.byte_size < 0
+            or snapshot.row_count < 0
+            or snapshot.local_snapshot_path
+            != f"blobs/{digest[:2]}/{digest}.csv"
         ):
             raise _invalid_completed_run()
         snapshot_by_resource[snapshot.source_resource_id] = snapshot
