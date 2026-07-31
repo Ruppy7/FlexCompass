@@ -1492,6 +1492,40 @@ if ($LASTEXITCODE -ne 0) {
   throw "STOP: reproducibility commit is not on remote main"
 }
 
+function Get-GitHubHttpStatus {
+  param([Parameter(Mandatory)][string]$Endpoint)
+  $probe = @(gh api --include --silent $Endpoint 2>&1)
+  $probeExit = $LASTEXITCODE
+  $statusLine = $probe |
+    Where-Object { $_ -match "^HTTP/\\S+ [0-9]{3}" } |
+    Select-Object -Last 1
+  if (-not $statusLine) {
+    throw "STOP: GitHub preflight returned no authenticated HTTP status"
+  }
+  $status = [int]([regex]::Match($statusLine, "[0-9]{3}").Value)
+  if ($status -ge 200 -and $status -lt 300 -and $probeExit -ne 0) {
+    throw "STOP: inconsistent successful GitHub preflight"
+  }
+  return $status
+}
+
+function Assert-ExactLightweightTag {
+  param(
+    [Parameter(Mandatory)][string]$Tag,
+    [Parameter(Mandatory)][string]$ExpectedCommit
+  )
+  $tagObject = gh api "repos/Ruppy7/FlexCompass/git/ref/tags/$Tag" `
+    --jq ".object"
+  if ($LASTEXITCODE -ne 0) {
+    throw "STOP: release tag target could not be read"
+  }
+  $tagObject = $tagObject | ConvertFrom-Json -ErrorAction Stop
+  if ($tagObject.type -cne "commit" -or
+      $tagObject.sha -cne $ExpectedCommit) {
+    throw "STOP: release tag is not the exact lightweight commit tag"
+  }
+}
+
 function Assert-ExactReleaseAsset {
   param(
     [string]$Tag,
@@ -1502,21 +1536,13 @@ function Assert-ExactReleaseAsset {
   )
   $release = gh release view $Tag `
     --repo Ruppy7/FlexCompass `
-    --json tagName,targetCommitish,assets | ConvertFrom-Json
+    --json tagName,assets | ConvertFrom-Json
   if ($LASTEXITCODE -ne 0) {
     throw "STOP: existing release could not be read"
   }
-  $tagObject = gh api "repos/Ruppy7/FlexCompass/git/ref/tags/$Tag" `
-    --jq ".object"
-  if ($LASTEXITCODE -ne 0) {
-    throw "STOP: release tag target could not be read"
-  }
-  $tagObject = $tagObject | ConvertFrom-Json -ErrorAction Stop
-  if ($release.tagName -cne $Tag -or
-      $release.targetCommitish -cne $ExpectedCommit -or
-      $tagObject.type -cne "commit" -or
-      $tagObject.sha -cne $ExpectedCommit) {
-    throw "STOP: existing release/tag target differs"
+  Assert-ExactLightweightTag $Tag $ExpectedCommit
+  if ($release.tagName -cne $Tag) {
+    throw "STOP: existing release tag name differs"
   }
   $matches = @($release.assets | Where-Object { $_.name -ceq $ExpectedName })
   if ($matches.Count -ne 1 -or $matches[0].size -ne $ExpectedSize) {
@@ -1555,23 +1581,31 @@ function Assert-ExactReleaseAsset {
   }
 }
 
-$probe = @(gh api --include --silent `
-  "repos/Ruppy7/FlexCompass/releases/tags/$tag" 2>&1)
-$probeExit = $LASTEXITCODE
-$statusLine = $probe | Where-Object { $_ -match "^HTTP/\\S+ [0-9]{3}" } |
-  Select-Object -Last 1
-if (-not $statusLine) {
-  throw "STOP: release preflight returned no authenticated HTTP status"
-}
-$httpStatus = [int]([regex]::Match($statusLine, "[0-9]{3}").Value)
+$httpStatus = Get-GitHubHttpStatus `
+  "repos/Ruppy7/FlexCompass/releases/tags/$tag"
 if ($httpStatus -eq 200) {
-  if ($probeExit -ne 0) { throw "STOP: inconsistent release preflight" }
   Assert-ExactReleaseAsset $tag $reproCommit $assetName `
     $localAsset.Length $localAssetHash
 } elseif ($httpStatus -eq 404) {
+  $tagStatus = Get-GitHubHttpStatus `
+    "repos/Ruppy7/FlexCompass/git/ref/tags/$tag"
+  if ($tagStatus -eq 200) {
+    Assert-ExactLightweightTag $tag $reproCommit
+  } elseif ($tagStatus -eq 404) {
+    gh api --method POST "repos/Ruppy7/FlexCompass/git/refs" `
+      -f "ref=refs/tags/$tag" `
+      -f "sha=$reproCommit" `
+      --silent
+    if ($LASTEXITCODE -ne 0) {
+      throw "STOP: exact release tag creation failed; user action required"
+    }
+    Assert-ExactLightweightTag $tag $reproCommit
+  } else {
+    throw "STOP: tag preflight HTTP $tagStatus requires user action"
+  }
   gh release create $tag $asset `
     --repo Ruppy7/FlexCompass `
-    --target $reproCommit `
+    --verify-tag `
     --title "SSEN NaFIRS HV evidence $tag" `
     --notes "CC BY 4.0 source evidence; attribution: SSEN Distribution."
   if ($LASTEXITCODE -ne 0) {
