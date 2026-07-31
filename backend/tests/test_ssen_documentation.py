@@ -1,5 +1,6 @@
 """Behavioral public-doc contract for the reviewed SSEN NaFIRS HV workflow."""
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,13 @@ def _section(document: str, heading: str, next_heading: str) -> str:
 
 def _normalise(text: str) -> str:
     return " ".join(text.split())
+
+
+def _api_powershell_workflow(text: str) -> str:
+    blocks = re.findall(r"```powershell\s*\n(.*?)```", text, flags=re.DOTALL)
+    workflows = [block.strip() for block in blocks if "$apiBase =" in block]
+    assert len(workflows) == 1
+    return workflows[0]
 
 
 def test_source_register_binds_identity_licence_and_source_limits() -> None:
@@ -118,19 +126,49 @@ def test_readme_provides_copyable_sync_api_and_product_workflow() -> None:
 
 
 def test_api_selector_contract_is_bound_to_both_operating_documents() -> None:
-    readme = _normalise(Path("README.md").read_text("utf-8"))
-    source = _normalise(
-        _section(
-            "docs/public-data-sources.md",
-            "## Accepted SSEN NaFIRS HV source",
-            "## Catalogue intelligence workflow",
-        )
+    readme_raw = Path("README.md").read_text("utf-8")
+    source_raw = _section(
+        "docs/public-data-sources.md",
+        "## Accepted SSEN NaFIRS HV source",
+        "## Catalogue intelligence workflow",
     )
-    for text in (readme, source):
+    for raw_text in (readme_raw, source_raw):
+        text = _normalise(raw_text)
         assert "exactly one `source_snapshot_id`" in text
         assert "Zero or two detail selectors return `422`" in text
         assert "repeatable singular `source_snapshot_id`" in text
         assert "exact two-resource snapshot set" in text
+
+        workflow = _api_powershell_workflow(raw_text)
+        lines = set(workflow.splitlines())
+        replay_query = (
+            '$replayQuery = ($list.evidence_scope.snapshot_ids | '
+            'ForEach-Object { "source_snapshot_id='
+            '$([uri]::EscapeDataString($_))" }) -join "&"'
+        )
+        detail = (
+            '$detail = Invoke-RestMethod -Uri "$apiBase/events/'
+            '$eventId`?source_snapshot_id=$detailSnapshotId"'
+        )
+        replay_list = (
+            '$replayList = Invoke-RestMethod -Uri '
+            '"$apiBase/events`?$replayQuery"'
+        )
+        replay_summary = (
+            '$replaySummary = Invoke-RestMethod -Uri '
+            '"$apiBase/summary`?$replayQuery"'
+        )
+        assert "$eventId = [uri]::EscapeDataString($event.event_id)" in lines
+        assert (
+            "$detailSnapshotId = "
+            "[uri]::EscapeDataString($event.source_snapshot_id)"
+        ) in lines
+        assert replay_query in lines
+        assert detail in lines
+        assert replay_list in lines
+        assert replay_summary in lines
+        assert "$replayQuery" not in detail
+        assert "snapshot_ids[" not in workflow
 
 
 def test_only_ssen_auth_example_is_absent_and_local_outputs_are_ignored() -> None:
