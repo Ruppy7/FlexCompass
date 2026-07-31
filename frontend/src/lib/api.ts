@@ -1,90 +1,59 @@
-/* API client for FlexCompass v0.1 */
+/* API client for the explicitly synthetic FlexCompass demonstration. */
 
-import type { Portfolio, AnalyseResponse, ReportResponse, FlexZone, FlexSignal, PortalDataset, IngestStatus } from "./types";
+import type {
+  AnalyseResponse,
+  DemoPortfolioListResponse,
+  Portfolio,
+  ReportResponse,
+} from "./types";
 
-const BASE = "/api";
+const DEMO_BASE = "/api/demo";
 
-// ---------------------------------------------------------------------------
-// v0 endpoints
-// ---------------------------------------------------------------------------
-
-export async function fetchPortfolios(): Promise<Portfolio[]> {
-  const res = await fetch(`${BASE}/portfolios`);
-  if (!res.ok) throw new Error("Failed to fetch portfolios");
-  return res.json();
+async function parseResponse<T>(
+  response: Response,
+  failureMessage: string,
+): Promise<T> {
+  if (!response.ok) {
+    throw new Error(failureMessage);
+  }
+  return response.json() as Promise<T>;
 }
 
-export async function analysePortfolio(portfolio: Portfolio): Promise<AnalyseResponse> {
-  const res = await fetch(`${BASE}/analyse`, {
+export async function fetchDemoPortfolios(): Promise<Portfolio[]> {
+  const response = await fetch(`${DEMO_BASE}/portfolios`, {
+    method: "GET",
+  });
+  const payload = await parseResponse<DemoPortfolioListResponse>(
+    response,
+    "Failed to fetch synthetic demonstration portfolios",
+  );
+  return payload.items;
+}
+
+export async function analyseDemoPortfolio(
+  portfolio: Portfolio,
+): Promise<AnalyseResponse> {
+  const response = await fetch(`${DEMO_BASE}/analyse`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ portfolio }),
   });
-  if (!res.ok) throw new Error("Analysis failed");
-  return res.json();
+  return parseResponse<AnalyseResponse>(
+    response,
+    "Synthetic demonstration analysis failed",
+  );
 }
 
-export async function generateReport(portfolio: Portfolio): Promise<ReportResponse> {
-  const res = await fetch(`${BASE}/report`, {
+export async function generateDemoReport(
+  portfolio: Portfolio,
+): Promise<ReportResponse> {
+  const response = await fetch(`${DEMO_BASE}/report`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ portfolio }),
   });
-  if (!res.ok) throw new Error("Report generation failed");
-  return res.json();
-}
-
-// ---------------------------------------------------------------------------
-// v0.1 endpoints
-// ---------------------------------------------------------------------------
-
-export async function fetchZones(dso?: string): Promise<FlexZone[]> {
-  const url = dso ? `${BASE}/zones?dso=${dso}` : `${BASE}/zones`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch zones");
-  const data = await res.json();
-  // Backend returns paginated response: {items, total, limit, offset}
-  return Array.isArray(data) ? data : (data.items || []);
-}
-
-export async function fetchSignals(): Promise<FlexSignal[]> {
-  const res = await fetch(`${BASE}/signals`);
-  if (!res.ok) throw new Error("Failed to fetch signals");
-  const data = await res.json();
-  // Backend returns paginated response: {items, total, limit, offset}
-  return Array.isArray(data) ? data : (data.items || []);
-}
-
-export async function fetchPortalDatasets(): Promise<PortalDataset[]> {
-  const res = await fetch(`${BASE}/portal/datasets`);
-  if (!res.ok) throw new Error("Failed to fetch portal datasets");
-  const data = await res.json();
-  // Backend returns paginated response: {items, total, limit, offset}
-  return Array.isArray(data) ? data : (data.items || []);
-}
-
-export async function fetchSignalsByZone(zoneId: string): Promise<FlexSignal[]> {
-  const res = await fetch(`${BASE}/signals/by-zone/${zoneId}`);
-  if (!res.ok) throw new Error("Failed to fetch signals for zone");
-  return res.json();
-}
-
-export async function generateAssetGroup(spec: {
-  asset_type: string;
-  count: number;
-  region: string;
-}): Promise<{ asset_group: Record<string, unknown>; estimated_available_kw: number }> {
-  const res = await fetch(`${BASE}/asset-groups/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(spec),
-  });
-  if (!res.ok) throw new Error("Failed to generate asset group");
-  return res.json();
-}
-
-export async function fetchIngestStatus(): Promise<IngestStatus> {
-  const res = await fetch(`${BASE}/ingest/status`);
-  if (!res.ok) throw new Error("Failed to fetch ingest status");
-  return res.json();
+  return parseResponse<ReportResponse>(
+    response,
+    "Synthetic demonstration report generation failed",
+  );
 }

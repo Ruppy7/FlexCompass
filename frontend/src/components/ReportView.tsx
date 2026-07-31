@@ -24,7 +24,7 @@ export default function ReportView({ markdown, assessments, signals }: Props) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "flexibility-fit-report.md";
+    a.download = "flexcompass-synthetic-demo.md";
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -32,7 +32,9 @@ export default function ReportView({ markdown, assessments, signals }: Props) {
   return (
     <div className="bg-surface rounded-lg shadow-card p-6">
       <div className="flex justify-between items-center mb-4">
-        <h2 className="text-lg font-bold text-gray-900">Flexibility Fit Report</h2>
+        <h2 className="text-lg font-bold text-gray-900">
+          Synthetic Flexibility Fit Demonstration
+        </h2>
         <div className="flex gap-1 bg-surface-muted rounded-lg p-0.5">
           <button
             onClick={() => setView("cards")}

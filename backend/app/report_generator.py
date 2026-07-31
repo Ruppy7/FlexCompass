@@ -34,7 +34,10 @@ def generate_report(
     _add = lines.append
 
     # ── Title ──
-    _add("# Flexibility Fit Report\n")
+    _add("# Synthetic Flexibility Fit Demonstration\n")
+    _add(
+        "> Synthetic demonstration — no live or current portal data is used.\n"
+    )
 
     # ── 1. Portfolio Summary ──
     _add("## 1. Portfolio Summary\n")

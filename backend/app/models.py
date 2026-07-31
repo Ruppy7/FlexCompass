@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -382,3 +382,53 @@ class ReportResponse(BaseModel):
     markdown: str
     portfolio: Portfolio
     assessments: list[FitAssessment]
+
+
+def require_synthetic_portfolio(portfolio: Portfolio) -> Portfolio:
+    """Reject non-synthetic assets at the demonstration boundary."""
+    if any(
+        asset.source is not AssetSource.synthetic
+        for asset in portfolio.assets
+    ):
+        raise ValueError("demo workflow accepts synthetic assets only")
+    return portfolio
+
+
+class DemoAnalyseRequest(BaseModel):
+    portfolio: Portfolio
+
+    @model_validator(mode="after")
+    def require_synthetic_assets(self) -> "DemoAnalyseRequest":
+        require_synthetic_portfolio(self.portfolio)
+        return self
+
+
+class DemoReportRequest(BaseModel):
+    portfolio: Portfolio
+
+    @model_validator(mode="after")
+    def require_synthetic_assets(self) -> "DemoReportRequest":
+        require_synthetic_portfolio(self.portfolio)
+        return self
+
+
+class DemoPortfolioListResponse(BaseModel):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+    items: list[Portfolio]
+
+
+class DemoAnalyseResponse(AnalyseResponse):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+
+
+class DemoReportResponse(ReportResponse):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+
+
+class DemoAssetGroupResponse(BaseModel):
+    workflow_kind: Literal["synthetic_demo"] = "synthetic_demo"
+    portal_data_used: Literal[False] = False
+    item: AssetGroup

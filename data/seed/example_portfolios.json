@@ -1,7 +1,7 @@
 [
   {
     "portfolio_id": "portfolio_ev_domestic_001",
-    "portfolio_name": "Domestic EV Charger Portfolio",
+    "portfolio_name": "Synthetic Domestic EV Charger Demonstration",
     "assets": [
       {
         "source": "synthetic",
@@ -32,7 +32,7 @@
   },
   {
     "portfolio_id": "portfolio_mixed_der_001",
-    "portfolio_name": "Mixed DER Portfolio",
+    "portfolio_name": "Synthetic Mixed DER Demonstration",
     "assets": [
       {
         "source": "synthetic",

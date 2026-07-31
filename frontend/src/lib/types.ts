@@ -25,7 +25,7 @@ export type ConfidenceLevel = "high" | "medium" | "low" | "insufficient_evidence
 
 export interface AssetGroup {
   asset_group_id?: string;
-  source?: "real" | "synthetic";
+  source: "real" | "synthetic";
   asset_type: AssetType;
   asset_count: number;
   postcode?: string;
@@ -125,6 +125,8 @@ export interface FitAssessment {
 }
 
 export interface AnalyseResponse {
+  workflow_kind: "synthetic_demo";
+  portal_data_used: false;
   portfolio: Portfolio;
   assessments: FitAssessment[];
   signals_considered: number;
@@ -133,9 +135,17 @@ export interface AnalyseResponse {
 }
 
 export interface ReportResponse {
+  workflow_kind: "synthetic_demo";
+  portal_data_used: false;
   markdown: string;
   portfolio: Portfolio;
   assessments: FitAssessment[];
+}
+
+export interface DemoPortfolioListResponse {
+  workflow_kind: "synthetic_demo";
+  portal_data_used: false;
+  items: Portfolio[];
 }
 
 export interface IngestStatus {

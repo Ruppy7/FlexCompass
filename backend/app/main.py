@@ -13,6 +13,7 @@ from .api_errors import (
     validation_exception_response,
 )
 from .config import config
+from .demo_routes import demo_router
 from .routes import router
 
 app = FastAPI(
@@ -43,6 +44,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(demo_router)
 
 
 @app.get("/")
