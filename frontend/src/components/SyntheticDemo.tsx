@@ -70,22 +70,23 @@ export default function SyntheticDemo() {
               Running synthetic demonstration…
             </div>
           )}
-          {hasCompletedRun && assessments.length === 0 && !loading && (
-            <div className="bg-surface rounded-lg shadow-card p-8 text-center text-gray-600">
-              No verified flexibility signals are available in this release,
-              so no fit assessments can be produced.
+          {hasCompletedRun && !loading && (
+            <div className="space-y-6">
+              {assessments.length === 0 && (
+                <div className="bg-surface rounded-lg shadow-card p-8 text-center text-gray-600">
+                  No verified flexibility signals are available in this
+                  release, so no fit assessments can be produced.
+                </div>
+              )}
+              {reportMarkdown && (
+                <ReportView
+                  markdown={reportMarkdown}
+                  assessments={assessments}
+                  signals={[]}
+                />
+              )}
             </div>
           )}
-          {hasCompletedRun
-            && assessments.length > 0
-            && reportMarkdown
-            && !loading && (
-            <ReportView
-              markdown={reportMarkdown}
-              assessments={assessments}
-              signals={[]}
-            />
-            )}
         </div>
       </div>
     </section>

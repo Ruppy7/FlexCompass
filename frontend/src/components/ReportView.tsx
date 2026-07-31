@@ -12,7 +12,9 @@ interface Props {
 }
 
 export default function ReportView({ markdown, assessments, signals }: Props) {
-  const [view, setView] = useState<"cards" | "markdown">("cards");
+  const [view, setView] = useState<"cards" | "markdown">(
+    assessments.length === 0 ? "markdown" : "cards",
+  );
   const signalMap = new Map(signals.map((s) => [s.signal_id, s]));
 
   const copyToClipboard = () => {
