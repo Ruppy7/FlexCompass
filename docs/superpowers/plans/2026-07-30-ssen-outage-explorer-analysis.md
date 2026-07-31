@@ -1459,31 +1459,128 @@ without rewriting either SHA.
 This orchestrator-owned external-write gate runs only after remote `main`
 contains `$reproCommit`. Verify that exact commit is an ancestor of
 `origin/main`, re-run the mandatory local `ruppy7` identity/email/remote gate,
-then run the exact `gh api user` check. Use a GET-only `gh release view`
-preflight. If the tag already exists, reuse it only after its target commit and
-freshly downloaded asset match exactly. If absent:
+then run the exact `gh api user` check. The preflight below distinguishes an
+HTTP 404 from authentication, authorization, transport, and server failures.
+If the tag already exists, reuse it only after its exact lightweight-tag
+target, asset name, size, and freshly downloaded SHA-256 match. Create only
+after a conclusive 404:
 
 ```powershell
 $login = gh api user --jq .login
-if ($LASTEXITCODE -ne 0 -or $login -cne "ruppy7") {
+if ($LASTEXITCODE -ne 0 -or $login -cne "Ruppy7") {
   throw "STOP: GitHub auth must be repaired by the user"
 }
 $repro = Get-Content `
   docs/analyses/ssen-hv-sepd-shepd/reproducibility.json `
-  -Encoding utf8 | ConvertFrom-Json
+  -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
 $tag = $repro.reproducibility_tag
+if ($tag -cnotmatch "^[a-z0-9][a-z0-9._-]{0,127}$") {
+  throw "STOP: unsafe or unsupported release tag"
+}
 $asset = "data/analyses/ssen-hv-sepd-shepd/evidence-bundle.zip"
+$assetName = Split-Path -Leaf $asset
+$localAsset = Get-Item -LiteralPath $asset -ErrorAction Stop
+$localAssetHash = (
+  Get-FileHash -LiteralPath $asset -Algorithm SHA256 -ErrorAction Stop
+).Hash.ToLowerInvariant()
+if ($localAsset.Length -ne $repro.release_asset_byte_size -or
+    $localAssetHash -cne $repro.release_asset_sha256) {
+  throw "STOP: local release asset differs from reproducibility manifest"
+}
 git merge-base --is-ancestor $reproCommit origin/main
 if ($LASTEXITCODE -ne 0) {
   throw "STOP: reproducibility commit is not on remote main"
 }
-gh release create $tag $asset `
-  --repo Ruppy7/FlexCompass `
-  --target $reproCommit `
-  --title "SSEN NaFIRS HV evidence $tag" `
-  --notes "CC BY 4.0 source evidence; attribution: SSEN Distribution."
-if ($LASTEXITCODE -ne 0) {
-  throw "STOP: release creation failed; user action required"
+
+function Assert-ExactReleaseAsset {
+  param(
+    [string]$Tag,
+    [string]$ExpectedCommit,
+    [string]$ExpectedName,
+    [long]$ExpectedSize,
+    [string]$ExpectedSha256
+  )
+  $release = gh release view $Tag `
+    --repo Ruppy7/FlexCompass `
+    --json tagName,targetCommitish,assets | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0) {
+    throw "STOP: existing release could not be read"
+  }
+  $tagObject = gh api "repos/Ruppy7/FlexCompass/git/ref/tags/$Tag" `
+    --jq ".object"
+  if ($LASTEXITCODE -ne 0) {
+    throw "STOP: release tag target could not be read"
+  }
+  $tagObject = $tagObject | ConvertFrom-Json -ErrorAction Stop
+  if ($release.tagName -cne $Tag -or
+      $release.targetCommitish -cne $ExpectedCommit -or
+      $tagObject.type -cne "commit" -or
+      $tagObject.sha -cne $ExpectedCommit) {
+    throw "STOP: existing release/tag target differs"
+  }
+  $matches = @($release.assets | Where-Object { $_.name -ceq $ExpectedName })
+  if ($matches.Count -ne 1 -or $matches[0].size -ne $ExpectedSize) {
+    throw "STOP: existing release asset name or size differs"
+  }
+  $downloadRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+  $downloadDir = [IO.Path]::GetFullPath((Join-Path $downloadRoot (
+    "flexcompass-release-check-" + [guid]::NewGuid().ToString("N")
+  )))
+  if (-not $downloadDir.StartsWith(
+      $downloadRoot,
+      [StringComparison]::OrdinalIgnoreCase
+  )) { throw "STOP: unsafe release-check path" }
+  New-Item -ItemType Directory -Path $downloadDir -ErrorAction Stop | Out-Null
+  try {
+    gh release download $Tag `
+      --repo Ruppy7/FlexCompass `
+      --pattern $ExpectedName `
+      --dir $downloadDir
+    if ($LASTEXITCODE -ne 0) {
+      throw "STOP: existing release asset download failed"
+    }
+    $downloaded = Join-Path $downloadDir $ExpectedName
+    $downloadedInfo = Get-Item -LiteralPath $downloaded -ErrorAction Stop
+    $downloadedHash = (
+      Get-FileHash -LiteralPath $downloaded -Algorithm SHA256 -ErrorAction Stop
+    ).Hash.ToLowerInvariant()
+    if ($downloadedInfo.Length -ne $ExpectedSize -or
+        $downloadedHash -cne $ExpectedSha256) {
+      throw "STOP: existing release asset bytes differ"
+    }
+  } finally {
+    if (Test-Path -LiteralPath $downloadDir) {
+      Remove-Item -LiteralPath $downloadDir -Recurse -Force
+    }
+  }
+}
+
+$probe = @(gh api --include --silent `
+  "repos/Ruppy7/FlexCompass/releases/tags/$tag" 2>&1)
+$probeExit = $LASTEXITCODE
+$statusLine = $probe | Where-Object { $_ -match "^HTTP/\\S+ [0-9]{3}" } |
+  Select-Object -Last 1
+if (-not $statusLine) {
+  throw "STOP: release preflight returned no authenticated HTTP status"
+}
+$httpStatus = [int]([regex]::Match($statusLine, "[0-9]{3}").Value)
+if ($httpStatus -eq 200) {
+  if ($probeExit -ne 0) { throw "STOP: inconsistent release preflight" }
+  Assert-ExactReleaseAsset $tag $reproCommit $assetName `
+    $localAsset.Length $localAssetHash
+} elseif ($httpStatus -eq 404) {
+  gh release create $tag $asset `
+    --repo Ruppy7/FlexCompass `
+    --target $reproCommit `
+    --title "SSEN NaFIRS HV evidence $tag" `
+    --notes "CC BY 4.0 source evidence; attribution: SSEN Distribution."
+  if ($LASTEXITCODE -ne 0) {
+    throw "STOP: release creation failed; user action required"
+  }
+  Assert-ExactReleaseAsset $tag $reproCommit $assetName `
+    $localAsset.Length $localAssetHash
+} else {
+  throw "STOP: release preflight HTTP $httpStatus requires user action"
 }
 ```
 
@@ -1505,38 +1602,64 @@ download. No tracked file changes after this release gate.
 
 - [ ] **Step 1: Reproduce the documented new-user workflow**
 
-From a clean checkout with generated artifacts absent:
+Use a disposable, bounded Git worktree so the active branch is never detached
+or contaminated:
 
 ```powershell
 $repro = Get-Content `
   docs/analyses/ssen-hv-sepd-shepd/reproducibility.json `
-  -Encoding utf8 | ConvertFrom-Json
+  -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
 git fetch --tags origin $repro.reproducibility_tag
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-git checkout --detach $repro.reproducibility_tag
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-git merge-base --is-ancestor $repro.analysis_code_commit_sha HEAD
-if ($LASTEXITCODE -ne 0) { throw "Tag does not contain reviewed analysis code" }
-git merge-base --is-ancestor $repro.publication_artifact_commit_sha HEAD
-if ($LASTEXITCODE -ne 0) { throw "Tag does not contain reviewed artifacts" }
-python -m venv .venv
-if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed" }
-.\.venv\Scripts\python -m pip install -r backend/requirements.txt
-if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
-$env:PYTHONPATH = "backend"
-.\.venv\Scripts\python -m app.outage_cli bootstrap-evidence `
-  docs/analyses/ssen-hv-sepd-shepd/evidence-bundle.json `
-  --db-path data/cache/outages/registry.sqlite3 `
-  --snapshot-dir data/snapshots/outages
-if ($LASTEXITCODE -ne 0) { throw "Evidence bootstrap failed" }
-.\.venv\Scripts\python scripts/build_ssen_outage_investigation.py `
-  --db-path data/cache/outages/registry.sqlite3 `
-  --snapshot-dir data/snapshots/outages `
-  --manifest docs/analyses/ssen-hv-sepd-shepd/manifest.json `
-  --evidence-publication-manifest docs/analyses/ssen-hv-sepd-shepd/evidence-bundle.json `
-  --output-dir data/analyses/ssen-hv-sepd-shepd-reproduced `
-  --verify
-if ($LASTEXITCODE -ne 0) { throw "Investigation reproduction failed" }
+$reproRoot = [IO.Path]::GetFullPath(
+  (Join-Path $env:LOCALAPPDATA "Temp\FlexCompass-Repro")
+)
+$reproPath = [IO.Path]::GetFullPath(
+  (Join-Path $reproRoot ([guid]::NewGuid().ToString("N")))
+)
+if (-not $reproPath.StartsWith(
+    $reproRoot + [IO.Path]::DirectorySeparatorChar,
+    [StringComparison]::OrdinalIgnoreCase
+)) { throw "Unsafe reproduction worktree path" }
+git worktree add --detach $reproPath $repro.reproducibility_tag
+if ($LASTEXITCODE -ne 0) { throw "Disposable worktree creation failed" }
+Push-Location $reproPath
+try {
+  $initialStatus = @(git status --porcelain)
+  if ($LASTEXITCODE -ne 0 -or $initialStatus) {
+    throw "Disposable reproduction worktree is not clean"
+  }
+  git merge-base --is-ancestor $repro.analysis_code_commit_sha HEAD
+  if ($LASTEXITCODE -ne 0) {
+    throw "Tag does not contain reviewed analysis code"
+  }
+  git merge-base --is-ancestor $repro.publication_artifact_commit_sha HEAD
+  if ($LASTEXITCODE -ne 0) {
+    throw "Tag does not contain reviewed artifacts"
+  }
+  python -m venv .venv
+  if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed" }
+  .\.venv\Scripts\python -m pip install -r backend/requirements.txt
+  if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+  $env:PYTHONPATH = "backend"
+  .\.venv\Scripts\python -m app.outage_cli bootstrap-evidence `
+    docs/analyses/ssen-hv-sepd-shepd/evidence-bundle.json `
+    --db-path data/cache/outages/registry.sqlite3 `
+    --snapshot-dir data/snapshots/outages
+  if ($LASTEXITCODE -ne 0) { throw "Evidence bootstrap failed" }
+  .\.venv\Scripts\python scripts/build_ssen_outage_investigation.py `
+    --db-path data/cache/outages/registry.sqlite3 `
+    --snapshot-dir data/snapshots/outages `
+    --manifest docs/analyses/ssen-hv-sepd-shepd/manifest.json `
+    --evidence-publication-manifest docs/analyses/ssen-hv-sepd-shepd/evidence-bundle.json `
+    --output-dir data/analyses/ssen-hv-sepd-shepd-reproduced `
+    --verify
+  if ($LASTEXITCODE -ne 0) { throw "Investigation reproduction failed" }
+} finally {
+  Pop-Location
+  git worktree remove --force $reproPath
+  if ($LASTEXITCODE -ne 0) { throw "Disposable worktree cleanup failed" }
+}
 ```
 
 Expected: the user first checks out the immutable tag that contains the exact

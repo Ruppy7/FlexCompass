@@ -90,11 +90,24 @@ function Assert-CleanGitState {
 - [ ] **Step 1: Verify exact state and identity**
 
 ```powershell
+$expectedPhase0Head = $env:FLEXCOMPASS_ACCEPTED_PHASE0_HEAD
+if ($expectedPhase0Head -cnotmatch "^[0-9a-f]{40}$") {
+  throw "Exact accepted Phase 0 main SHA was not supplied"
+}
 $status = @(git status --porcelain)
 if ($LASTEXITCODE -ne 0) { throw "Unable to read SSEN worktree status" }
 if ($status) { throw "SSEN worktree is not clean: $($status -join ', ')" }
+$branch = git branch --show-current
+if ($LASTEXITCODE -ne 0) { throw "Unable to resolve SSEN branch" }
 $head = git rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw "Unable to resolve SSEN head" }
+$mainHead = git rev-parse main
+if ($LASTEXITCODE -ne 0) { throw "Unable to resolve local main" }
+if ($branch -cne "feature/ssen-nafirs-hv-foundation" -or
+    $head -cne "f1f3f7c582dcbea6b30feed1025f99a3386b7991" -or
+    $mainHead -cne $expectedPhase0Head) {
+  throw "SSEN branch/head or accepted Phase 0 main SHA does not match"
+}
 $name = git config --local --get user.name
 if ($LASTEXITCODE -ne 0) { throw "Unable to read local Git name" }
 $email = git config --local --get user.email
@@ -106,7 +119,9 @@ if ($name -ne "ruppy7" -or
     $remote -notmatch "^https://github\.com/Ruppy7/FlexCompass(?:\.git)?$") {
   throw "FlexCompass Git identity or remote is not the required ruppy7 account"
 }
+$branch
 $head
+$mainHead
 ```
 
 Expected: clean `feature/ssen-nafirs-hv-foundation` at the head recorded in

@@ -237,20 +237,38 @@ Expected: one local documentation commit under the verified `ruppy7` identity.
 
 - [ ] **Step 1: Revalidate the active plan against current `main`**
 
+Before dispatch, the orchestrator copies the exact accepted predecessor SHA and
+the plan's exact implementation branch from `memory/CURRENT.md` into
+`FLEXCOMPASS_EXPECTED_HEAD` and `FLEXCOMPASS_EXPECTED_BRANCH`. A worker may not
+derive, guess, or silently replace either value.
+
 ```powershell
-$status = git status --porcelain
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$expectedHead = $env:FLEXCOMPASS_EXPECTED_HEAD
+$expectedBranch = $env:FLEXCOMPASS_EXPECTED_BRANCH
+if ($expectedHead -cnotmatch "^[0-9a-f]{40}$") {
+  throw "Exact accepted predecessor SHA was not supplied"
+}
+if ([string]::IsNullOrWhiteSpace($expectedBranch)) {
+  throw "Exact implementation branch was not supplied"
+}
+$status = @(git status --porcelain)
+if ($LASTEXITCODE -ne 0) { throw "Unable to read implementation status" }
 if ($status) { throw "Implementation worktree is not clean" }
-git status --short --branch
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-git rev-parse HEAD
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$actualBranch = git branch --show-current
+if ($LASTEXITCODE -ne 0) { throw "Unable to read implementation branch" }
+$actualHead = git rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw "Unable to read implementation head" }
+if ($actualBranch -cne $expectedBranch -or $actualHead -cne $expectedHead) {
+  throw "Implementation checkout does not match the accepted branch/head"
+}
 git diff --check
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($LASTEXITCODE -ne 0) { throw "Implementation diff check failed" }
+$actualBranch
+$actualHead
 ```
 
-Expected: the chosen implementation worktree is clean and its base matches the
-head recorded in `memory/CURRENT.md`.
+Expected: the chosen implementation worktree is clean and both its exact branch
+and base match the values recorded in `memory/CURRENT.md`.
 
 - [ ] **Step 2: Dispatch one bounded implementation task**
 
