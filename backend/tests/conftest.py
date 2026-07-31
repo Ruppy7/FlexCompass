@@ -45,7 +45,10 @@ def isolated_api_client(
     finally:
         object.__setattr__(config, "db_path", original_db)
 
-    assert set(opened) <= {test_db.resolve()}
+    # Startup no longer opens a database; zero connections is valid. If an
+    # application connection returns, it must still fail closed to this path.
+    allowed_databases = {test_db.resolve()}
+    assert set(opened) <= allowed_databases
 
 
 @pytest.fixture

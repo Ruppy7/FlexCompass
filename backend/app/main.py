@@ -2,33 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
+from .api_errors import (
+    public_exception_response,
+    validation_exception_response,
+)
 from .config import config
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup: run migrations, seed if needed, load data into caches."""
-    from .db import run_migrations
-    run_migrations()
-
-    # Seed DB from JSON if the core tables are empty
-    from .db import get_connection
-    with get_connection() as conn:
-        count = conn.execute("SELECT COUNT(*) FROM portal_datasets").fetchone()[0]
-    if count == 0:
-        from .db_seed import seed_all
-        seed_all()
-
-    # Load data into route-level caches
-    from .routes import reload_data
-    reload_data()
-    yield
-
+from .routes import router
 
 app = FastAPI(
     title="FlexCompass",
@@ -37,46 +20,38 @@ app = FastAPI(
         "electricity-network and flexibility-market data."
     ),
     version="0.1.0",
-    lifespan=lifespan,
+)
+
+app.add_exception_handler(Exception, public_exception_response)
+app.add_exception_handler(
+    RequestValidationError,
+    validation_exception_response,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
-
-from .routes import router  # noqa: E402
 
 app.include_router(router)
 
 
 @app.get("/")
-def root_info():
-    """Root info — service identity + key stats."""
+def root_info() -> dict[str, object]:
+    """Return service identity and the truthful public surface."""
     return {
         "service": "flexcompass",
         "version": "0.1.0",
         "description": "Public Great Britain grid-data research API",
-        "endpoints": [
-            "/health",
-            "/api/health",
-            "/api/portal/datasets",
-            "/api/zones",
-            "/api/signals",
-            "/api/portfolios",
-            "/api/analyse",
-            "/api/report",
-            "/api/ingest/status",
-            "/api/db/stats",
-        ],
+        "endpoints": ["/health", "/api/health"],
     }
 
 
 @app.get("/health")
-def root_health():
+def root_health() -> dict[str, str | int]:
     return {
         "status": "ok",
         "service": "flexcompass",

@@ -1,65 +1,126 @@
-"""FlexCompass configuration — no hardcoded URLs or magic numbers.
-
-All settings load from environment variables with sane defaults.
-Import `config` from this module for a singleton instance.
-"""
+"""FlexCompass configuration with environment-backed settings."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 __all__ = ["config"]
 
 # Load .env early so local public-portal settings are available.
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
 
 
+def _cors_origins_from_env(value: str | None) -> tuple[str, ...]:
+    raw_values = (
+        value.split(",")
+        if value
+        else ["http://127.0.0.1:3000", "http://localhost:3000"]
+    )
+    origins: list[str] = []
+    for raw in raw_values:
+        origin = raw.strip()
+        if origin == "*":
+            raise ValueError("CORS wildcard is prohibited")
+        try:
+            parsed = urlsplit(origin)
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "CORS origins must be absolute HTTP(S) origins"
+            ) from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("CORS origins must be absolute HTTP(S) origins")
+        normalised = f"{parsed.scheme}://{parsed.netloc}"
+        if normalised not in origins:
+            origins.append(normalised)
+    return tuple(origins)
+
+
 @dataclass(frozen=True)
 class FlexCompassConfig:
-    """Top-level configuration — all values overridable via env vars."""
+    """Top-level configuration with values overridable by environment."""
 
-    # --- Paths ---
-    db_path: Path = field(default_factory=lambda: Path(
-        os.environ.get("FLEXCOMPASS_DB_PATH",
-            str(Path(__file__).resolve().parent.parent.parent / "data" / "flexcompass.db"))
-    ))
-    seed_dir: Path = field(default_factory=lambda: Path(
-        os.environ.get("FLEXCOMPASS_SEED_DIR",
-            str(Path(__file__).resolve().parent.parent.parent / "data" / "seed"))
-    ))
-    cache_dir: Path = field(default_factory=lambda: Path(
-        os.environ.get("FLEXCOMPASS_CACHE_DIR",
-            str(Path(__file__).resolve().parent.parent.parent / "data" / "cache"))
-    ))
+    db_path: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get(
+                "FLEXCOMPASS_DB_PATH",
+                str(
+                    Path(__file__).resolve().parent.parent.parent
+                    / "data"
+                    / "flexcompass.db"
+                ),
+            )
+        )
+    )
+    seed_dir: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get(
+                "FLEXCOMPASS_SEED_DIR",
+                str(
+                    Path(__file__).resolve().parent.parent.parent
+                    / "data"
+                    / "seed"
+                ),
+            )
+        )
+    )
+    cache_dir: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get(
+                "FLEXCOMPASS_CACHE_DIR",
+                str(
+                    Path(__file__).resolve().parent.parent.parent
+                    / "data"
+                    / "cache"
+                ),
+            )
+        )
+    )
 
-    # --- Sampling ---
-    default_seed: int = field(default_factory=lambda: int(
-        os.environ.get("FLEXCOMPASS_SEED", "42")
-    ))
+    default_seed: int = field(
+        default_factory=lambda: int(os.environ.get("FLEXCOMPASS_SEED", "42"))
+    )
 
-    # --- API ---
-    api_host: str = field(default_factory=lambda: os.environ.get("FLEXCOMPASS_HOST", "127.0.0.1"))
-    api_port: int = field(default_factory=lambda: int(os.environ.get("FLEXCOMPASS_PORT", "8099")))
-    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    api_host: str = field(
+        default_factory=lambda: os.environ.get(
+            "FLEXCOMPASS_HOST", "127.0.0.1"
+        )
+    )
+    api_port: int = field(
+        default_factory=lambda: int(
+            os.environ.get("FLEXCOMPASS_PORT", "8099")
+        )
+    )
+    cors_origins: tuple[str, ...] = field(
+        default_factory=lambda: _cors_origins_from_env(
+            os.environ.get("FLEXCOMPASS_CORS_ORIGINS")
+        )
+    )
 
-    # --- Capacity formula ---
     capacity_method_version: str = "v0.1"
     default_availability_pct: float = 0.03
     default_reliability_pct: float = 0.85
 
-    # --- Confidence rubric thresholds ---
-    confidence_polygon_field_count: int = 3   # fields needed for high confidence
-    confidence_prefix_field_count: int = 2    # fields needed for medium
-    confidence_min_fields_for_low: int = 1    # minimum fields for low (else insufficient_evidence)
+    confidence_polygon_field_count: int = 3
+    confidence_prefix_field_count: int = 2
+    confidence_min_fields_for_low: int = 1
 
-    # --- Auth ---
-    admin_token: str = field(default_factory=lambda: os.environ.get("FLEXCOMPASS_ADMIN_TOKEN", ""))
 
-# Singleton — import this
 config = FlexCompassConfig()
