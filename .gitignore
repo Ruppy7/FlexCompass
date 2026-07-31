@@ -33,6 +33,7 @@ reports/
 project-plan/
 /memory/
 /.superpowers/
+/.worktrees/
 
 # Build and editor files
 dist/
