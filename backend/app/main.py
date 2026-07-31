@@ -54,7 +54,14 @@ def root_info() -> dict[str, object]:
         "service": "flexcompass",
         "version": "0.1.0",
         "description": "Public Great Britain grid-data research API",
-        "endpoints": ["/health", "/api/health"],
+        "endpoints": [
+            "/health",
+            "/api/health",
+            "/api/demo/portfolios",
+            "/api/demo/analyse",
+            "/api/demo/report",
+            "/api/demo/asset-groups/generate",
+        ],
     }
 
 

@@ -1,6 +1,7 @@
 """API integration tests for the Phase 0 public surface."""
 
 import importlib
+import re
 
 import app.db as app_db
 import httpx
@@ -40,6 +41,22 @@ def test_phase_zero_public_api_contains_health_and_demo_only() -> None:
         "/api/demo/report",
         "/api/demo/asset-groups/generate",
     }
+
+
+def test_root_metadata_lists_the_complete_phase_zero_public_surface(
+    client,
+) -> None:
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.json()["endpoints"] == [
+        "/health",
+        "/api/health",
+        "/api/demo/portfolios",
+        "/api/demo/analyse",
+        "/api/demo/report",
+        "/api/demo/asset-groups/generate",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -105,6 +122,7 @@ def test_demo_report_states_no_portal_data_is_used(
     )
     assert response.status_code == 200
     payload = response.json()
+    assert payload["workflow_kind"] == "synthetic_demo"
     assert payload["portal_data_used"] is False
     assert payload["markdown"].startswith(
         "# Synthetic Flexibility Fit Demonstration"
@@ -113,6 +131,16 @@ def test_demo_report_states_no_portal_data_is_used(
         "no live or current portal data is used."
         in payload["markdown"].lower()
     )
+    assert "synthetic-only" in payload["markdown"].lower()
+    assert re.search(
+        (
+            r"\buses?\b[^.\n]{0,40}"
+            r"\b(?:public|curated|live|current)\b"
+            r"[^.\n]{0,20}\bdata\b"
+        ),
+        payload["markdown"],
+        flags=re.IGNORECASE,
+    ) is None
 
 
 @pytest.mark.parametrize("endpoint", ["analyse", "report"])

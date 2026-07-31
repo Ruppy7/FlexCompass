@@ -5,6 +5,26 @@ export type ServiceType =
   | "demand_turn_up"
   | "generation_turn_up"
   | "generation_turn_down";
+export type Direction = ServiceType;
+export type LocationType =
+  | "dso_region"
+  | "zone"
+  | "postcode_group"
+  | "gsp"
+  | "substation"
+  | "polygon"
+  | "unknown";
+export type RequirementType =
+  | "long_term"
+  | "short_term"
+  | "day_ahead"
+  | "intraday"
+  | "unknown";
+export type HistoricCurrentFutureStatus =
+  | "historic"
+  | "current"
+  | "future"
+  | "unknown";
 
 export type AssetType =
   | "ev_charger"
@@ -50,20 +70,19 @@ export interface Portfolio {
 
 export interface FlexSignal {
   signal_id: string;
-  zone_id?: string;
-  source_id?: string;
+  zone_id: string | null;
   dso: string;
-  platform?: string;
-  market_name: string;
-  area_name: string;
-  location_type: string;
-  location_reference: string;
-  service_type: ServiceType;
-  direction?: string;
-  requirement_type?: string;
-  tender_round?: string;
-  historic_current_future_status?: string;
-  procurement_type: string;
+  platform: string | null;
+  market_name: string | null;
+  area_name: string | null;
+  location_type: LocationType | null;
+  location_reference: string | null;
+  service_type: ServiceType | null;
+  direction: Direction | null;
+  requirement_type: RequirementType | null;
+  tender_round: string | null;
+  historic_current_future_status: HistoricCurrentFutureStatus;
+  procurement_type: string | null;
   window_start: string | null;
   window_end: string | null;
   duration_minutes: number | null;
@@ -73,10 +92,13 @@ export interface FlexSignal {
   price_unit: string | null;
   utilisation_estimate: string | null;
   payment_type: string | null;
-  eligible_asset_types: AssetType[];
+  eligible_asset_types: AssetType[] | null;
+  source_id: string | null;
   source_updated_at: string | null;
+  source_dataset_id: string | null;
+  raw_record: Record<string, unknown> | null;
   confidence_level: ConfidenceLevel;
-  missing_fields?: string[];
+  missing_fields: string[];
   data_quality_notes: string[];
 }
 

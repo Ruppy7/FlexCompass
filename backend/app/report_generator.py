@@ -211,7 +211,9 @@ def generate_report(
     # ── 6. Disclaimer ──
     _add("## 6. Disclaimer\n")
     _add(
-        "This report uses curated public-source data and transparent heuristic assumptions. "
+        "This synthetic-only report is generated solely from the submitted "
+        "demonstration portfolio. No portal-derived signals, sources, market "
+        "evidence, or procurement records are used. "
         "It is **not** a bid recommendation, eligibility confirmation, revenue forecast, "
         "regulatory opinion, or commercial decisioning tool. All estimates are directional "
         "and should be validated against official DSO procurement documentation before "
