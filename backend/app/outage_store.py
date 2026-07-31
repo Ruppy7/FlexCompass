@@ -350,7 +350,7 @@ def _snapshot_from_row(row: sqlite3.Row) -> SourceSnapshot:
         licence_area=row["licence_area"],
         stable_source_url=row["stable_source_url"],
         source_modified_at=row["source_modified_at"],
-        fetched_at=row["fetched_at"] or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        fetched_at=row["fetched_at"],
         content_sha256=row["content_sha256"],
         byte_size=row["byte_size"],
         row_count=row["row_count"],
@@ -771,6 +771,112 @@ def save_outage_rejects(
     return len(supplied)
 
 
+def _invalid_completed_run() -> ValueError:
+    return ValueError("completed ingestion requires one exact completed run")
+
+
+def _validate_completed_run_payload(
+    *,
+    run_id: str,
+    resources_seen: int,
+    snapshots: Sequence[SourceSnapshot],
+    events: Sequence[OutageEvent],
+    rejects: Sequence[OutageReject],
+    fetch_attempts: Sequence[OutageFetchAttemptPublicV1],
+) -> None:
+    if (
+        not run_id
+        or resources_seen != 2
+        or len(snapshots) != 2
+        or len(fetch_attempts) != 2
+    ):
+        raise _invalid_completed_run()
+
+    snapshot_by_resource: dict[str, SourceSnapshot] = {}
+    snapshot_ids: set[str] = set()
+    for snapshot in snapshots:
+        if (
+            snapshot.source_resource_id not in _EXPECTED_RESOURCE_IDS
+            or snapshot.source_resource_id in snapshot_by_resource
+            or snapshot.snapshot_id in snapshot_ids
+            or snapshot.snapshot_id
+            != (
+                f"ssen-nafirs-hv:{snapshot.source_resource_id}:"
+                f"sha256:{snapshot.content_sha256}"
+            )
+        ):
+            raise _invalid_completed_run()
+        snapshot_by_resource[snapshot.source_resource_id] = snapshot
+        snapshot_ids.add(snapshot.snapshot_id)
+    if tuple(sorted(snapshot_by_resource)) != _EXPECTED_RESOURCE_IDS:
+        raise _invalid_completed_run()
+
+    attempt_by_resource: dict[str, OutageFetchAttemptPublicV1] = {}
+    attempt_ids: set[str] = set()
+    for attempt in fetch_attempts:
+        snapshot = snapshot_by_resource.get(attempt.source_resource_id)
+        if (
+            snapshot is None
+            or attempt.source_resource_id in attempt_by_resource
+            or attempt.attempt_id in attempt_ids
+            or attempt.run_id != run_id
+            or attempt.status != "completed"
+            or attempt.response_status != 200
+            or attempt.error_code is not None
+            or attempt.source_snapshot_id != snapshot.snapshot_id
+            or attempt.content_sha256 != snapshot.content_sha256
+            or attempt.byte_size != snapshot.byte_size
+            or attempt.attempted_at != snapshot.fetched_at
+            or attempt.source_modified_at != snapshot.source_modified_at
+        ):
+            raise _invalid_completed_run()
+        attempt_by_resource[attempt.source_resource_id] = attempt
+        attempt_ids.add(attempt.attempt_id)
+    if tuple(sorted(attempt_by_resource)) != _EXPECTED_RESOURCE_IDS:
+        raise _invalid_completed_run()
+
+    materialised_rows = dict.fromkeys(snapshot_ids, 0)
+    event_keys: set[tuple[str, str]] = set()
+    for event in events:
+        snapshot = next(
+            (
+                item
+                for item in snapshots
+                if item.snapshot_id == event.source_snapshot_id
+            ),
+            None,
+        )
+        event_key = (event.source_snapshot_id, event.event_id)
+        if (
+            snapshot is None
+            or event_key in event_keys
+            or event.source_resource_id != snapshot.source_resource_id
+            or event.source_dataset_id != snapshot.source_dataset_id
+            or event.licence_area != snapshot.licence_area
+        ):
+            raise _invalid_completed_run()
+        event_keys.add(event_key)
+        materialised_rows[snapshot.snapshot_id] += 1
+    reject_keys: set[tuple[str, int]] = set()
+    for reject in rejects:
+        snapshot = snapshot_by_resource.get(reject.source_resource_id)
+        reject_key = (reject.source_resource_id, reject.row_number)
+        if (
+            snapshot is None
+            or reject.run_id != run_id
+            or reject.row_number < 1
+            or reject_key in reject_keys
+        ):
+            raise _invalid_completed_run()
+        reject_keys.add(reject_key)
+        materialised_rows[snapshot.snapshot_id] += 1
+    if any(
+        snapshot.row_count != materialised_rows[snapshot.snapshot_id]
+        for snapshot in snapshots
+    ):
+        raise _invalid_completed_run()
+
+
 def commit_ingestion_run(
     *,
     run_id: str,
@@ -778,8 +884,6 @@ def commit_ingestion_run(
     snapshots: Sequence[SourceSnapshot],
     events: Sequence[OutageEvent],
     rejects: Sequence[OutageReject],
-    snapshots_created: int,
-    snapshots_reused: int,
     warnings: Sequence[str],
     fetch_attempts: Sequence[OutageFetchAttemptPublicV1] = (),
     db_path: Path | None = None,
@@ -788,6 +892,15 @@ def commit_ingestion_run(
     supplied_snapshots = list(snapshots)
     supplied_events = list(events)
     supplied_rejects = list(rejects)
+    attempts = list(fetch_attempts)
+    _validate_completed_run_payload(
+        run_id=run_id,
+        resources_seen=resources_seen,
+        snapshots=supplied_snapshots,
+        events=supplied_events,
+        rejects=supplied_rejects,
+        fetch_attempts=attempts,
+    )
     run_migrations(_db_path(db_path))
     safe_warnings = sanitise_diagnostic_value(list(warnings))
     if safe_warnings == UNSAFE_VALUE_SENTINEL:
@@ -810,25 +923,8 @@ def commit_ingestion_run(
         if snapshot_id is None:
             raise ValueError("reject has no supplied source observation")
         rejects_by_snapshot[snapshot_id].append(reject)
-    attempts = list(fetch_attempts)
-    if not attempts:
-        attempts = [
-            OutageFetchAttemptPublicV1(
-                attempt_id=f"attempt:{uuid.uuid4().hex}",
-                run_id=run_id,
-                source_resource_id=item.source_resource_id,
-                attempted_at=item.fetched_at,
-                status="completed",
-                response_status=200,
-                source_modified_at=item.source_modified_at,
-                source_snapshot_id=item.snapshot_id,
-                content_sha256=item.content_sha256,
-                byte_size=item.byte_size,
-                error_code=None,
-            )
-            for item in supplied_snapshots
-        ]
     with get_connection(_db_path(db_path)) as connection:
+        snapshots_created = 0
         connection.execute(
             """INSERT INTO ingestion_runs (
                    run_id, status, resources_seen, warnings_json
@@ -842,6 +938,7 @@ def commit_ingestion_run(
             observation_created = _insert_or_validate_observation(
                 connection, snapshot
             )
+            snapshots_created += int(observation_created)
             _insert_or_validate_events(
                 connection,
                 snapshot.snapshot_id,
@@ -889,6 +986,7 @@ def commit_ingestion_run(
                            updated_at=excluded.updated_at""",
                     (resource_id, snapshot_by_resource[resource_id], run_id, updated_at),
                 )
+        snapshots_reused = len(supplied_snapshots) - snapshots_created
         connection.execute(
             """UPDATE ingestion_runs SET
                    status='completed', snapshots_created=?, snapshots_reused=?,

@@ -3,23 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
+import multiprocessing
 import os
+import re
+import ssl
+import struct
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
+from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import urlsplit
 
-import httpx
 from pydantic import BaseModel, model_validator
 
 from app.config import config
 from app.outage_store import (
     commit_ingestion_run,
     record_failed_ingestion_run,
-    source_observation_exists,
 )
 from app.outages import (
     PARSER_VERSION,
@@ -50,6 +55,480 @@ _REDIRECT_HOST = (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_MANIFEST_PATH = _REPOSITORY_ROOT / "data/sources/ssen-nafirs-hv.json"
 _EXPECTED_RESOURCE_IDS = tuple(sorted((SEPD_RESOURCE_ID, SHEPD_RESOURCE_ID)))
+_PROCESS_MESSAGE_SUCCESS = b"O"
+_PROCESS_MESSAGE_ERROR = b"E"
+_PROCESS_ERROR_REQUEST_FAILED = 1
+_PROCESS_ERROR_DEADLINE = 2
+_PROCESS_ERROR_INITIAL_STATUS = 3
+_PROCESS_ERROR_REDIRECT = 4
+_PROCESS_ERROR_FINAL_STATUS = 5
+_PROCESS_ERROR_MEDIA_TYPE = 6
+_PROCESS_ERROR_CONTENT_LENGTH = 7
+_PROCESS_ERROR_RESPONSE_SIZE = 8
+_PROCESS_ERROR_MESSAGES = {
+    _PROCESS_ERROR_REQUEST_FAILED: (
+        "SSEN resource request failed",
+        "request_failed",
+    ),
+    _PROCESS_ERROR_DEADLINE: (
+        "SSEN resource total deadline exceeded",
+        "total_deadline_exceeded",
+    ),
+    _PROCESS_ERROR_INITIAL_STATUS: (
+        "SSEN resource did not return the required redirect",
+        "unexpected_initial_status",
+    ),
+    _PROCESS_ERROR_REDIRECT: (
+        "SSEN resource returned an unapproved redirect",
+        "unapproved_redirect",
+    ),
+    _PROCESS_ERROR_FINAL_STATUS: (
+        "SSEN redirected resource did not return 200",
+        "unexpected_final_status",
+    ),
+    _PROCESS_ERROR_MEDIA_TYPE: (
+        "SSEN redirected resource is not text/csv",
+        "unexpected_media_type",
+    ),
+    _PROCESS_ERROR_CONTENT_LENGTH: (
+        "SSEN resource content length is invalid",
+        "invalid_content_length",
+    ),
+    _PROCESS_ERROR_RESPONSE_SIZE: (
+        "SSEN resource exceeds the response size limit",
+        "response_size_exceeded",
+    ),
+}
+_PROCESS_ERROR_IDS = {
+    details[1]: error_id for error_id, details in _PROCESS_ERROR_MESSAGES.items()
+}
+
+
+class SsenResourceTransport(Protocol):
+    """Deadline-aware owner of all resources used for one source request."""
+
+    def download(self, resource: SourceResource, *, deadline: float) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+ProcessWorker = Callable[[Connection, dict[str, Any], float], None]
+ConnectionFactory = Callable[[str, int, float], Any]
+
+
+def _remaining_timeout(deadline: float, maximum: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SourceContractError(
+            "SSEN resource total deadline exceeded",
+            error_code="total_deadline_exceeded",
+        )
+    return min(maximum, remaining)
+
+
+def _create_https_connection(
+    host: str,
+    port: int,
+    timeout: float,
+) -> http.client.HTTPSConnection:
+    return http.client.HTTPSConnection(
+        host,
+        port=port,
+        timeout=timeout,
+        context=ssl.create_default_context(),
+    )
+
+
+def _set_connection_timeout(connection: Any, timeout: float) -> None:
+    sock = getattr(connection, "sock", None)
+    if sock is None:
+        raise SourceContractError(
+            "SSEN resource request failed",
+            error_code="request_failed",
+        )
+    sock.settimeout(timeout)
+
+
+def _open_https_response(
+    url: str,
+    deadline: float,
+    connection_factory: ConnectionFactory,
+) -> tuple[Any, Any]:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port or 443
+        host = parsed.hostname
+    except ValueError:
+        raise SourceContractError(
+            "SSEN resource request failed",
+            error_code="request_failed",
+        ) from None
+    if parsed.scheme != "https" or host is None:
+        raise SourceContractError(
+            "SSEN resource request failed",
+            error_code="request_failed",
+        )
+    connection = connection_factory(
+        host,
+        port,
+        _remaining_timeout(deadline, SOURCE_CONNECT_TIMEOUT_SECONDS),
+    )
+    try:
+        connection.connect()
+        _remaining_timeout(deadline, SOURCE_CONNECT_TIMEOUT_SECONDS)
+        _set_connection_timeout(
+            connection,
+            _remaining_timeout(deadline, SOURCE_READ_TIMEOUT_SECONDS),
+        )
+        target = parsed.path or "/"
+        if parsed.query:
+            target += "?" + parsed.query
+        connection.request("GET", target, headers={"accept": "text/csv"})
+        _set_connection_timeout(
+            connection,
+            _remaining_timeout(deadline, SOURCE_READ_TIMEOUT_SECONDS),
+        )
+        response = connection.getresponse()
+        _remaining_timeout(deadline, SOURCE_READ_TIMEOUT_SECONDS)
+        return connection, response
+    except SourceContractError:
+        connection.close()
+        raise
+    except BaseException:
+        connection.close()
+        if time.monotonic() >= deadline:
+            raise SourceContractError(
+                "SSEN resource total deadline exceeded",
+                error_code="total_deadline_exceeded",
+            ) from None
+        raise SourceContractError(
+            "SSEN resource request failed",
+            error_code="request_failed",
+        ) from None
+
+
+def _approved_redirect(location: str, resource_id: str) -> bool:
+    if not location or any(ord(character) < 32 or ord(character) == 127 for character in location):
+        return False
+    try:
+        parsed = urlsplit(location)
+        port = parsed.port
+    except ValueError:
+        return False
+    prefix = f"/dx-sse-prod/resources/{resource_id}/"
+    if not parsed.path.startswith(prefix):
+        return False
+    filename = parsed.path[len(prefix) :]
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == _REDIRECT_HOST
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+        and parsed.fragment == ""
+        and bool(parsed.query)
+        and "%" not in parsed.path
+        and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", filename)
+        is not None
+    )
+
+
+def _download_resource_in_child(
+    resource_payload: dict[str, Any],
+    deadline: float,
+    *,
+    connection_factory: ConnectionFactory | None = None,
+) -> bytes:
+    active_connection_factory = connection_factory or _create_https_connection
+    try:
+        resource = SourceResource.model_validate(resource_payload)
+        _validate_stable_resource_url(resource)
+    except BaseException:
+        raise SourceContractError(
+            "SSEN resource request failed",
+            error_code="request_failed",
+        ) from None
+
+    first_connection, first = _open_https_response(
+        resource.stable_url,
+        deadline,
+        active_connection_factory,
+    )
+    try:
+        if first.status != 302:
+            raise SourceContractError(
+                "SSEN resource did not return the required redirect",
+                response_status=first.status,
+                error_code="unexpected_initial_status",
+            )
+        location = first.getheader("location", "") or ""
+        if not _approved_redirect(location, resource.source_resource_id):
+            raise SourceContractError(
+                "SSEN resource returned an unapproved redirect",
+                error_code="unapproved_redirect",
+            )
+    finally:
+        first.close()
+        first_connection.close()
+
+    second_connection, second = _open_https_response(
+        location,
+        deadline,
+        active_connection_factory,
+    )
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        if second.status != 200:
+            raise SourceContractError(
+                "SSEN redirected resource did not return 200",
+                response_status=second.status,
+                error_code="unexpected_final_status",
+            )
+        media_type = (second.getheader("content-type", "") or "").split(
+            ";", 1
+        )[0].strip().lower()
+        if media_type != "text/csv":
+            raise SourceContractError(
+                "SSEN redirected resource is not text/csv",
+                error_code="unexpected_media_type",
+            )
+        declared = second.getheader("content-length")
+        if declared is not None:
+            try:
+                declared_size = int(declared, 10)
+            except ValueError:
+                raise SourceContractError(
+                    "SSEN resource content length is invalid",
+                    error_code="invalid_content_length",
+                ) from None
+            if declared_size < 0 or declared_size > SOURCE_MAX_RESPONSE_BYTES:
+                raise SourceContractError(
+                    "SSEN resource exceeds the response size limit",
+                    error_code="response_size_exceeded",
+                )
+        while True:
+            _set_connection_timeout(
+                second_connection,
+                _remaining_timeout(deadline, SOURCE_READ_TIMEOUT_SECONDS),
+            )
+            try:
+                chunk = second.read(64 * 1024)
+            except BaseException:
+                if time.monotonic() >= deadline:
+                    raise SourceContractError(
+                        "SSEN resource total deadline exceeded",
+                        error_code="total_deadline_exceeded",
+                    ) from None
+                raise SourceContractError(
+                    "SSEN resource request failed",
+                    error_code="request_failed",
+                ) from None
+            _remaining_timeout(deadline, SOURCE_READ_TIMEOUT_SECONDS)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > SOURCE_MAX_RESPONSE_BYTES:
+                raise SourceContractError(
+                    "SSEN resource exceeds the response size limit",
+                    error_code="response_size_exceeded",
+                )
+            chunks.append(chunk)
+    finally:
+        second.close()
+        second_connection.close()
+    return b"".join(chunks)
+
+
+def _ssen_download_process_worker(
+    send_connection: Connection,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    try:
+        content = _download_resource_in_child(resource_payload, deadline)
+    except SourceContractError as error:
+        error_id = _PROCESS_ERROR_IDS.get(
+            error.code,
+            _PROCESS_ERROR_REQUEST_FAILED,
+        )
+        status = error.response_status
+        safe_status = status if status is not None and 0 <= status < 0xFFFF else 0xFFFF
+        send_connection.send_bytes(
+            _PROCESS_MESSAGE_ERROR + struct.pack("!BH", error_id, safe_status)
+        )
+        return
+    except BaseException:
+        send_connection.send_bytes(
+            _PROCESS_MESSAGE_ERROR
+            + struct.pack("!BH", _PROCESS_ERROR_REQUEST_FAILED, 0xFFFF)
+        )
+        return
+    send_connection.send_bytes(_PROCESS_MESSAGE_SUCCESS + content)
+
+
+def _safe_process_entry(
+    worker_target: ProcessWorker,
+    send_connection: Connection,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    """Run an importable child target without reflecting child exception state."""
+    try:
+        worker_target(send_connection, resource_payload, deadline)
+    except BaseException:
+        try:
+            send_connection.send_bytes(
+                _PROCESS_MESSAGE_ERROR
+                + struct.pack("!BH", _PROCESS_ERROR_REQUEST_FAILED, 0xFFFF)
+            )
+        except BaseException:
+            pass
+    finally:
+        try:
+            send_connection.close()
+        except BaseException:
+            pass
+
+
+def _terminate_and_join(process: multiprocessing.Process) -> None:
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
+    if process.is_alive():
+        process.kill()
+        process.join()
+    elif process.exitcode is None:
+        process.join()
+
+
+class OwnedProcessSsenTransport:
+    """Spawn-owned hard-deadline boundary for synchronous HTTPS collection."""
+
+    def __init__(
+        self,
+        *,
+        worker_target: ProcessWorker | None = None,
+        max_response_bytes: int = SOURCE_MAX_RESPONSE_BYTES,
+        poll_interval_seconds: float = 0.05,
+    ) -> None:
+        self._worker_target = worker_target or _ssen_download_process_worker
+        self._max_response_bytes = max_response_bytes
+        self._poll_interval_seconds = poll_interval_seconds
+        self._context = multiprocessing.get_context("spawn")
+
+    def download(self, resource: SourceResource, *, deadline: float) -> bytes:
+        if time.monotonic() >= deadline:
+            raise SourceContractError("SSEN resource total deadline exceeded")
+        receive_connection, send_connection = self._context.Pipe(duplex=False)
+        process = self._context.Process(
+            target=_safe_process_entry,
+            args=(
+                self._worker_target,
+                send_connection,
+                resource.model_dump(mode="python"),
+                deadline,
+            ),
+            name="ssen-download-worker",
+        )
+        started = False
+        message: bytes | None = None
+        try:
+            process.start()
+            started = True
+            send_connection.close()
+            while message is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SourceContractError(
+                        "SSEN resource total deadline exceeded"
+                    )
+                if receive_connection.poll(
+                    min(remaining, self._poll_interval_seconds)
+                ):
+                    try:
+                        message = receive_connection.recv_bytes(
+                            self._max_response_bytes + 1
+                        )
+                    except (EOFError, OSError):
+                        raise SourceContractError(
+                            "SSEN resource worker protocol failed"
+                        ) from None
+                    if time.monotonic() >= deadline:
+                        raise SourceContractError(
+                            "SSEN resource total deadline exceeded"
+                        )
+                    break
+                if not process.is_alive():
+                    raise SourceContractError(
+                        "SSEN resource worker protocol failed"
+                    )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SourceContractError(
+                    "SSEN resource total deadline exceeded"
+                )
+            process.join(remaining)
+            if process.is_alive() or time.monotonic() >= deadline:
+                raise SourceContractError(
+                    "SSEN resource total deadline exceeded"
+                )
+            duplicate_message = False
+            try:
+                has_trailing_data = receive_connection.poll(0)
+            except (EOFError, OSError):
+                has_trailing_data = False
+            if has_trailing_data:
+                try:
+                    receive_connection.recv_bytes(self._max_response_bytes + 1)
+                except EOFError:
+                    pass
+                except OSError:
+                    duplicate_message = True
+                else:
+                    duplicate_message = True
+            if process.exitcode != 0 or duplicate_message:
+                raise SourceContractError(
+                    "SSEN resource worker protocol failed"
+                )
+            return self._decode_message(message)
+        except SourceContractError:
+            raise
+        except BaseException:
+            raise SourceContractError(
+                "SSEN resource worker protocol failed"
+            ) from None
+        finally:
+            if started:
+                _terminate_and_join(process)
+                process.close()
+            receive_connection.close()
+            try:
+                send_connection.close()
+            except BaseException:
+                pass
+
+    def _decode_message(self, message: bytes) -> bytes:
+        if not message:
+            raise SourceContractError("SSEN resource worker protocol failed")
+        if message[:1] == _PROCESS_MESSAGE_SUCCESS:
+            return message[1:]
+        if message[:1] != _PROCESS_MESSAGE_ERROR or len(message) != 4:
+            raise SourceContractError("SSEN resource worker protocol failed")
+        error_id, response_status = struct.unpack("!BH", message[1:])
+        details = _PROCESS_ERROR_MESSAGES.get(error_id)
+        if details is None:
+            raise SourceContractError("SSEN resource worker protocol failed")
+        message_text, error_code = details
+        raise SourceContractError(
+            message_text,
+            response_status=None if response_status == 0xFFFF else response_status,
+            error_code=error_code,
+        )
+
+    def close(self) -> None:
+        """No persistent child resource survives an individual download."""
 
 
 class SourceLicenceEvidenceArtifactV1(BaseModel):
@@ -231,125 +710,24 @@ def load_ssen_source_manifest(
     return manifest
 
 
-def _approved_redirect(location: str, resource_id: str) -> bool:
-    try:
-        parsed = urlsplit(location)
-        port = parsed.port
-    except ValueError:
-        return False
-    prefix = f"/dx-sse-prod/resources/{resource_id}/"
-    filename = parsed.path.removeprefix(prefix)
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname == _REDIRECT_HOST
-        and parsed.username is None
-        and parsed.password is None
-        and port in (None, 443)
-        and parsed.fragment == ""
-        and parsed.path.startswith(prefix)
-        and bool(filename)
-        and "/" not in filename
-    )
-
-
-def _send_stream(
-    client: httpx.Client,
-    url: str,
-    timeout: httpx.Timeout,
-) -> httpx.Response | None:
-    failed = False
-    response: httpx.Response | None = None
-    try:
-        request = client.build_request("GET", url, timeout=timeout)
-        response = client.send(request, stream=True, follow_redirects=False)
-    except Exception:
-        failed = True
-    if failed:
-        return None
-    return response
-
-
 def download_ssen_hv_resource(
-    client: httpx.Client,
+    transport: SsenResourceTransport,
     resource: SourceResource,
 ) -> bytes:
     """Download one resource through exactly one bounded approved redirect."""
-    if getattr(client, "follow_redirects", False):
-        raise SourceContractError("SSEN resource client must not follow redirects")
     _validate_stable_resource_url(resource)
-    started = time.monotonic()
-
-    def check_deadline() -> None:
-        if time.monotonic() - started >= SOURCE_TOTAL_DEADLINE_SECONDS:
-            raise SourceContractError("SSEN resource total deadline exceeded")
-
-    timeout = httpx.Timeout(
-        connect=SOURCE_CONNECT_TIMEOUT_SECONDS,
-        read=SOURCE_READ_TIMEOUT_SECONDS,
-        write=SOURCE_READ_TIMEOUT_SECONDS,
-        pool=SOURCE_CONNECT_TIMEOUT_SECONDS,
-    )
-    check_deadline()
-    first = _send_stream(client, resource.stable_url, timeout)
-    if first is None:
-        raise SourceContractError("SSEN resource request failed")
     try:
-        check_deadline()
-        if first.status_code != 302:
-            raise SourceContractError(
-                "SSEN resource did not return the required redirect",
-                response_status=first.status_code,
-                error_code="unexpected_initial_status",
-            )
-        location = first.headers.get("location", "")
-        if not _approved_redirect(location, resource.source_resource_id):
-            raise SourceContractError("SSEN resource returned an unapproved redirect")
-    finally:
-        first.close()
-
-    check_deadline()
-    second = _send_stream(client, location, timeout)
-    location = ""
-    if second is None:
-        raise SourceContractError("SSEN redirected resource request failed")
-    stream_failed = False
-    chunks: list[bytes] = []
-    total = 0
-    try:
-        check_deadline()
-        if second.status_code != 200:
-            raise SourceContractError(
-                "SSEN redirected resource did not return 200",
-                response_status=second.status_code,
-                error_code="unexpected_final_status",
-            )
-        media_type = second.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        if media_type != "text/csv":
-            raise SourceContractError("SSEN redirected resource is not text/csv")
-        declared = second.headers.get("content-length")
-        if declared is not None:
-            try:
-                declared_size = int(declared, 10)
-            except ValueError:
-                raise SourceContractError("SSEN resource content length is invalid") from None
-            if declared_size < 0 or declared_size > SOURCE_MAX_RESPONSE_BYTES:
-                raise SourceContractError("SSEN resource exceeds the response size limit")
-        try:
-            for chunk in second.iter_bytes():
-                total += len(chunk)
-                if total > SOURCE_MAX_RESPONSE_BYTES:
-                    raise SourceContractError("SSEN resource exceeds the response size limit")
-                chunks.append(chunk)
-                check_deadline()
-        except SourceContractError:
-            raise
-        except Exception:
-            stream_failed = True
-    finally:
-        second.close()
-    if stream_failed:
-        raise SourceContractError("SSEN resource stream failed")
-    return b"".join(chunks)
+        return transport.download(
+            resource,
+            deadline=time.monotonic() + SOURCE_TOTAL_DEADLINE_SECONDS,
+        )
+    except SourceContractError:
+        raise
+    except BaseException:
+        raise SourceContractError(
+            "SSEN resource request failed",
+            error_code="request_failed",
+        ) from None
 
 
 def _write_blob(
@@ -384,7 +762,7 @@ def sync_ssen_nafirs_hv(
     *,
     db_path: Path | None = None,
     snapshot_dir: Path | None = None,
-    client: httpx.Client | None = None,
+    client: SsenResourceTransport | None = None,
 ) -> SyncResult:
     """Synchronise both reviewed resources into one atomic local evidence set."""
     manifest = load_ssen_source_manifest()
@@ -396,23 +774,19 @@ def sync_ssen_nafirs_hv(
     rejects: list[OutageReject] = []
     attempts: list[OutageFetchAttemptPublicV1] = []
     created_files: list[Path] = []
-    own_client = client is None
-    active_client = client or httpx.Client(follow_redirects=False)
+    own_transport = client is None
+    active_transport = client or OwnedProcessSsenTransport()
     resources_seen = 0
     try:
-        snapshots_created = 0
         for resource in sorted(
             manifest.resources, key=lambda item: item.source_resource_id
         ):
             resources_seen += 1
             attempted_at = datetime.now(timezone.utc)
             try:
-                content = download_ssen_hv_resource(active_client, resource)
+                content = download_ssen_hv_resource(active_transport, resource)
                 digest = hashlib.sha256(content).hexdigest()
                 snapshot_id = source_snapshot_id(resource.source_resource_id, digest)
-                snapshots_created += int(
-                    not source_observation_exists(snapshot_id, db_path=resolved_db)
-                )
                 relative_path, created_path = _write_blob(
                     content, digest, resolved_snapshot_dir, run_id
                 )
@@ -507,8 +881,6 @@ def sync_ssen_nafirs_hv(
             snapshots=snapshots,
             events=events,
             rejects=rejects,
-            snapshots_created=snapshots_created,
-            snapshots_reused=len(snapshots) - snapshots_created,
             warnings=[],
             fetch_attempts=attempts,
             db_path=resolved_db,
@@ -525,5 +897,5 @@ def sync_ssen_nafirs_hv(
             db_path=resolved_db,
         )
     finally:
-        if own_client:
-            active_client.close()
+        if own_transport:
+            active_transport.close()

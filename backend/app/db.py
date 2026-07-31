@@ -697,6 +697,8 @@ def _source_snapshot_id(source_resource_id: str, content_sha256: str) -> str:
 
 def _backfill_outage_version_seven(conn: sqlite3.Connection) -> None:
     """Backfill only legacy evidence whose snapshot association is provable."""
+    from .persistence_safety import require_exact_safe_raw_record
+
     legacy_snapshots = conn.execute(
         "SELECT * FROM source_snapshots ORDER BY snapshot_id"
     ).fetchall()
@@ -770,6 +772,7 @@ def _backfill_outage_version_seven(conn: sqlite3.Connection) -> None:
         event["source_snapshot_id"] = snapshot_id
         event["quality_flags"] = json.loads(event.pop("quality_flags_json"))
         event["raw_record"] = json.loads(event.pop("raw_record_json"))
+        require_exact_safe_raw_record(event["raw_record"])
         event_json = _canonical_json(event)
         event_sha256 = __import__("hashlib").sha256(event_json.encode()).hexdigest()
         conn.execute(

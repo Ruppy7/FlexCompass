@@ -6,10 +6,13 @@ import csv
 import hashlib
 import io
 import json
+import logging
+import multiprocessing
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -20,9 +23,10 @@ import pytest
 from app.db import MIGRATIONS, get_connection, run_migrations
 from app.outage_cli import main as outage_cli_main
 from app.outage_source import (
-    SOURCE_CONNECT_TIMEOUT_SECONDS,
-    SOURCE_READ_TIMEOUT_SECONDS,
+    OwnedProcessSsenTransport,
     SourceLicenceEvidenceArtifactV1,
+    _download_resource_in_child,
+    _ssen_download_process_worker,
     download_ssen_hv_resource,
     load_ssen_source_manifest,
     sync_ssen_nafirs_hv,
@@ -47,6 +51,7 @@ from app.outage_store import (
 )
 from app.outages import (
     OutageEvent,
+    OutageFetchAttemptPublicV1,
     OutageReject,
     OutageSummary,
     SourceResource,
@@ -80,6 +85,87 @@ from pydantic import BaseModel, ValidationError
 
 LicenceArea = Literal["SEPD", "SHEPD"]
 
+
+def _spawn_success_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del resource_payload, deadline
+    try:
+        send_connection.send_bytes(b"Ocsv")
+    finally:
+        send_connection.close()
+
+
+def _spawn_failure_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del resource_payload, deadline
+    try:
+        send_connection.send_bytes(b"E\x01\xff\xff")
+    finally:
+        send_connection.close()
+
+
+def _spawn_non_cooperative_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del send_connection, resource_payload, deadline
+    time.sleep(60)
+
+
+def _spawn_malformed_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del resource_payload, deadline
+    try:
+        send_connection.send_bytes(b"not-a-valid-message")
+    finally:
+        send_connection.close()
+
+
+def _spawn_duplicate_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del resource_payload, deadline
+    try:
+        send_connection.send_bytes(b"Ocsv")
+        send_connection.send_bytes(b"Oduplicate")
+    finally:
+        send_connection.close()
+
+
+def _spawn_oversize_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del resource_payload, deadline
+    try:
+        send_connection.send_bytes(b"O" + (b"x" * 64))
+    finally:
+        send_connection.close()
+
+
+def _spawn_marker_failure_worker(
+    send_connection: Any,
+    resource_payload: dict[str, Any],
+    deadline: float,
+) -> None:
+    del send_connection, resource_payload, deadline
+    raise RuntimeError(
+        "X-Amz-Signature=SYNTHETIC_CHILD_FAILURE_MUST_NOT_LEAK"
+    )
+
 EXPECTED_MODEL_FIELDS: dict[type[BaseModel], dict[str, object]] = {
     SourceResource: {
         "source_dataset_id": str,
@@ -102,7 +188,7 @@ EXPECTED_MODEL_FIELDS: dict[type[BaseModel], dict[str, object]] = {
         "licence_area": LicenceArea,
         "stable_source_url": str,
         "source_modified_at": datetime | None,
-        "fetched_at": datetime,
+        "fetched_at": datetime | None,
         "content_sha256": str,
         "byte_size": int,
         "row_count": int,
@@ -122,7 +208,7 @@ EXPECTED_MODEL_FIELDS: dict[type[BaseModel], dict[str, object]] = {
         "licence_area": LicenceArea,
         "stable_source_url": str,
         "source_modified_at": datetime | None,
-        "fetched_at": datetime,
+        "fetched_at": datetime | None,
         "content_sha256": str,
         "byte_size": int,
         "row_count": int,
@@ -1029,6 +1115,106 @@ def _event_with(
     )
 
 
+def _exact_run_payload(
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    fetched_at = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    sepd_digest = "a" * 64
+    shepd_digest = "b" * 64
+    sepd = source_snapshot.model_copy(
+        update={
+            "snapshot_id": source_snapshot_id(SEPD_RESOURCE_ID, sepd_digest),
+            "source_resource_id": SEPD_RESOURCE_ID,
+            "licence_area": "SEPD",
+            "content_sha256": sepd_digest,
+            "byte_size": 101,
+            "fetched_at": fetched_at,
+            "local_snapshot_path": f"blobs/aa/{sepd_digest}.csv",
+        }
+    )
+    shepd = source_snapshot.model_copy(
+        update={
+            "snapshot_id": source_snapshot_id(SHEPD_RESOURCE_ID, shepd_digest),
+            "source_resource_id": SHEPD_RESOURCE_ID,
+            "licence_area": "SHEPD",
+            "content_sha256": shepd_digest,
+            "byte_size": 202,
+            "row_count": 0,
+            "fetched_at": fetched_at,
+            "local_snapshot_path": f"blobs/bb/{shepd_digest}.csv",
+        }
+    )
+    event = parsed_event.model_copy(
+        update={
+            "source_snapshot_id": sepd.snapshot_id,
+            "source_resource_id": SEPD_RESOURCE_ID,
+            "licence_area": "SEPD",
+        }
+    )
+    attempts = [
+        OutageFetchAttemptPublicV1(
+            attempt_id=f"attempt:{run_id}:{snapshot.source_resource_id}",
+            run_id=run_id,
+            source_resource_id=snapshot.source_resource_id,
+            attempted_at=fetched_at,
+            status="completed",
+            response_status=200,
+            source_modified_at=snapshot.source_modified_at,
+            source_snapshot_id=snapshot.snapshot_id,
+            content_sha256=snapshot.content_sha256,
+            byte_size=snapshot.byte_size,
+            error_code=None,
+        )
+        for snapshot in (sepd, shepd)
+    ]
+    return {
+        "run_id": run_id,
+        "resources_seen": 2,
+        "snapshots": [sepd, shepd],
+        "events": [event],
+        "rejects": [],
+        "warnings": [],
+        "fetch_attempts": attempts,
+    }
+
+
+def _commit_exact_run(
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+    *,
+    run_id: str,
+    db_path: Path,
+    rejects: list[OutageReject] | None = None,
+    warnings: list[Any] | None = None,
+) -> SyncResult:
+    payload = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
+        run_id=run_id,
+    )
+    if rejects is not None:
+        payload["rejects"] = rejects
+    if warnings is not None:
+        payload["warnings"] = warnings
+    row_counts = {
+        snapshot.source_resource_id: 0 for snapshot in payload["snapshots"]
+    }
+    for event in payload["events"]:
+        row_counts[event.source_resource_id] += 1
+    for reject in payload["rejects"]:
+        row_counts[reject.source_resource_id] += 1
+    payload["snapshots"] = [
+        snapshot.model_copy(
+            update={"row_count": row_counts[snapshot.source_resource_id]}
+        )
+        for snapshot in payload["snapshots"]
+    ]
+    return commit_ingestion_run(**payload, db_path=db_path)
+
+
 def test_outage_schema_migrates_with_required_tables_and_indexes(
     temp_db: Path,
 ) -> None:
@@ -1355,16 +1541,13 @@ def test_commit_ingestion_run_is_one_atomic_transaction(
         raw_row={"HV_INCIDENT_TIME": "not-a-date", "signed_url": marker},
     )
 
-    result = commit_ingestion_run(
+    result = _commit_exact_run(
+        source_snapshot,
+        parsed_event,
         run_id="run:complete",
-        resources_seen=2,
-        snapshots=[source_snapshot],
-        events=[parsed_event],
-        rejects=[reject],
-        snapshots_created=1,
-        snapshots_reused=0,
-        warnings=["publisher cadence remains unknown"],
         db_path=temp_db,
+        rejects=[reject],
+        warnings=["publisher cadence remains unknown"],
     )
 
     assert result.status == "completed"
@@ -1385,44 +1568,134 @@ def test_commit_ingestion_run_is_one_atomic_transaction(
     assert marker not in reject_json
 
 
+@pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "duplicate_snapshot",
+        "missing_snapshot",
+        "extra_resource",
+        "duplicate_attempt",
+        "missing_attempt",
+        "cross_run_attempt",
+        "failed_attempt",
+        "attempt_snapshot_mismatch",
+        "attempt_hash_mismatch",
+        "attempt_size_mismatch",
+        "resources_seen_mismatch",
+        "row_count_mismatch",
+        "event_resource_mismatch",
+        "duplicate_event",
+        "duplicate_reject",
+    ],
+)
+def test_commit_ingestion_run_rejects_malformed_exact_run_before_mutation(
+    invalid_case: str,
+    temp_db: Path,
+    tmp_path: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    seed = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
+        run_id="run:valid-seed",
+    )
+    commit_ingestion_run(**seed, db_path=temp_db)
+    with get_connection(temp_db) as connection:
+        before_dump = "\n".join(connection.iterdump())
+    before_current = current_outage_snapshot_ids(db_path=temp_db)
+
+    invalid = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
+        run_id=f"run:invalid:{invalid_case}",
+    )
+    snapshots = invalid["snapshots"]
+    attempts = invalid["fetch_attempts"]
+    if invalid_case == "duplicate_snapshot":
+        snapshots.append(snapshots[0])
+    elif invalid_case == "missing_snapshot":
+        snapshots.pop()
+    elif invalid_case == "extra_resource":
+        snapshots.append(
+            snapshots[0].model_copy(
+                update={
+                    "snapshot_id": source_snapshot_id("extra", "c" * 64),
+                    "source_resource_id": "extra",
+                    "content_sha256": "c" * 64,
+                }
+            )
+        )
+    elif invalid_case == "duplicate_attempt":
+        attempts.append(attempts[0])
+    elif invalid_case == "missing_attempt":
+        attempts.pop()
+    elif invalid_case == "cross_run_attempt":
+        attempts[0] = attempts[0].model_copy(update={"run_id": "run:other"})
+    elif invalid_case == "failed_attempt":
+        attempts[0] = attempts[0].model_copy(update={"status": "failed"})
+    elif invalid_case == "attempt_snapshot_mismatch":
+        attempts[0] = attempts[0].model_copy(
+            update={"source_snapshot_id": snapshots[1].snapshot_id}
+        )
+    elif invalid_case == "attempt_hash_mismatch":
+        attempts[0] = attempts[0].model_copy(update={"content_sha256": "d" * 64})
+    elif invalid_case == "attempt_size_mismatch":
+        attempts[0] = attempts[0].model_copy(update={"byte_size": 999})
+    elif invalid_case == "resources_seen_mismatch":
+        invalid["resources_seen"] = 3
+    elif invalid_case == "row_count_mismatch":
+        snapshots[0] = snapshots[0].model_copy(update={"row_count": 99})
+    elif invalid_case == "event_resource_mismatch":
+        invalid["events"][0] = invalid["events"][0].model_copy(
+            update={"source_resource_id": SHEPD_RESOURCE_ID}
+        )
+    elif invalid_case == "duplicate_event":
+        invalid["events"].append(invalid["events"][0])
+        snapshots[0] = snapshots[0].model_copy(update={"row_count": 2})
+    elif invalid_case == "duplicate_reject":
+        reject = OutageReject(
+            run_id=invalid["run_id"],
+            source_resource_id=SEPD_RESOURCE_ID,
+            row_number=2,
+            error_code="invalid",
+            error_message="invalid row",
+            raw_row={"value": "bad"},
+        )
+        invalid["rejects"] = [reject, reject]
+        snapshots[0] = snapshots[0].model_copy(update={"row_count": 3})
+
+    fresh_db = tmp_path / f"invalid-{invalid_case}.sqlite3"
+    with pytest.raises(ValueError, match="exact completed run"):
+        commit_ingestion_run(**invalid, db_path=fresh_db)
+    assert fresh_db.exists() is False
+
+    with pytest.raises(ValueError, match="exact completed run"):
+        commit_ingestion_run(**invalid, db_path=temp_db)
+    with get_connection(temp_db) as connection:
+        after_dump = "\n".join(connection.iterdump())
+    assert after_dump == before_dump
+    assert current_outage_snapshot_ids(db_path=temp_db) == before_current
+
+
 def test_commit_ingestion_run_rolls_back_running_row_and_all_payloads(
     temp_db: Path,
     source_snapshot: SourceSnapshot,
     parsed_event: OutageEvent,
 ) -> None:
-    invalid_event = parsed_event.model_copy(
+    invalid = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
+        run_id="run:rollback",
+    )
+    invalid["events"][0] = invalid["events"][0].model_copy(
         update={"source_snapshot_id": "sha256:missing"}
     )
 
-    with pytest.raises(sqlite3.IntegrityError):
-        commit_ingestion_run(
-            run_id="run:rollback",
-            resources_seen=1,
-            snapshots=[source_snapshot],
-            events=[invalid_event],
-            rejects=[],
-            snapshots_created=1,
-            snapshots_reused=0,
-            warnings=[],
-            db_path=temp_db,
-        )
+    with pytest.raises(ValueError, match="exact completed run"):
+        commit_ingestion_run(**invalid, db_path=temp_db)
 
-    with get_connection(temp_db) as connection:
-        counts = {
-            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in (
-                "source_snapshots",
-                "ingestion_runs",
-                "outage_events",
-                "outage_rejects",
-            )
-        }
-    assert counts == {
-        "source_snapshots": 0,
-        "ingestion_runs": 0,
-        "outage_events": 0,
-        "outage_rejects": 0,
-    }
+    assert temp_db.exists() is False
 
 
 def test_failed_run_records_only_redacted_safe_failure_state(
@@ -1498,21 +1771,18 @@ def test_signed_r2_redirect_material_never_crosses_persistence_boundaries(
         },
     )
 
-    completed = commit_ingestion_run(
+    completed = _commit_exact_run(
+        source_snapshot,
+        parsed_event,
         run_id="run:signed-completed",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[parsed_event],
+        db_path=temp_db,
         rejects=[reject],
-        snapshots_created=1,
-        snapshots_reused=0,
         warnings=[
             "preserve ordinary completed warning",
             signed_url,
             nested_payload,
             f"prefix X-Amz-Algorithm={markers['X-Amz-Algorithm']} suffix",
         ],
-        db_path=temp_db,
     )
     failed = record_failed_ingestion_run(
         run_id="run:signed-failed",
@@ -1614,14 +1884,12 @@ def test_encoded_signed_redirect_material_never_crosses_persistence_boundaries(
         raw_row=encoded_payload,
     )
 
-    completed = commit_ingestion_run(
+    completed = _commit_exact_run(
+        source_snapshot,
+        parsed_event,
         run_id="run:encoded-completed",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[parsed_event],
+        db_path=temp_db,
         rejects=[reject],
-        snapshots_created=1,
-        snapshots_reused=0,
         warnings=[
             "preserve ordinary encoded completed warning",
             encoded_url,
@@ -1631,7 +1899,6 @@ def test_encoded_signed_redirect_material_never_crosses_persistence_boundaries(
             double_fully_encoded_url,
             encoded_payload,
         ],
-        db_path=temp_db,
     )
     failed = record_failed_ingestion_run(
         run_id="run:encoded-failed",
@@ -1725,21 +1992,18 @@ def test_default_port_signed_redirect_never_crosses_persistence_boundaries(
         },
     )
 
-    completed = commit_ingestion_run(
+    completed = _commit_exact_run(
+        source_snapshot,
+        parsed_event,
         run_id="run:port-completed",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[parsed_event],
+        db_path=temp_db,
         rejects=[reject],
-        snapshots_created=1,
-        snapshots_reused=0,
         warnings=[
             "preserve ordinary default-port completed warning",
             signed_url,
             encoded_url,
             double_encoded_url,
         ],
-        db_path=temp_db,
     )
     failed = record_failed_ingestion_run(
         run_id="run:port-failed",
@@ -1792,16 +2056,12 @@ def test_benign_percent_and_multiline_warnings_survive_persistence(
         "ordinary first line\nordinary second line",
     ]
 
-    completed = commit_ingestion_run(
+    completed = _commit_exact_run(
+        source_snapshot,
+        parsed_event,
         run_id="run:benign-completed",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[parsed_event],
-        rejects=[],
-        snapshots_created=1,
-        snapshots_reused=0,
-        warnings=benign,
         db_path=temp_db,
+        warnings=benign,
     )
     failed = record_failed_ingestion_run(
         run_id="run:benign-failed",
@@ -2146,16 +2406,12 @@ def test_mixed_safe_and_unsafe_rows_complete_with_one_reject(
         raw_row=parsed[0].raw_record,
     )
 
-    result = commit_ingestion_run(
+    result = _commit_exact_run(
+        source_snapshot,
+        parsed[1],
         run_id="run:mixed-boundary",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[parsed[1]],
-        rejects=[reject],
-        snapshots_created=1,
-        snapshots_reused=0,
-        warnings=[],
         db_path=temp_db,
+        rejects=[reject],
     )
 
     with get_connection(temp_db) as connection:
@@ -2174,18 +2430,22 @@ def test_budget_failures_leave_no_partial_run_state(
         update={"raw_record": {"note": "x" * (MAX_PERSISTED_STRING_BYTES + 1)}}
     )
 
-    with pytest.raises(UnsafePersistenceValueError):
-        commit_ingestion_run(
-            run_id="run:unsafe-budget",
-            resources_seen=1,
-            snapshots=[source_snapshot],
-            events=[unsafe],
-            rejects=[],
-            snapshots_created=1,
-            snapshots_reused=0,
-            warnings=[],
-            db_path=temp_db,
+    payload = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
+        run_id="run:unsafe-budget",
+    )
+    payload["events"] = [
+        unsafe.model_copy(
+            update={
+                "source_snapshot_id": payload["snapshots"][0].snapshot_id,
+                "source_resource_id": SEPD_RESOURCE_ID,
+            }
         )
+    ]
+
+    with pytest.raises(UnsafePersistenceValueError):
+        commit_ingestion_run(**payload, db_path=temp_db)
 
     with get_connection(temp_db) as connection:
         counts = {
@@ -2221,16 +2481,13 @@ def test_deep_completed_failed_reject_and_results_share_the_same_boundary(
         raw_row={unsafe_key: unsafe, "value": unsafe},
     )
 
-    completed = commit_ingestion_run(
+    completed = _commit_exact_run(
+        source_snapshot,
+        parsed_event,
         run_id=f"run:shared-completed:{run_suffix}",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[parsed_event],
-        rejects=[reject],
-        snapshots_created=1,
-        snapshots_reused=0,
-        warnings=[{unsafe_key: unsafe, "value": unsafe}],
         db_path=temp_db,
+        rejects=[reject],
+        warnings=[{unsafe_key: unsafe, "value": unsafe}],
     )
     failed = record_failed_ingestion_run(
         run_id=f"run:shared-failed:{run_suffix}",
@@ -2309,6 +2566,92 @@ class TimedByteStream(httpx.SyncByteStream):
             yield chunk
 
 
+class ScriptedSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+
+class ScriptedHTTPResponse:
+    def __init__(
+        self,
+        status: int,
+        *,
+        headers: dict[str, str] | None = None,
+        chunks: list[bytes] | None = None,
+        on_read: Any | None = None,
+    ) -> None:
+        self.status = status
+        self._headers = {key.lower(): value for key, value in (headers or {}).items()}
+        self._chunks = list(chunks or [])
+        self._on_read = on_read
+        self.closed = False
+
+    def getheader(self, name: str, default: str | None = None) -> str | None:
+        return self._headers.get(name.lower(), default)
+
+    def read(self, amount: int) -> bytes:
+        del amount
+        if self._on_read is not None:
+            self._on_read()
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ScriptedHTTPSConnection:
+    def __init__(self, response: ScriptedHTTPResponse | BaseException) -> None:
+        self.response = response
+        self.sock = ScriptedSocket()
+        self.connected = False
+        self.closed = False
+        self.requests: list[tuple[str, str]] = []
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def request(
+        self,
+        method: str,
+        target: str,
+        *,
+        headers: dict[str, str],
+    ) -> None:
+        del headers
+        self.requests.append((method, target))
+
+    def getresponse(self) -> ScriptedHTTPResponse:
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ScriptedConnectionFactory:
+    def __init__(
+        self, responses: list[ScriptedHTTPResponse | BaseException]
+    ) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, int, float]] = []
+        self.connections: list[ScriptedHTTPSConnection] = []
+
+    def __call__(
+        self,
+        host: str,
+        port: int,
+        timeout: float,
+    ) -> ScriptedHTTPSConnection:
+        self.calls.append((host, port, timeout))
+        connection = ScriptedHTTPSConnection(self._responses.pop(0))
+        self.connections.append(connection)
+        return connection
+
+
 def response_client(
     responses: list[httpx.Response],
     requests: list[httpx.Request] | None = None,
@@ -2326,6 +2669,45 @@ def response_client(
         transport=httpx.MockTransport(handler),
         follow_redirects=False,
     )
+
+
+class ScriptedDeadlineTransport:
+    def __init__(
+        self,
+        payloads: dict[str, bytes],
+        *,
+        fail_resource_id: str | None = None,
+        token: str = "secret",
+        on_download: Any | None = None,
+    ) -> None:
+        self.payloads = payloads
+        self.fail_resource_id = fail_resource_id
+        self._transient_token = token
+        self.on_download = on_download
+        self.requests: list[tuple[str, float]] = []
+        self.closed = False
+
+    def download(self, resource: SourceResource, *, deadline: float) -> bytes:
+        self.requests.append((resource.source_resource_id, deadline))
+        if self.on_download is not None:
+            self.on_download(deadline)
+        if resource.source_resource_id == self.fail_resource_id:
+            raise SourceContractError(
+                "SSEN resource did not return the required redirect",
+                response_status=503,
+                error_code="unexpected_initial_status",
+            )
+        return self.payloads[resource.source_resource_id]
+
+    def close(self) -> None:
+        self._transient_token = ""
+        self.closed = True
+
+    def __enter__(self) -> ScriptedDeadlineTransport:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def redirect_for(resource_id: str, token: str = "secret") -> httpx.Response:
@@ -2349,30 +2731,22 @@ def csv_response(content: bytes, **headers: str) -> httpx.Response:
     )
 
 
-def sync_client(
+def sync_transport(
     sepd: bytes,
     shepd: bytes,
     *,
     token: str = "secret",
     fail_resource_id: str | None = None,
-) -> httpx.Client:
+) -> ScriptedDeadlineTransport:
     payloads = {SEPD_RESOURCE_ID: sepd, SHEPD_RESOURCE_ID: shepd}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        resource_id = next(
-            item for item in payloads if f"/{item}/" in path
-        )
-        if request.url.host == "data-api.ssen.co.uk":
-            if resource_id == fail_resource_id:
-                return httpx.Response(503)
-            return redirect_for(resource_id, token)
-        return csv_response(payloads[resource_id])
-
-    return httpx.Client(
-        transport=httpx.MockTransport(handler),
-        follow_redirects=False,
+    return ScriptedDeadlineTransport(
+        payloads,
+        token=token,
+        fail_resource_id=fail_resource_id,
     )
+
+
+sync_client = sync_transport
 
 
 def first_csv_row_only(content: bytes) -> bytes:
@@ -2388,16 +2762,296 @@ def csv_with_invalid_first_row(content: bytes) -> bytes:
     return ("\n".join(rows) + "\n").encode()
 
 
-def test_download_accepts_only_exact_one_hop_r2_redirect() -> None:
-    requests: list[httpx.Request] = []
-    with response_client(
-        [redirect_for(SEPD_RESOURCE_ID), csv_response(b"A,B\n1,2\n")],
-        requests,
-    ) as client:
-        assert download_ssen_hv_resource(client, ssen_resource("SEPD")) == (
-            b"A,B\n1,2\n"
+def _active_child_pids() -> set[int]:
+    return {
+        child.pid
+        for child in multiprocessing.active_children()
+        if child.pid is not None
+    }
+
+
+def _scripted_redirect(location: str) -> ScriptedHTTPResponse:
+    return ScriptedHTTPResponse(302, headers={"location": location})
+
+
+def test_child_https_download_uses_exact_targets_and_emits_no_signed_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    literal_marker = "LITERAL_SIGNED_MARKER"
+    encoded_marker = "ENCODED%5FSIGNED%5FMARKER"
+    location = (
+        "https://83025b28472d6aa2bf5ae59f3724aa78."
+        "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+        f"{SEPD_RESOURCE_ID}/sample.csv?"
+        f"X-Amz-Signature={literal_marker}&X-Amz-Credential={encoded_marker}"
+    )
+    final = ScriptedHTTPResponse(
+        200,
+        headers={"content-type": "text/csv"},
+        chunks=[b"A,B\n", b"1,2\n"],
+    )
+    first = _scripted_redirect(location)
+    factory = ScriptedConnectionFactory([first, final])
+    for logger_name in ("app.outage_source", "httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    content = _download_resource_in_child(
+        ssen_resource("SEPD").model_dump(mode="python"),
+        time.monotonic() + 180,
+        connection_factory=factory,
+    )
+
+    assert content == b"A,B\n1,2\n"
+    assert factory.connections[0].requests == [
+        (
+            "GET",
+            "/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/"
+            f"{SEPD_RESOURCE_ID}/download/20260728_nafirs_hv_sepd_csv.csv",
         )
-    assert [request.method for request in requests] == ["GET", "GET"]
+    ]
+    assert factory.connections[1].requests == [
+        ("GET", location.split("r2.cloudflarestorage.com", 1)[1])
+    ]
+    assert all(connection.connected and connection.closed for connection in factory.connections)
+    assert first.closed is True
+    assert final.closed is True
+    assert literal_marker not in caplog.text
+    assert encoded_marker not in caplog.text
+    assert "X-Amz" not in caplog.text
+
+
+def test_child_https_failure_emits_no_literal_or_encoded_signed_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    literal_marker = "LITERAL_FAILURE_MARKER"
+    encoded_marker = "ENCODED%5FFAILURE%5FMARKER"
+    location = (
+        "https://83025b28472d6aa2bf5ae59f3724aa78."
+        "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+        f"{SEPD_RESOURCE_ID}/sample.csv?"
+        f"X-Amz-Signature={literal_marker}&X-Amz-Credential={encoded_marker}"
+    )
+    failure = RuntimeError(
+        f"transport failed for {location}"
+    )
+    factory = ScriptedConnectionFactory(
+        [_scripted_redirect(location), failure]
+    )
+    for logger_name in ("app.outage_source", "httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with pytest.raises(SourceContractError) as caught:
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
+
+    surfaces = str(caught.value) + caplog.text
+    assert literal_marker not in surfaces
+    assert encoded_marker not in surfaces
+    assert "X-Amz" not in surfaces
+    assert all(connection.closed for connection in factory.connections)
+
+
+def test_production_child_worker_uses_bounded_safe_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    location = (
+        "https://83025b28472d6aa2bf5ae59f3724aa78."
+        "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+        f"{SEPD_RESOURCE_ID}/sample.csv?X-Amz-Signature=secret"
+    )
+    factory = ScriptedConnectionFactory(
+        [
+            _scripted_redirect(location),
+            ScriptedHTTPResponse(
+                200,
+                headers={"content-type": "text/csv"},
+                chunks=[b"csv"],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "app.outage_source._create_https_connection",
+        factory,
+    )
+    receive_connection, send_connection = multiprocessing.Pipe(duplex=False)
+    try:
+        _ssen_download_process_worker(
+            send_connection,
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+        )
+        assert receive_connection.recv_bytes(16) == b"Ocsv"
+    finally:
+        receive_connection.close()
+        send_connection.close()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        ".",
+        "..",
+        "../escape.csv",
+        r"..\escape.csv",
+        "%2e%2e",
+        "%2E%2E",
+        "%252e%252e",
+        "%2fescape.csv",
+        "%252Fescape.csv",
+        "%5cescape.csv",
+        "%255Cescape.csv",
+        "%00.csv",
+        "%2500.csv",
+        "%",
+        "%2",
+        "%GG.csv",
+        "%c0%af.csv",
+    ],
+)
+def test_child_https_download_rejects_noncanonical_redirect_filename(
+    filename: str,
+) -> None:
+    location = (
+        "https://83025b28472d6aa2bf5ae59f3724aa78."
+        "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+        f"{SEPD_RESOURCE_ID}/{filename}?X-Amz-Signature=secret"
+    )
+    first = _scripted_redirect(location)
+    factory = ScriptedConnectionFactory([first])
+
+    with pytest.raises(SourceContractError, match="unapproved redirect"):
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
+
+    assert len(factory.connections) == 1
+    assert first.closed is True
+    assert factory.connections[0].closed is True
+
+
+def test_child_https_download_clamps_connect_header_and_each_body_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr("app.outage_source.time.monotonic", lambda: clock["now"])
+    location = (
+        "https://83025b28472d6aa2bf5ae59f3724aa78."
+        "r2.cloudflarestorage.com/dx-sse-prod/resources/"
+        f"{SEPD_RESOURCE_ID}/sample.csv?X-Amz-Signature=secret"
+    )
+    final = ScriptedHTTPResponse(
+        200,
+        headers={"content-type": "text/csv"},
+        chunks=[b"a", b"b"],
+        on_read=lambda: clock.update(now=175.0),
+    )
+    factory = ScriptedConnectionFactory(
+        [_scripted_redirect(location), final]
+    )
+
+    assert _download_resource_in_child(
+        ssen_resource("SEPD").model_dump(mode="python"),
+        180.0,
+        connection_factory=factory,
+    ) == b"ab"
+
+    assert [call[2] for call in factory.calls] == [10, 10]
+    assert factory.connections[0].sock.timeouts[0] == 60
+    assert factory.connections[1].sock.timeouts[0] == 60
+    assert factory.connections[1].sock.timeouts[-1] == 5
+
+
+def test_owned_process_transport_success_closes_every_process_and_pipe() -> None:
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(worker_target=_spawn_success_worker)
+
+    for _ in range(3):
+        assert transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        ) == b"csv"
+
+    assert _active_child_pids() == before
+
+
+def test_owned_process_transport_failure_is_fixed_and_does_not_trace_request(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    marker = "SYNTHETIC_CHILD_FAILURE_MUST_NOT_LEAK"
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        worker_target=_spawn_marker_failure_worker
+    )
+
+    with pytest.raises(SourceContractError) as caught:
+        transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        )
+
+    captured = capfd.readouterr()
+    surfaces = str(caught.value) + captured.out + captured.err
+    assert marker not in surfaces
+    assert "X-Amz-Signature" not in surfaces
+    assert _active_child_pids() == before
+
+
+@pytest.mark.parametrize("blocked_operation", ["header", "body"])
+def test_owned_process_transport_terminates_non_cooperative_io_at_deadline(
+    blocked_operation: str,
+) -> None:
+    del blocked_operation
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        worker_target=_spawn_non_cooperative_worker,
+        poll_interval_seconds=0.005,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(SourceContractError, match="deadline"):
+        transport.download(
+            ssen_resource("SEPD"), deadline=started + 0.5
+        )
+
+    assert time.monotonic() - started < 2
+    assert _active_child_pids() == before
+
+
+@pytest.mark.parametrize(
+    "worker_target",
+    [_spawn_malformed_worker, _spawn_duplicate_worker, _spawn_oversize_worker],
+)
+def test_owned_process_transport_rejects_malformed_duplicate_and_oversize_ipc(
+    worker_target: Any,
+) -> None:
+    before = _active_child_pids()
+    transport = OwnedProcessSsenTransport(
+        worker_target=worker_target,
+        max_response_bytes=8,
+    )
+
+    with pytest.raises(SourceContractError, match="protocol"):
+        transport.download(
+            ssen_resource("SEPD"), deadline=time.monotonic() + 5
+        )
+
+    assert _active_child_pids() == before
+
+
+def test_download_delegates_one_resource_with_one_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 10.0}
+    monkeypatch.setattr("app.outage_source.time.monotonic", lambda: clock["now"])
+    transport = ScriptedDeadlineTransport({SEPD_RESOURCE_ID: b"A,B\n1,2\n"})
+
+    assert download_ssen_hv_resource(
+        transport, ssen_resource("SEPD")
+    ) == b"A,B\n1,2\n"
+    assert transport.requests == [(SEPD_RESOURCE_ID, 190.0)]
 
 
 @pytest.mark.parametrize(
@@ -2410,22 +3064,35 @@ def test_download_accepts_only_exact_one_hop_r2_redirect() -> None:
     ],
 )
 def test_download_rejects_unapproved_redirects(location: str) -> None:
-    with response_client(
-        [httpx.Response(302, headers={"location": location})]
-    ) as client:
-        with pytest.raises(SourceContractError):
-            download_ssen_hv_resource(client, ssen_resource("SEPD"))
+    first = _scripted_redirect(location)
+    factory = ScriptedConnectionFactory([first])
+
+    with pytest.raises(SourceContractError):
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
+
+    assert first.closed is True
+    assert factory.connections[0].closed is True
 
 
 def test_download_rejects_second_redirect_without_following() -> None:
-    requests: list[httpx.Request] = []
-    with response_client(
-        [redirect_for(SEPD_RESOURCE_ID), redirect_for(SEPD_RESOURCE_ID)],
-        requests,
-    ) as client:
-        with pytest.raises(SourceContractError):
-            download_ssen_hv_resource(client, ssen_resource("SEPD"))
-    assert len(requests) == 2
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+    factory = ScriptedConnectionFactory(
+        [_scripted_redirect(location), _scripted_redirect(location)]
+    )
+
+    with pytest.raises(SourceContractError, match="did not return 200"):
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
+
+    assert len(factory.connections) == 2
+    assert all(connection.closed for connection in factory.connections)
 
 
 @pytest.mark.parametrize(
@@ -2438,41 +3105,52 @@ def test_download_stream_size_boundaries_at_limit_minus_one_limit_and_plus_one(
     accepted: bool,
 ) -> None:
     monkeypatch.setattr("app.outage_source.SOURCE_MAX_RESPONSE_BYTES", 8)
-    with response_client(
-        [redirect_for(SEPD_RESOURCE_ID), csv_response(b"x" * size)]
-    ) as client:
-        if accepted:
-            assert len(download_ssen_hv_resource(client, ssen_resource("SEPD"))) == size
-        else:
-            with pytest.raises(SourceContractError):
-                download_ssen_hv_resource(client, ssen_resource("SEPD"))
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+    factory = ScriptedConnectionFactory(
+        [
+            _scripted_redirect(location),
+            ScriptedHTTPResponse(
+                200,
+                headers={"content-type": "text/csv"},
+                chunks=[b"x" * size],
+            ),
+        ]
+    )
+    if accepted:
+        assert len(_download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )) == size
+    else:
+        with pytest.raises(SourceContractError, match="size limit"):
+            _download_resource_in_child(
+                ssen_resource("SEPD").model_dump(mode="python"),
+                time.monotonic() + 180,
+                connection_factory=factory,
+            )
 
 
 def test_download_rejects_oversize_content_length_before_streaming(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("app.outage_source.SOURCE_MAX_RESPONSE_BYTES", 8)
-    stream = TimedByteStream([b"must-not-be-read"])
-    final = httpx.Response(
+    location = redirect_for(SEPD_RESOURCE_ID).headers["location"]
+    final = ScriptedHTTPResponse(
         200,
         headers={"content-type": "text/csv", "content-length": "9"},
-        stream=stream,
+        chunks=[b"must-not-be-read"],
     )
-    with response_client([redirect_for(SEPD_RESOURCE_ID), final]) as client:
-        with pytest.raises(SourceContractError):
-            download_ssen_hv_resource(client, ssen_resource("SEPD"))
+    factory = ScriptedConnectionFactory([_scripted_redirect(location), final])
 
+    with pytest.raises(SourceContractError, match="size limit"):
+        _download_resource_in_child(
+            ssen_resource("SEPD").model_dump(mode="python"),
+            time.monotonic() + 180,
+            connection_factory=factory,
+        )
 
-def test_download_uses_exact_connect_and_read_timeouts() -> None:
-    requests: list[httpx.Request] = []
-    with response_client(
-        [redirect_for(SEPD_RESOURCE_ID), csv_response(b"x")], requests
-    ) as client:
-        download_ssen_hv_resource(client, ssen_resource("SEPD"))
-    for request in requests:
-        timeout = request.extensions["timeout"]
-        assert timeout["connect"] == SOURCE_CONNECT_TIMEOUT_SECONDS
-        assert timeout["read"] == SOURCE_READ_TIMEOUT_SECONDS
+    assert final._chunks == [b"must-not-be-read"]
 
 
 @pytest.mark.parametrize(
@@ -2486,17 +3164,22 @@ def test_download_enforces_total_deadline_across_redirects_and_slow_chunks(
 ) -> None:
     clock = {"now": 0.0}
     monkeypatch.setattr("app.outage_source.time.monotonic", lambda: clock["now"])
-    final = httpx.Response(
-        200,
-        headers={"content-type": "text/csv"},
-        stream=TimedByteStream([b"x"], tick=lambda: clock.update(now=elapsed)),
+    def advance_and_enforce(deadline: float) -> None:
+        clock["now"] = elapsed
+        if clock["now"] >= deadline:
+            raise SourceContractError("SSEN resource total deadline exceeded")
+
+    transport = ScriptedDeadlineTransport(
+        {SEPD_RESOURCE_ID: b"x"},
+        on_download=advance_and_enforce,
     )
-    with response_client([redirect_for(SEPD_RESOURCE_ID), final]) as client:
-        if accepted:
-            assert download_ssen_hv_resource(client, ssen_resource("SEPD")) == b"x"
-        else:
-            with pytest.raises(SourceContractError, match="deadline"):
-                download_ssen_hv_resource(client, ssen_resource("SEPD"))
+    if accepted:
+        assert download_ssen_hv_resource(
+            transport, ssen_resource("SEPD")
+        ) == b"x"
+    else:
+        with pytest.raises(SourceContractError, match="deadline"):
+            download_ssen_hv_resource(transport, ssen_resource("SEPD"))
 
 
 def _install_schema_through_six(db_path: Path) -> None:
@@ -2507,6 +3190,60 @@ def _install_schema_through_six(db_path: Path) -> None:
                 "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                 (version,),
             )
+        connection.commit()
+
+
+def _insert_legacy_snapshot_and_event(
+    db_path: Path,
+    snapshot: SourceSnapshot,
+    event: OutageEvent,
+    *,
+    raw_record: dict[str, Any] | None = None,
+) -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO source_snapshots VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot.snapshot_id,
+                snapshot.source_dataset_id,
+                snapshot.package_id,
+                snapshot.source_resource_id,
+                snapshot.licence_area,
+                snapshot.stable_source_url,
+                snapshot.source_modified_at,
+                snapshot.fetched_at.isoformat(),
+                snapshot.content_sha256,
+                snapshot.byte_size,
+                snapshot.row_count,
+                json.dumps(snapshot.observed_columns),
+                snapshot.licence_id,
+                snapshot.licence_title,
+                snapshot.licence_url,
+                snapshot.attribution,
+                snapshot.parser_version,
+                snapshot.local_snapshot_path,
+            ),
+        )
+        values = event.model_dump()
+        values["quality_flags"] = json.dumps(values["quality_flags"])
+        values["raw_record"] = json.dumps(
+            event.raw_record if raw_record is None else raw_record,
+            ensure_ascii=False,
+        )
+        columns = [
+            "quality_flags_json"
+            if item == "quality_flags"
+            else "raw_record_json"
+            if item == "raw_record"
+            else item
+            for item in OutageEvent.model_fields
+        ]
+        connection.execute(
+            f"INSERT INTO outage_events ({','.join(columns)}) VALUES "
+            f"({','.join('?' for _ in columns)})",
+            tuple(values[item] for item in OutageEvent.model_fields),
+        )
         connection.commit()
 
 
@@ -2590,6 +3327,206 @@ def test_migration_seven_backfills_legacy_rows_without_inventing_current_state(
     assert observation[0] == source_snapshot_id(SEPD_RESOURCE_ID, "abc")
     assert tuple(blob) == (0, None)
     assert current == 0
+
+
+@pytest.mark.parametrize(
+    ("unsafe_kind", "raw_record"),
+    [
+        (
+            "literal",
+            {"note": synthetic_signed_target("LEGACY_LITERAL_MARKER")},
+        ),
+        (
+            "repeated_encoded",
+            {
+                "note": fully_byte_encoded(
+                    synthetic_signed_target("LEGACY_REPEATED_MARKER"),
+                    9,
+                )
+            },
+        ),
+        (
+            "malformed_encoded",
+            {
+                "note": quote(
+                    synthetic_signed_target("LEGACY_MALFORMED_MARKER"),
+                    safe="",
+                )
+                + "%GG"
+            },
+        ),
+        (
+            "over_budget",
+            {"note": "x" * (MAX_PERSISTED_STRING_BYTES + 1)},
+        ),
+    ],
+)
+def test_migration_seven_rejects_unsafe_legacy_raw_record_transactionally(
+    unsafe_kind: str,
+    raw_record: dict[str, Any],
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    del unsafe_kind
+    _install_schema_through_six(temp_db)
+    _insert_legacy_snapshot_and_event(
+        temp_db,
+        source_snapshot,
+        parsed_event,
+        raw_record=raw_record,
+    )
+    before_raw = json.dumps(raw_record, ensure_ascii=False)
+
+    with pytest.raises(UnsafePersistenceValueError) as caught:
+        run_migrations(temp_db)
+
+    assert str(caught.value) == "raw record is unsafe for persistence"
+    for value in raw_record.values():
+        assert str(value) not in str(caught.value)
+    with sqlite3.connect(temp_db) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert connection.execute(
+            "SELECT COUNT(*) FROM schema_version WHERE version=7"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT raw_record_json FROM outage_events"
+        ).fetchone()[0] == before_raw
+    assert {
+        "outage_content_blobs",
+        "outage_source_observations",
+        "outage_event_versions",
+    }.isdisjoint(tables)
+
+
+def test_migration_seven_preserves_exact_safe_legacy_raw_record_bytes(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+    parsed_event: OutageEvent,
+) -> None:
+    safe_raw_record = {
+        "multiline": "first line\nsecond line",
+        "percent": "95%25 and %GG remain exact",
+        "unicode": "Shetland Æðey",
+    }
+    _install_schema_through_six(temp_db)
+    _insert_legacy_snapshot_and_event(
+        temp_db,
+        source_snapshot,
+        parsed_event,
+        raw_record=safe_raw_record,
+    )
+
+    assert run_migrations(temp_db) == 7
+
+    with get_connection(temp_db) as connection:
+        event_json = connection.execute(
+            "SELECT event_json FROM outage_event_versions"
+        ).fetchone()[0]
+    migrated_raw = json.loads(event_json)["raw_record"]
+    assert migrated_raw == safe_raw_record
+    assert json.dumps(
+        migrated_raw,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode() == json.dumps(
+        safe_raw_record,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def test_legacy_unknown_fetch_time_is_null_and_orders_deterministically(
+    temp_db: Path,
+    source_snapshot: SourceSnapshot,
+) -> None:
+    _install_schema_through_six(temp_db)
+    first = source_snapshot.model_copy(
+        update={
+            "snapshot_id": "legacy:z",
+            "content_sha256": "1" * 64,
+            "local_snapshot_path": "C:/legacy/z.csv",
+        }
+    )
+    second = source_snapshot.model_copy(
+        update={
+            "snapshot_id": "legacy:a",
+            "content_sha256": "2" * 64,
+            "local_snapshot_path": "C:/legacy/a.csv",
+        }
+    )
+    with sqlite3.connect(temp_db) as connection:
+        for snapshot in (first, second):
+            connection.execute(
+                """INSERT INTO source_snapshots VALUES
+                   (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    snapshot.snapshot_id,
+                    snapshot.source_dataset_id,
+                    snapshot.package_id,
+                    snapshot.source_resource_id,
+                    snapshot.licence_area,
+                    snapshot.stable_source_url,
+                    snapshot.source_modified_at,
+                    snapshot.fetched_at.isoformat(),
+                    snapshot.content_sha256,
+                    snapshot.byte_size,
+                    0,
+                    json.dumps(snapshot.observed_columns),
+                    snapshot.licence_id,
+                    snapshot.licence_title,
+                    snapshot.licence_url,
+                    snapshot.attribution,
+                    snapshot.parser_version,
+                    snapshot.local_snapshot_path,
+                ),
+            )
+        connection.commit()
+
+    assert run_migrations(temp_db) == 7
+    unknown = list_source_snapshots(db_path=temp_db)
+    assert [item.snapshot_id for item in unknown] == sorted(
+        item.snapshot_id for item in unknown
+    )
+    assert [item.fetched_at for item in unknown] == [None, None]
+    serialised = json.dumps(
+        [item.model_dump(mode="json") for item in unknown],
+        sort_keys=True,
+    )
+    assert '"fetched_at": null' in serialised
+    assert "1970-01-01" not in serialised
+
+    known_digest = "3" * 64
+    known = source_snapshot.model_copy(
+        update={
+            "snapshot_id": source_snapshot_id(SEPD_RESOURCE_ID, known_digest),
+            "content_sha256": known_digest,
+            "local_snapshot_path": f"blobs/33/{known_digest}.csv",
+        }
+    )
+    save_snapshot(known, db_path=temp_db)
+    ordered = list_source_snapshots(db_path=temp_db)
+    assert ordered[0].snapshot_id == known.snapshot_id
+    assert ordered[0].fetched_at == known.fetched_at
+    assert ordered[0].fetched_at is not None
+    assert ordered[0].fetched_at.tzinfo is timezone.utc
+
+
+def test_source_snapshot_requires_unknown_fetch_time_to_be_explicit() -> None:
+    data = source_snapshot_data()
+    data["fetched_at"] = None
+
+    snapshot = SourceSnapshot(**data)
+
+    assert snapshot.fetched_at is None
+    assert snapshot.model_dump(mode="json")["fetched_at"] is None
 
 
 def test_migration_seven_rejects_conflicting_legacy_snapshot_identity(
@@ -2798,30 +3735,26 @@ def test_snapshot_reuse_cannot_add_to_an_empty_immutable_materialisation(
     source_snapshot: SourceSnapshot,
     parsed_event: OutageEvent,
 ) -> None:
-    commit_ingestion_run(
+    empty = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
         run_id="run:empty-materialisation",
-        resources_seen=1,
-        snapshots=[source_snapshot],
-        events=[],
-        rejects=[],
-        snapshots_created=1,
-        snapshots_reused=0,
-        warnings=[],
-        db_path=temp_db,
     )
+    empty["events"] = []
+    empty["snapshots"] = [
+        snapshot.model_copy(update={"row_count": 0})
+        for snapshot in empty["snapshots"]
+    ]
+    commit_ingestion_run(**empty, db_path=temp_db)
 
-    with pytest.raises(ValueError, match="immutable"):
-        commit_ingestion_run(
-            run_id="run:mutated-materialisation",
-            resources_seen=1,
-            snapshots=[source_snapshot],
-            events=[parsed_event],
-            rejects=[],
-            snapshots_created=0,
-            snapshots_reused=1,
-            warnings=[],
-            db_path=temp_db,
-        )
+    mutated = _exact_run_payload(
+        source_snapshot,
+        parsed_event,
+        run_id="run:mutated-materialisation",
+    )
+    mutated["snapshots"] = empty["snapshots"]
+    with pytest.raises(ValueError, match="exact completed run"):
+        commit_ingestion_run(**mutated, db_path=temp_db)
 
 
 def test_changed_parser_or_canonical_schema_cannot_overwrite_v1_materialization(
@@ -2912,6 +3845,7 @@ def test_unavailable_legacy_blob_becomes_available_only_after_hash_verification(
         )
 
     assert result.status == "completed"
+    assert (result.snapshots_created, result.snapshots_reused) == (1, 1)
     with get_connection(temp_db) as connection:
         blob = connection.execute(
             """SELECT available, relative_snapshot_path

@@ -58,7 +58,7 @@ class SourceSnapshotPublic(BaseModel):
     licence_area: LicenceArea
     stable_source_url: str
     source_modified_at: datetime | None
-    fetched_at: datetime
+    fetched_at: datetime | None
     content_sha256: NonEmptyStr
     byte_size: int
     row_count: int
@@ -71,7 +71,11 @@ class SourceSnapshotPublic(BaseModel):
 
     @field_validator("fetched_at")
     @classmethod
-    def normalise_fetched_at_to_utc(cls, value: datetime) -> datetime:
+    def normalise_fetched_at_to_utc(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("fetched_at must include a timezone")
         return value.astimezone(timezone.utc)
