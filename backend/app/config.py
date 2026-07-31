@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import idna
+
 __all__ = ["config"]
 
 # Load .env early so local public-portal settings are available.
@@ -31,8 +33,13 @@ def _canonical_cors_host(hostname: str) -> str:
         address = ipaddress.ip_address(hostname)
     except ValueError:
         try:
-            canonical = hostname.encode("idna").decode("ascii").lower()
-        except UnicodeError as exc:
+            canonical = idna.encode(
+                hostname,
+                uts46=True,
+                transitional=False,
+                std3_rules=True,
+            ).decode("ascii").lower()
+        except idna.IDNAError as exc:
             raise ValueError(_CORS_ORIGIN_ERROR) from exc
         labels = canonical.split(".")
         if (

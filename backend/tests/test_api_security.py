@@ -1,5 +1,6 @@
 import json
 import logging
+from collections.abc import AsyncIterator
 from importlib.util import find_spec
 
 import pytest
@@ -11,8 +12,10 @@ from app.config import _cors_origins_from_env
 from app.main import app
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, model_validator
+from starlette.background import BackgroundTask
 
 
 class SecretBearingProbe(BaseModel):
@@ -36,12 +39,14 @@ class ServerLoggingProbe:
 
     def __init__(self, application):
         self.application = application
+        self.escaped_exception_types: list[str] = []
 
     async def __call__(self, scope, receive, send) -> None:
         try:
             await self.application(scope, receive, send)
-        except Exception:
+        except Exception as exc:
             if scope["type"] == "http":
+                self.escaped_exception_types.append(type(exc).__name__)
                 logging.getLogger("uvicorn.error").exception(
                     "Exception in ASGI application"
                 )
@@ -91,6 +96,18 @@ def test_cors_origins_are_normalised_and_deduplicated() -> None:
         "https://xn--bcher-kva.example",
         "http://[2001:db8::1]",
         "http://example.test:8080",
+    )
+
+
+def test_cors_uses_non_transitional_uts46_for_deviation_characters() -> None:
+    assert _cors_origins_from_env(
+        "https://fa\u00df.de,https://fass.de,"
+        "https://\u03c2.example,https://\u03c3.example"
+    ) == (
+        "https://xn--fa-hia.de",
+        "https://fass.de",
+        "https://xn--3xa.example",
+        "https://xn--4xa.example",
     )
 
 
@@ -180,10 +197,11 @@ def test_unhandled_exception_never_reaches_server_logging(caplog) -> None:
 
     app.add_api_route("/_test/unhandled", secret_probe)
     app.openapi_schema = None
+    server_probe = ServerLoggingProbe(app)
     try:
         with caplog.at_level(logging.ERROR):
             response = TestClient(
-                ServerLoggingProbe(app),
+                server_probe,
                 raise_server_exceptions=False,
             ).get("/_test/unhandled")
     finally:
@@ -197,6 +215,75 @@ def test_unhandled_exception_never_reaches_server_logging(caplog) -> None:
     }
     assert secret not in response.text
     assert secret not in caplog.text
+    assert server_probe.escaped_exception_types == []
+
+
+def test_streaming_exception_safely_finishes_started_body(caplog) -> None:
+    secret = "stream-secret-must-not-reach-server-log"
+    original_routes = list(app.router.routes)
+    original_openapi = app.openapi_schema
+
+    async def secret_stream() -> AsyncIterator[bytes]:
+        yield b"visible-prefix"
+        raise RuntimeError(secret)
+
+    def stream_probe() -> StreamingResponse:
+        return StreamingResponse(secret_stream(), media_type="text/plain")
+
+    app.add_api_route("/_test/streaming", stream_probe)
+    app.openapi_schema = None
+    server_probe = ServerLoggingProbe(app)
+    try:
+        with caplog.at_level(logging.ERROR):
+            response = TestClient(
+                server_probe,
+                raise_server_exceptions=False,
+            ).get("/_test/streaming")
+    finally:
+        app.router.routes[:] = original_routes
+        app.openapi_schema = original_openapi
+
+    assert response.status_code == 200
+    assert response.content == b"visible-prefix"
+    assert secret not in response.text
+    assert secret not in caplog.text
+    assert server_probe.escaped_exception_types == []
+
+
+def test_background_exception_after_complete_response_does_not_escape(
+    caplog,
+) -> None:
+    secret = "background-secret-must-not-reach-server-log"
+    original_routes = list(app.router.routes)
+    original_openapi = app.openapi_schema
+
+    def background_failure() -> None:
+        raise RuntimeError(secret)
+
+    def background_probe() -> JSONResponse:
+        return JSONResponse(
+            {"status": "sent"},
+            background=BackgroundTask(background_failure),
+        )
+
+    app.add_api_route("/_test/background", background_probe)
+    app.openapi_schema = None
+    server_probe = ServerLoggingProbe(app)
+    try:
+        with caplog.at_level(logging.ERROR):
+            response = TestClient(
+                server_probe,
+                raise_server_exceptions=False,
+            ).get("/_test/background")
+    finally:
+        app.router.routes[:] = original_routes
+        app.openapi_schema = original_openapi
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "sent"}
+    assert secret not in response.text
+    assert secret not in caplog.text
+    assert server_probe.escaped_exception_types == []
 
 
 @pytest.mark.parametrize(

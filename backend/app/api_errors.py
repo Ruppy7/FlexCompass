@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 DEMO_PATHS = {
@@ -34,11 +34,43 @@ class PublicExceptionMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        response_started = False
+        body_started = False
+        response_complete = False
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started, body_started, response_complete
+            await send(message)
+            if message["type"] == "http.response.start":
+                response_started = True
+            elif message["type"] == "http.response.body":
+                body_started = True
+                if not message.get("more_body", False):
+                    response_complete = True
+
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, tracked_send)
         except Exception as exc:
-            response = public_exception_response(Request(scope), exc)
-            await response(scope, receive, send)
+            if not response_started:
+                response = public_exception_response(Request(scope), exc)
+                try:
+                    await response(scope, receive, send)
+                except Exception as recovery_exc:
+                    _log_exception_type(recovery_exc)
+                return
+
+            _log_exception_type(exc)
+            if body_started and not response_complete:
+                try:
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b"",
+                            "more_body": False,
+                        }
+                    )
+                except Exception as recovery_exc:
+                    _log_exception_type(recovery_exc)
 
 
 def _public_error_content(
@@ -58,7 +90,7 @@ def public_exception_response(
     request: Request | None,
     exc: Exception,
 ) -> JSONResponse:
-    logger.error("Unhandled API exception type=%s", type(exc).__name__)
+    _log_exception_type(exc)
     return JSONResponse(
         status_code=500,
         content=_public_error_content(
@@ -66,6 +98,10 @@ def public_exception_response(
             {"detail": "Internal server error", "code": "internal_error"},
         ),
     )
+
+
+def _log_exception_type(exc: Exception) -> None:
+    logger.error("Unhandled API exception type=%s", type(exc).__name__)
 
 
 def http_exception_response(
