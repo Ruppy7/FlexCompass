@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -5,6 +6,7 @@ from importlib.util import find_spec
 
 import pytest
 from app.api_errors import (
+    PublicExceptionMiddleware,
     public_exception_response,
     validation_exception_response,
 )
@@ -40,10 +42,30 @@ class ServerLoggingProbe:
     def __init__(self, application):
         self.application = application
         self.escaped_exception_types: list[str] = []
+        self.response_complete = False
 
     async def __call__(self, scope, receive, send) -> None:
+        response_started = False
+
+        async def tracked_send(message) -> None:
+            nonlocal response_started
+            await send(message)
+            if message["type"] == "http.response.start":
+                response_started = True
+            elif (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            ):
+                self.response_complete = True
+
         try:
-            await self.application(scope, receive, send)
+            await self.application(scope, receive, tracked_send)
+            if (
+                scope["type"] == "http"
+                and response_started
+                and not self.response_complete
+            ):
+                raise AssertionError("ASGI response did not complete")
         except Exception as exc:
             if scope["type"] == "http":
                 self.escaped_exception_types.append(type(exc).__name__)
@@ -250,6 +272,41 @@ def test_streaming_exception_safely_finishes_started_body(caplog) -> None:
     assert server_probe.escaped_exception_types == []
 
 
+def test_streaming_exception_before_first_chunk_completes_response(
+    caplog,
+) -> None:
+    secret = "pre-yield-stream-secret-must-not-reach-server-log"
+    original_routes = list(app.router.routes)
+    original_openapi = app.openapi_schema
+
+    async def secret_stream() -> AsyncIterator[bytes]:
+        raise RuntimeError(secret)
+        yield b"unreachable"
+
+    def stream_probe() -> StreamingResponse:
+        return StreamingResponse(secret_stream(), media_type="text/plain")
+
+    app.add_api_route("/_test/streaming-before-yield", stream_probe)
+    app.openapi_schema = None
+    server_probe = ServerLoggingProbe(app)
+    try:
+        with caplog.at_level(logging.ERROR):
+            response = TestClient(
+                server_probe,
+                raise_server_exceptions=False,
+            ).get("/_test/streaming-before-yield")
+    finally:
+        app.router.routes[:] = original_routes
+        app.openapi_schema = original_openapi
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert secret not in response.text
+    assert secret not in caplog.text
+    assert server_probe.response_complete is True
+    assert server_probe.escaped_exception_types == []
+
+
 def test_background_exception_after_complete_response_does_not_escape(
     caplog,
 ) -> None:
@@ -284,6 +341,114 @@ def test_background_exception_after_complete_response_does_not_escape(
     assert secret not in response.text
     assert secret not in caplog.text
     assert server_probe.escaped_exception_types == []
+
+
+def _http_scope(path: str) -> dict[str, object]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [],
+        "server": ("testserver", 80),
+        "client": ("testclient", 50000),
+    }
+
+
+async def _receive_disconnect() -> dict[str, str]:
+    return {"type": "http.disconnect"}
+
+
+def test_safe_500_send_failure_is_type_only_logged_and_swallowed(caplog) -> None:
+    original_secret = "original-before-start-secret"
+    recovery_secret = "safe-500-send-secret"
+
+    class OriginalSecretError(Exception):
+        pass
+
+    class RecoverySecretError(Exception):
+        pass
+
+    async def failing_app(scope, receive, send) -> None:
+        raise OriginalSecretError(original_secret)
+
+    async def failing_send(message) -> None:
+        raise RecoverySecretError(recovery_secret)
+
+    middleware = PublicExceptionMiddleware(failing_app)
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(
+            middleware(
+                _http_scope("/_test/recovery-before-start"),
+                _receive_disconnect,
+                failing_send,
+            )
+        )
+
+    assert "OriginalSecretError" in caplog.text
+    assert "RecoverySecretError" in caplog.text
+    assert original_secret not in caplog.text
+    assert recovery_secret not in caplog.text
+    assert [record.getMessage() for record in caplog.records] == [
+        "Unhandled API exception type=OriginalSecretError",
+        "Unhandled API exception type=RecoverySecretError",
+    ]
+
+
+def test_terminal_body_send_failure_is_type_only_logged_and_swallowed(
+    caplog,
+) -> None:
+    original_secret = "original-after-start-secret"
+    recovery_secret = "terminal-body-send-secret"
+    attempted_message_types: list[str] = []
+
+    class OriginalSecretError(Exception):
+        pass
+
+    class RecoverySecretError(Exception):
+        pass
+
+    async def failing_app(scope, receive, send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [],
+            }
+        )
+        raise OriginalSecretError(original_secret)
+
+    async def failing_terminal_send(message) -> None:
+        attempted_message_types.append(message["type"])
+        if message["type"] == "http.response.body":
+            raise RecoverySecretError(recovery_secret)
+
+    middleware = PublicExceptionMiddleware(failing_app)
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(
+            middleware(
+                _http_scope("/_test/recovery-after-start"),
+                _receive_disconnect,
+                failing_terminal_send,
+            )
+        )
+
+    assert attempted_message_types == [
+        "http.response.start",
+        "http.response.body",
+    ]
+    assert "OriginalSecretError" in caplog.text
+    assert "RecoverySecretError" in caplog.text
+    assert original_secret not in caplog.text
+    assert recovery_secret not in caplog.text
+    assert [record.getMessage() for record in caplog.records] == [
+        "Unhandled API exception type=OriginalSecretError",
+        "Unhandled API exception type=RecoverySecretError",
+    ]
 
 
 @pytest.mark.parametrize(

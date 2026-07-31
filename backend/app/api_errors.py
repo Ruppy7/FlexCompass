@@ -35,16 +35,14 @@ class PublicExceptionMiddleware:
             await self.app(scope, receive, send)
             return
         response_started = False
-        body_started = False
         response_complete = False
 
         async def tracked_send(message: Message) -> None:
-            nonlocal response_started, body_started, response_complete
+            nonlocal response_started, response_complete
             await send(message)
             if message["type"] == "http.response.start":
                 response_started = True
             elif message["type"] == "http.response.body":
-                body_started = True
                 if not message.get("more_body", False):
                     response_complete = True
 
@@ -60,7 +58,7 @@ class PublicExceptionMiddleware:
                 return
 
             _log_exception_type(exc)
-            if body_started and not response_complete:
+            if not response_complete:
                 try:
                     await send(
                         {
