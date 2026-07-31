@@ -7,6 +7,8 @@ import logging
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 DEMO_PATHS = {
@@ -15,6 +17,28 @@ DEMO_PATHS = {
     "/api/demo/report",
     "/api/demo/asset-groups/generate",
 }
+
+
+class PublicExceptionMiddleware:
+    """Keep unhandled application exceptions inside the public boundary."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        except Exception as exc:
+            response = public_exception_response(Request(scope), exc)
+            await response(scope, receive, send)
 
 
 def _public_error_content(
@@ -40,6 +64,19 @@ def public_exception_response(
         content=_public_error_content(
             request,
             {"detail": "Internal server error", "code": "internal_error"},
+        ),
+    )
+
+
+def http_exception_response(
+    request: Request,
+    exc: StarletteHTTPException,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_public_error_content(
+            request,
+            {"detail": "Request failed", "code": "http_error"},
         ),
     )
 

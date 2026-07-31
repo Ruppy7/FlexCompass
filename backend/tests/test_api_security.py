@@ -9,7 +9,7 @@ from app.api_errors import (
 )
 from app.config import _cors_origins_from_env
 from app.main import app
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, model_validator
@@ -29,6 +29,23 @@ class SecretKeyProbe(BaseModel):
 
 class SecretFieldProbe(BaseModel):
     attacker_named_field: int
+
+
+class ServerLoggingProbe:
+    """Represent the server boundary that logs escaped ASGI exceptions."""
+
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await self.application(scope, receive, send)
+        except Exception:
+            if scope["type"] == "http":
+                logging.getLogger("uvicorn.error").exception(
+                    "Exception in ASGI application"
+                )
+            raise
 
 
 def test_public_openapi_has_no_ingest_or_drift_paths() -> None:
@@ -65,9 +82,16 @@ def test_default_cors_is_local_and_never_wildcard() -> None:
 
 def test_cors_origins_are_normalised_and_deduplicated() -> None:
     assert _cors_origins_from_env(
-        " https://example.test/,http://localhost:8000,"
-        "https://example.test"
-    ) == ("https://example.test", "http://localhost:8000")
+        " HTTPS://EXAMPLE.TEST:443/,http://LOCALHOST:80,"
+        "https://BÜCHER.example,http://[2001:0DB8::1]:80,"
+        "http://example.test:8080,https://example.test"
+    ) == (
+        "https://example.test",
+        "http://localhost",
+        "https://xn--bcher-kva.example",
+        "http://[2001:db8::1]",
+        "http://example.test:8080",
+    )
 
 
 @pytest.mark.parametrize(
@@ -81,6 +105,13 @@ def test_cors_origins_are_normalised_and_deduplicated() -> None:
         "https://@example.test",
         "https://example.test:not-a-port",
         "https://example.test:70000",
+        "https://*",
+        "https://bad_host.example",
+        "https://-bad.example",
+        "https://example..test",
+        "https://999.999.999.999",
+        "http://[fe80::1%25eth0]",
+        "https://exa\nmple.test",
         "example.test",
     ],
 )
@@ -137,6 +168,83 @@ def test_public_exception_never_echoes_or_logs_secret(caplog) -> None:
         "detail": "Internal server error",
         "code": "internal_error",
     }
+
+
+def test_unhandled_exception_never_reaches_server_logging(caplog) -> None:
+    secret = "https://example.test/?token=server-log-secret"
+    original_routes = list(app.router.routes)
+    original_openapi = app.openapi_schema
+
+    def secret_probe() -> None:
+        raise RuntimeError(secret)
+
+    app.add_api_route("/_test/unhandled", secret_probe)
+    app.openapi_schema = None
+    try:
+        with caplog.at_level(logging.ERROR):
+            response = TestClient(
+                ServerLoggingProbe(app),
+                raise_server_exceptions=False,
+            ).get("/_test/unhandled")
+    finally:
+        app.router.routes[:] = original_routes
+        app.openapi_schema = original_openapi
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": "Internal server error",
+        "code": "internal_error",
+    }
+    assert secret not in response.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (
+            "/_test/http-exception",
+            {"detail": "Request failed", "code": "http_error"},
+        ),
+        (
+            "/api/demo/analyse",
+            {
+                "detail": "Request failed",
+                "code": "http_error",
+                "workflow_kind": "synthetic_demo",
+                "portal_data_used": False,
+            },
+        ),
+    ],
+)
+def test_http_exception_never_echoes_detail_or_headers(
+    path: str,
+    expected: dict[str, object],
+) -> None:
+    secret = "secret-from-request"
+    original_routes = list(app.router.routes)
+    original_openapi = app.openapi_schema
+
+    def secret_probe() -> None:
+        raise HTTPException(
+            status_code=400,
+            detail=secret,
+            headers={"X-Secret": secret, "WWW-Authenticate": secret},
+        )
+
+    app.add_api_route(path, secret_probe)
+    app.openapi_schema = None
+    try:
+        response = TestClient(app).get(path)
+    finally:
+        app.router.routes[:] = original_routes
+        app.openapi_schema = original_openapi
+
+    assert response.status_code == 400
+    assert response.json() == expected
+    assert secret not in response.text
+    assert "x-secret" not in response.headers
+    assert "www-authenticate" not in response.headers
 
 
 def test_validation_handler_never_echoes_custom_secret() -> None:

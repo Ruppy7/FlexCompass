@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -18,6 +20,34 @@ except ImportError:
     pass
 
 
+_CORS_ORIGIN_ERROR = "CORS origins must be absolute HTTP(S) origins"
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _canonical_cors_host(hostname: str) -> str:
+    if "%" in hostname:
+        raise ValueError(_CORS_ORIGIN_ERROR)
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            canonical = hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError(_CORS_ORIGIN_ERROR) from exc
+        labels = canonical.split(".")
+        if (
+            len(canonical) > 253
+            or not labels
+            or all(label.isdigit() for label in labels)
+            or any(_DNS_LABEL.fullmatch(label) is None for label in labels)
+        ):
+            raise ValueError(_CORS_ORIGIN_ERROR)
+        return canonical
+    if isinstance(address, ipaddress.IPv6Address):
+        return f"[{address.compressed}]"
+    return str(address)
+
+
 def _cors_origins_from_env(value: str | None) -> tuple[str, ...]:
     raw_values = (
         value.split(",")
@@ -29,14 +59,19 @@ def _cors_origins_from_env(value: str | None) -> tuple[str, ...]:
         origin = raw.strip()
         if origin == "*":
             raise ValueError("CORS wildcard is prohibited")
+        if any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            for character in origin
+        ):
+            raise ValueError(_CORS_ORIGIN_ERROR)
         try:
             parsed = urlsplit(origin)
             hostname = parsed.hostname
-            parsed.port
+            port = parsed.port
         except ValueError as exc:
-            raise ValueError(
-                "CORS origins must be absolute HTTP(S) origins"
-            ) from exc
+            raise ValueError(_CORS_ORIGIN_ERROR) from exc
         if (
             parsed.scheme not in {"http", "https"}
             or not hostname
@@ -46,8 +81,17 @@ def _cors_origins_from_env(value: str | None) -> tuple[str, ...]:
             or parsed.fragment
             or parsed.path not in {"", "/"}
         ):
-            raise ValueError("CORS origins must be absolute HTTP(S) origins")
-        normalised = f"{parsed.scheme}://{parsed.netloc}"
+            raise ValueError(_CORS_ORIGIN_ERROR)
+        canonical_host = _canonical_cors_host(hostname)
+        if parsed.netloc.startswith("[") and not canonical_host.startswith("["):
+            raise ValueError(_CORS_ORIGIN_ERROR)
+        default_port = (
+            parsed.scheme == "http" and port == 80
+        ) or (parsed.scheme == "https" and port == 443)
+        authority = canonical_host
+        if port is not None and not default_port:
+            authority = f"{canonical_host}:{port}"
+        normalised = f"{parsed.scheme}://{authority}"
         if normalised not in origins:
             origins.append(normalised)
     return tuple(origins)

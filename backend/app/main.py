@@ -5,9 +5,11 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .api_errors import (
-    public_exception_response,
+    PublicExceptionMiddleware,
+    http_exception_response,
     validation_exception_response,
 )
 from .config import config
@@ -22,12 +24,16 @@ app = FastAPI(
     version="0.1.0",
 )
 
-app.add_exception_handler(Exception, public_exception_response)
 app.add_exception_handler(
     RequestValidationError,
     validation_exception_response,
 )
+app.add_exception_handler(
+    StarletteHTTPException,
+    http_exception_response,
+)
 
+app.add_middleware(PublicExceptionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.cors_origins,
