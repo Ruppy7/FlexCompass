@@ -116,11 +116,14 @@ class OutageRowError(ValueError):
         row_number: int | None = None,
     ) -> None:
         self.code = code
-        self.message = str(redact(message))
+        self.message = str(sanitise_diagnostic_value(message))
+        safe_raw_record = sanitise_diagnostic_value(
+            {} if raw_record is None else raw_record
+        )
         self.raw_record = (
-            dict(raw_record)
-            if isinstance(raw_record, Mapping)
-            else {"_unsafe": raw_record or UNSAFE_VALUE_SENTINEL}
+            dict(safe_raw_record)
+            if isinstance(safe_raw_record, Mapping)
+            else {"_unsafe": safe_raw_record or UNSAFE_VALUE_SENTINEL}
         )
         self.row_number = row_number
         super().__init__(self.message)
@@ -275,6 +278,8 @@ def parse_ssen_hv_event(
     snapshot_id: str,
 ) -> OutageEvent:
     """Parse one raw SSEN row without losing its original evidence."""
+    raw_record = dict(row)
+    require_exact_safe_raw_record(raw_record)
     expected_columns = _columns_for(licence_area)
     if tuple(row) != expected_columns:
         raise SourceContractError(
@@ -282,7 +287,6 @@ def parse_ssen_hv_event(
             observed=list(row),
         )
 
-    raw_record = dict(row)
     network_field = "NRN_SOUTH" if licence_area == "SEPD" else "NRN_NORTH"
     average_field = (
         "AVG_TIME_OFF_SUPPLY_MINS"

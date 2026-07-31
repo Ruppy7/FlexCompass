@@ -1784,8 +1784,11 @@ def test_benign_percent_and_multiline_warnings_survive_persistence(
     }
 
 
-def encoded(value: str, depth: int) -> str:
-    for _ in range(depth):
+def fully_byte_encoded(value: str, depth: int) -> str:
+    if depth == 0:
+        return value
+    value = "".join(f"%{byte:02X}" for byte in value.encode("utf-8"))
+    for _ in range(1, depth):
         value = quote(value, safe="")
     return value
 
@@ -1799,13 +1802,19 @@ def synthetic_signed_target(marker: str) -> str:
 
 @pytest.mark.parametrize("depth", [0, 1, 4, 8])
 def test_signed_detector_covers_permitted_decode_budget(depth: int) -> None:
-    value = encoded(synthetic_signed_target("SYNTHETIC_DEPTH_MARKER"), depth)
+    value = fully_byte_encoded(
+        synthetic_signed_target("SYNTHETIC_DEPTH_MARKER"),
+        depth,
+    )
 
     assert sanitise_diagnostic_value(value) == UNSAFE_VALUE_SENTINEL
 
 
 def test_ninth_decoding_layer_fails_closed() -> None:
-    value = encoded(synthetic_signed_target("SYNTHETIC_NINTH_MARKER"), 9)
+    value = fully_byte_encoded(
+        synthetic_signed_target("SYNTHETIC_NINTH_MARKER"),
+        9,
+    )
 
     assert sanitise_diagnostic_value(value) == UNSAFE_VALUE_SENTINEL
 
@@ -1818,20 +1827,86 @@ def test_benign_percent_and_multiline_values_round_trip(value: str) -> None:
     assert sanitise_diagnostic_value(value) == value
 
 
-@pytest.mark.parametrize("depth", [8, 9])
-def test_encoded_signed_mapping_keys_fail_closed_at_eight_and_nine_layers(
+@pytest.mark.parametrize("depth", [1, 4, 8, 9])
+def test_fully_byte_encoded_mapping_keys_fail_closed_at_every_depth(
     depth: int,
 ) -> None:
     marker = "SYNTHETIC_ENCODED_KEY_MARKER"
-    value = {encoded("signed_url", depth): marker, "ordinary": "retained"}
+    unsafe_key = fully_byte_encoded("signed_url", depth)
+    value = {unsafe_key: marker, "ordinary": "retained"}
 
     sanitised = sanitise_diagnostic_value(value)
     rendered = json.dumps(sanitised, sort_keys=True)
 
     assert marker not in rendered
-    assert encoded("signed_url", depth) not in rendered
+    assert unsafe_key not in rendered
     with pytest.raises(UnsafePersistenceValueError):
         require_exact_safe_structure(value)
+
+
+def test_direct_parser_rejects_unsafe_raw_record_without_reflection(
+    sample_row: dict[str, str],
+) -> None:
+    marker = "SYNTHETIC_DIRECT_PARSER_MARKER"
+    target = synthetic_signed_target(marker)
+
+    with pytest.raises(UnsafePersistenceValueError) as caught:
+        parse_sepd(sample_row | {"CAUSE": target})
+
+    exception_state = repr(caught.value.__dict__)
+    for forbidden in (marker, target):
+        assert forbidden not in str(caught.value)
+        assert forbidden not in repr(caught.value)
+        assert forbidden not in exception_state
+
+
+def test_extra_column_unsafe_value_is_sanitised_and_later_row_continues(
+    sepd_csv_bytes: bytes,
+) -> None:
+    marker = "SYNTHETIC_EXTRA_COLUMN_MARKER"
+    target = synthetic_signed_target(marker)
+    rows = list(csv.reader(io.StringIO(sepd_csv_bytes.decode())))
+    csv_text = io.StringIO(newline="")
+    csv.writer(csv_text, lineterminator="\n").writerows(
+        [rows[0], [*rows[1], target], rows[2]]
+    )
+
+    results = list(
+        iter_ssen_hv_csv(csv_text.getvalue().encode(), licence_area="SEPD")
+    )
+
+    assert len(results) == 2
+    assert isinstance(results[0], OutageRowError)
+    assert results[0].code == "invalid_row_shape"
+    error_state = repr(results[0].__dict__)
+    for forbidden in (marker, target):
+        assert forbidden not in str(results[0])
+        assert forbidden not in repr(results[0])
+        assert forbidden not in error_state
+    assert isinstance(results[1], OutageEvent)
+    assert results[1].raw_record == dict(zip(SEPD_COLUMNS, rows[2], strict=True))
+
+
+def test_malformed_unsafe_row_is_safe_and_later_row_continues(
+    sepd_csv_bytes: bytes,
+) -> None:
+    marker = "SYNTHETIC_MALFORMED_ROW_MARKER"
+    target = synthetic_signed_target(marker)
+    lines = sepd_csv_bytes.decode().splitlines()
+    malformed = lines[1].replace("Switchgear", f'"bad"tail{target}', 1)
+    csv_bytes = "\n".join((lines[0], malformed, lines[2])).encode()
+
+    results = list(iter_ssen_hv_csv(csv_bytes, licence_area="SEPD"))
+
+    assert len(results) == 2
+    assert isinstance(results[0], OutageRowError)
+    assert results[0].code == "invalid_row_shape"
+    error_state = repr(results[0].__dict__)
+    for forbidden in (marker, target):
+        assert forbidden not in str(results[0])
+        assert forbidden not in repr(results[0])
+        assert forbidden not in error_state
+    assert isinstance(results[1], OutageEvent)
 
 
 def test_persistence_rejects_structured_value_over_512_kib() -> None:
@@ -1890,6 +1965,69 @@ def test_persistence_rejects_cycles_and_non_json_values() -> None:
             require_exact_safe_structure(value)
 
 
+def test_exact_string_and_mapping_key_byte_limits_accept_boundary_only() -> None:
+    accepted_leaf = "é" * 32_768
+    rejected_leaf = accepted_leaf + "x"
+    accepted_key = "k" * 65_536
+    rejected_key = accepted_key + "k"
+
+    assert len(accepted_leaf.encode("utf-8")) == 65_536
+    assert len(rejected_leaf.encode("utf-8")) == 65_537
+    assert sanitise_diagnostic_value(accepted_leaf) == accepted_leaf
+    assert sanitise_diagnostic_value(rejected_leaf) == UNSAFE_VALUE_SENTINEL
+    assert sanitise_diagnostic_value({accepted_key: "v"}) == {accepted_key: "v"}
+    assert sanitise_diagnostic_value({rejected_key: "v"}) == UNSAFE_VALUE_SENTINEL
+    require_exact_safe_structure(accepted_leaf)
+    require_exact_safe_structure({accepted_key: "v"})
+    with pytest.raises(UnsafePersistenceValueError):
+        require_exact_safe_structure(rejected_leaf)
+    with pytest.raises(UnsafePersistenceValueError):
+        require_exact_safe_structure({rejected_key: "v"})
+
+
+def test_exact_structured_byte_limit_accepts_boundary_only() -> None:
+    accepted = ["x" * 65_536 for _ in range(7)] + ["x" * 65_511]
+    rejected = [*accepted[:-1], accepted[-1] + "x"]
+
+    def canonical_size(value: Any) -> int:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    assert canonical_size(accepted) == 524_288
+    assert canonical_size(rejected) == 524_289
+    assert sanitise_diagnostic_value(accepted) == accepted
+    assert sanitise_diagnostic_value(rejected) == UNSAFE_VALUE_SENTINEL
+    require_exact_safe_structure(accepted)
+    with pytest.raises(UnsafePersistenceValueError):
+        require_exact_safe_structure(rejected)
+
+
+def test_exact_depth_and_item_limits_accept_boundary_only() -> None:
+    accepted_depth: Any = "leaf"
+    for _ in range(32):
+        accepted_depth = [accepted_depth]
+    rejected_depth = [accepted_depth]
+    accepted_items = list(range(10_000))
+    rejected_items = list(range(10_001))
+
+    assert sanitise_diagnostic_value(accepted_depth) == accepted_depth
+    assert sanitise_diagnostic_value(rejected_depth) == UNSAFE_VALUE_SENTINEL
+    assert sanitise_diagnostic_value(accepted_items) == accepted_items
+    assert sanitise_diagnostic_value(rejected_items) == UNSAFE_VALUE_SENTINEL
+    require_exact_safe_structure(accepted_depth)
+    require_exact_safe_structure(accepted_items)
+    with pytest.raises(UnsafePersistenceValueError):
+        require_exact_safe_structure(rejected_depth)
+    with pytest.raises(UnsafePersistenceValueError):
+        require_exact_safe_structure(rejected_items)
+
+
 def test_event_raw_record_is_never_sanitised(
     temp_db: Path,
     parsed_event: OutageEvent,
@@ -1929,7 +2067,9 @@ def test_mixed_safe_and_unsafe_rows_complete_with_one_reject(
     sample_row: dict[str, str],
 ) -> None:
     marker = "SYNTHETIC_MIXED_ROW_MARKER"
-    unsafe_row = sample_row | {"CAUSE": encoded(synthetic_signed_target(marker), 4)}
+    unsafe_row = sample_row | {
+        "CAUSE": fully_byte_encoded(synthetic_signed_target(marker), 4)
+    }
     safe_row = sample_row | {
         "DIST_HV_REF": "SYNTHETIC-SAFE-ROW",
         "NRN_SOUTH": "SYNTHETIC-SAFE-NETWORK",
@@ -2016,38 +2156,43 @@ def test_budget_failures_leave_no_partial_run_state(
     assert counts == {table: 0 for table in counts}
 
 
-def test_completed_failed_reject_and_returned_results_share_the_same_boundary(
+@pytest.mark.parametrize("depth", [8, 9])
+def test_deep_completed_failed_reject_and_results_share_the_same_boundary(
     temp_db: Path,
     source_snapshot: SourceSnapshot,
     parsed_event: OutageEvent,
+    depth: int,
 ) -> None:
-    marker = "SYNTHETIC_SHARED_BOUNDARY_MARKER"
-    unsafe = encoded(synthetic_signed_target(marker), 8)
+    marker = f"SYNTHETIC_SHARED_BOUNDARY_MARKER_{depth}"
+    target = synthetic_signed_target(marker)
+    unsafe = fully_byte_encoded(target, depth)
+    unsafe_key = fully_byte_encoded("signed_url", depth)
+    run_suffix = str(depth)
     reject = OutageReject(
-        run_id="run:shared-completed",
+        run_id=f"run:shared-completed:{run_suffix}",
         source_resource_id=source_snapshot.source_resource_id,
         row_number=2,
         error_code="unsafe_raw_record",
         error_message=unsafe,
-        raw_row={"value": unsafe},
+        raw_row={unsafe_key: unsafe, "value": unsafe},
     )
 
     completed = commit_ingestion_run(
-        run_id="run:shared-completed",
+        run_id=f"run:shared-completed:{run_suffix}",
         resources_seen=1,
         snapshots=[source_snapshot],
         events=[parsed_event],
         rejects=[reject],
         snapshots_created=1,
         snapshots_reused=0,
-        warnings=[unsafe],
+        warnings=[{unsafe_key: unsafe, "value": unsafe}],
         db_path=temp_db,
     )
     failed = record_failed_ingestion_run(
-        run_id="run:shared-failed",
+        run_id=f"run:shared-failed:{run_suffix}",
         resources_seen=1,
         error=RuntimeError(unsafe),
-        warnings=[unsafe],
+        warnings=[{unsafe_key: unsafe, "value": unsafe}],
         db_path=temp_db,
     )
 
@@ -2057,10 +2202,9 @@ def test_completed_failed_reject_and_returned_results_share_the_same_boundary(
         [completed.model_dump(), failed.model_dump()],
         sort_keys=True,
     )
-    assert marker not in sqlite_text
-    assert marker not in returned
-    assert unsafe not in sqlite_text
-    assert unsafe not in returned
+    for forbidden in (marker, target, unsafe, unsafe_key):
+        assert forbidden not in sqlite_text
+        assert forbidden not in returned
     assert UNSAFE_VALUE_SENTINEL in sqlite_text
     assert UNSAFE_VALUE_SENTINEL in returned
 
