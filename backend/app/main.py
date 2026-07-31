@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +16,16 @@ from .api_errors import (
     validation_exception_response,
 )
 from .config import config
+from .db import run_migrations
 from .demo_routes import demo_router
 from .routes import router
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Prepare the configured outage store without coupling other databases."""
+    run_migrations(config.outage_db_path)
+    yield
 
 app = FastAPI(
     title="FlexCompass",
@@ -23,6 +34,7 @@ app = FastAPI(
         "electricity-network and flexibility-market data."
     ),
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_exception_handler(
@@ -61,6 +73,10 @@ def root_info() -> dict[str, object]:
             "/api/demo/analyse",
             "/api/demo/report",
             "/api/demo/asset-groups/generate",
+            "/api/v1/outages/events",
+            "/api/v1/outages/summary",
+            "/api/v1/outages/events/{event_id}",
+            "/api/v1/outages/snapshots",
         ],
     }
 
