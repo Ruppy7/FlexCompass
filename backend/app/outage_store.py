@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
-from app.catalogue_sync import redact, safe_error
+from app.catalogue_sync import safe_error
 from app.db import get_connection, run_migrations
 from app.outages import (
     OutageEvent,
@@ -19,6 +18,11 @@ from app.outages import (
     OutageSummary,
     SourceSnapshot,
     SyncResult,
+)
+from app.persistence_safety import (
+    UNSAFE_VALUE_SENTINEL,
+    require_exact_safe_raw_record,
+    sanitise_diagnostic_value,
 )
 
 _EVENT_FIELDS = tuple(OutageEvent.model_fields)
@@ -40,17 +44,6 @@ _SNAPSHOT_FILTERS = {
     "source_dataset_id": "source_dataset_id",
     "source_resource_id": "source_resource_id",
 }
-_R2_SIGNED_TARGET = re.compile(
-    r"https://83025b28472d6aa2bf5ae59f3724aa78"
-    r"\.r2\.cloudflarestorage\.com(?::443)?"
-    r"(?=/|[?#\s\"'<>]|$)(?:/[^\s\"'<>]*)?",
-    re.IGNORECASE,
-)
-_X_AMZ_FIELD = re.compile(
-    r"x-amz-[a-z0-9-]+(?:\s*[:=]\s*[^&,\s}\])\"']+)?",
-    re.IGNORECASE,
-)
-_PERSISTENCE_DECODE_ROUNDS = 3
 
 
 def _json(value: Any) -> str:
@@ -60,52 +53,6 @@ def _json(value: Any) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
-
-
-def _decoded_layers(value: str) -> list[str]:
-    """Decode only for detection, with the Package 1 three-round budget."""
-    layers = [value]
-    decoded = value
-    for _ in range(_PERSISTENCE_DECODE_ROUNDS):
-        further_decoded = unquote(decoded)
-        if further_decoded == decoded:
-            break
-        layers.append(further_decoded)
-        decoded = further_decoded
-    return layers
-
-
-def _has_signed_contamination(value: str, *, key: bool = False) -> bool:
-    layers = _decoded_layers(value)
-    return any(
-        _R2_SIGNED_TARGET.search(layer) or _X_AMZ_FIELD.search(layer)
-        for layer in layers
-    ) or (
-        key
-        and any(
-            layer.strip().casefold() in {"signed_url", "redirect_url"}
-            for layer in layers
-        )
-    )
-
-
-def _safe_failure_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        safe_mapping: dict[str, Any] = {}
-        for key, item in value.items():
-            key_text = str(key)
-            if _has_signed_contamination(key_text, key=True):
-                continue
-            safe_mapping[key_text] = _safe_failure_value(item)
-        return redact(safe_mapping)
-    if isinstance(value, (list, tuple)):
-        return [_safe_failure_value(item) for item in value]
-    if isinstance(value, str):
-        if _has_signed_contamination(value):
-            return "[REDACTED SIGNED REDIRECT]"
-        return redact(value)
-    return redact(value)
-
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
@@ -279,7 +226,13 @@ def count_source_snapshots(
 def _event_values(event: OutageEvent) -> tuple[Any, ...]:
     values = event.model_dump()
     values["quality_flags"] = _json(values["quality_flags"])
-    values["raw_record"] = _json(values["raw_record"])
+    require_exact_safe_raw_record(event.raw_record)
+    values["raw_record"] = json.dumps(
+        event.raw_record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return tuple(values[field] for field in _EVENT_FIELDS)
 
 
@@ -456,8 +409,8 @@ def _save_outage_rejects(
                 reject.source_resource_id,
                 reject.row_number,
                 reject.error_code,
-                str(_safe_failure_value(reject.error_message)),
-                _json(_safe_failure_value(reject.raw_row)),
+                str(sanitise_diagnostic_value(reject.error_message)),
+                _json(sanitise_diagnostic_value(reject.raw_row)),
             )
             for reject in rejects
         ],
@@ -493,9 +446,12 @@ def commit_ingestion_run(
     supplied_snapshots = list(snapshots)
     supplied_events = list(events)
     supplied_rejects = list(rejects)
-    safe_warnings = [
-        str(item) for item in _safe_failure_value(list(warnings))
-    ]
+    sanitised_warnings = sanitise_diagnostic_value(list(warnings))
+    safe_warnings = (
+        [UNSAFE_VALUE_SENTINEL]
+        if sanitised_warnings == UNSAFE_VALUE_SENTINEL
+        else [str(item) for item in sanitised_warnings]
+    )
     run_migrations(db_path)
     with get_connection(db_path) as connection:
         connection.execute(
@@ -546,11 +502,13 @@ def record_failed_ingestion_run(
     db_path: Path | None = None,
 ) -> SyncResult:
     """Record only redacted failure state in a separate short transaction."""
-    safe_warnings = _safe_failure_value(list(warnings))
+    safe_warnings = sanitise_diagnostic_value(list(warnings))
+    if safe_warnings == UNSAFE_VALUE_SENTINEL:
+        safe_warnings = [UNSAFE_VALUE_SENTINEL]
     safe_warning_strings = [
         item if isinstance(item, str) else _json(item) for item in safe_warnings
     ]
-    safe_failure = safe_error(error)
+    safe_failure = str(sanitise_diagnostic_value(safe_error(error)))
     run_migrations(db_path)
     with get_connection(db_path) as connection:
         connection.execute(

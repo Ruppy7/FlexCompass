@@ -18,6 +18,12 @@ from pydantic import ValidationError
 
 from app.catalogue_sync import redact
 from app.outages import LicenceArea, OutageEvent, SourceResource
+from app.persistence_safety import (
+    UNSAFE_VALUE_SENTINEL,
+    UnsafePersistenceValueError,
+    require_exact_safe_raw_record,
+    sanitise_diagnostic_value,
+)
 
 SOURCE_DATASET_ID = "nafirs-hv-faults"
 PACKAGE_ID = "b0a58349-2ce6-4fa8-9238-a5564f966433"
@@ -106,12 +112,16 @@ class OutageRowError(ValueError):
         code: str,
         message: str,
         *,
-        raw_record: Mapping[str, Any] | None = None,
+        raw_record: Mapping[str, Any] | str | None = None,
         row_number: int | None = None,
     ) -> None:
         self.code = code
         self.message = str(redact(message))
-        self.raw_record = dict(raw_record or {})
+        self.raw_record = (
+            dict(raw_record)
+            if isinstance(raw_record, Mapping)
+            else {"_unsafe": raw_record or UNSAFE_VALUE_SENTINEL}
+        )
         self.row_number = row_number
         super().__init__(self.message)
 
@@ -416,12 +426,20 @@ def iter_ssen_hv_csv(
             continue
         row = dict(zip(expected_columns, values, strict=True))
         try:
+            require_exact_safe_raw_record(row)
             yield parse_ssen_hv_event(
                 row,
                 licence_area=licence_area,
                 source_dataset_id=source_dataset_id,
                 source_resource_id=resolved_resource_id,
                 snapshot_id=snapshot_id,
+            )
+        except UnsafePersistenceValueError:
+            yield OutageRowError(
+                code="unsafe_raw_record",
+                message="raw outage row is unsafe for persistence",
+                raw_record=sanitise_diagnostic_value(row),
+                row_number=row_number,
             )
         except OutageRowError as error:
             error.row_number = row_number
