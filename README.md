@@ -38,7 +38,7 @@ verification status.
 
 ## Quick start
 
-Python 3.11+ and Node.js 20.9.0+ are expected.
+Python 3.11+ and Node.js 20.9+ on the 20.x line, or Node.js 22+, are expected.
 
 ```powershell
 python -m venv .venv
