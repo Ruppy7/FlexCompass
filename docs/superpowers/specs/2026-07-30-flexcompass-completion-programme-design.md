@@ -1,7 +1,7 @@
 # FlexCompass Completion Programme Design
 
 Date: 2026-07-30
-Status: approved programme direction; written specification pending final user review
+Status: approved written specification
 
 ## 1. Purpose
 
@@ -170,10 +170,12 @@ that defines:
 
 - portal, dataset, and resource identifiers;
 - publisher and attribution;
-- licence evidence and redistribution constraints;
+- licence evidence and redistribution constraints, bound to the exact reviewed
+  public evidence URL, observation identity/time, and immutable evidence hash;
 - anonymous or registered read mode without credential values;
 - expected content type, schema, time interpretation, and geography;
-- approved request rate and pagination/download behaviour;
+- approved request rate, timeouts, redirect limits, and explicit
+  pagination/download byte bounds;
 - snapshot and retention policy;
 - analytical role and known limitations.
 
@@ -431,7 +433,10 @@ Goal: deliver the first complete real-data research workflow.
 ### WP2.2 Historical outage explorer
 
 - Filter by licence area, reporting period, voltage, equipment, cause, customer
-  impact, duration, quality status, and source snapshot.
+  impact, quality status, and source snapshot. The NaFIRS extract does not
+  provide an event-end timestamp or event duration, so the explorer exposes
+  duration as an unsupported evidence gap. It never substitutes the aggregate
+  `average_minutes_off_supply` field.
 - Provide time trends, cause/equipment breakdowns, impact distributions,
   coverage, reject counts, and data-quality warnings.
 - Drill from summaries to event and raw-row provenance.
@@ -442,6 +447,11 @@ Goal: deliver the first complete real-data research workflow.
 - Generate an analysis manifest containing filters, source/resource IDs,
   snapshot hashes, schema/parser versions, exclusions, and code version.
 - Re-run a manifest against the same retained snapshot to reproduce the result.
+- Publish the exact licence-reviewed source bytes used by the first
+  investigation as a hash-addressed release asset outside Git, and provide a
+  GET-only bootstrap command that verifies the bundle before local import. A
+  mutable upstream source is not sufficient evidence for new-user
+  reproduction.
 
 ### WP2.4 First public investigation
 
@@ -705,7 +715,9 @@ Release gates include:
 - Ruff;
 - TypeScript strict checking, frontend unit/component tests, accessibility
   checks, and production build;
-- GET-only and credential-redaction verification;
+- GET-only portal-egress, absence of state-changing public application routes,
+  and credential-redaction verification; labelled non-persistent POST analysis
+  of supplied synthetic payloads remains permitted;
 - public-boundary scan;
 - migration and clean-install verification;
 - reproducible export comparison;
