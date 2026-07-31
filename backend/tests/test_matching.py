@@ -521,3 +521,25 @@ def test_report_renders_nullable_signal_evidence_as_unknown() -> None:
 
     assert "Unknown" in report
     assert "None" not in report
+
+
+def test_assessment_disclaimer_does_not_invent_signal_provenance() -> None:
+    signal = _make_signal(
+        confidence_level="unknown",
+        source_id=None,
+        source_dataset_id=None,
+        raw_record=None,
+    )
+
+    assessment = assess_portfolio(_make_portfolio(), [signal], [])[0]
+
+    assert "curated public-source data" not in assessment.disclaimer
+    assert "supplied signal and portfolio evidence" in assessment.disclaimer
+    assert "may be missing or unverified" in assessment.disclaimer
+    assert "not a bid recommendation" in assessment.disclaimer
+    assert "eligibility confirmation" in assessment.disclaimer
+    assert "revenue forecast" in assessment.disclaimer
+    assert "commercial decisioning tool" in assessment.disclaimer
+    assert signal.source_id is None
+    assert signal.source_dataset_id is None
+    assert signal.raw_record is None

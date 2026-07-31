@@ -426,9 +426,10 @@ def assess_portfolio(
             next_steps.append("Gather more data on this signal before assessing fit.")
 
         disclaimer = (
-            "This assessment uses curated public-source data and transparent heuristic "
-            "assumptions. It is not a bid recommendation, eligibility confirmation, "
-            "revenue forecast, or commercial decisioning tool."
+            "This assessment applies transparent heuristic checks to the supplied signal "
+            "and portfolio evidence. Evidence may be missing or unverified. It is not a "
+            "bid recommendation, eligibility confirmation, revenue forecast, or "
+            "commercial decisioning tool."
         )
 
         assessments.append(
