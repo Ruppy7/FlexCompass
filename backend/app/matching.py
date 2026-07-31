@@ -41,6 +41,14 @@ def _total_estimated_kw(portfolio: Portfolio) -> float:
 def _check_geography(portfolio: Portfolio, signal: FlexSignal) -> tuple[RatingLevel, list[str]]:
     evidence: list[str] = []
     dso = signal.dso.upper()
+    has_location_evidence = any(
+        group.regional_distribution or group.postcode_distribution
+        for group in portfolio.assets
+    )
+    if not has_location_evidence:
+        evidence.append("No regional or postcode distribution data found for portfolio.")
+        return RatingLevel.unknown, evidence
+
     if dso == "NESO":
         # National signal — partial if any regional presence
         has_presence = any(
@@ -80,6 +88,13 @@ def _check_asset_compatibility(
     portfolio: Portfolio, signal: FlexSignal
 ) -> tuple[CompatibilityLevel, list[str]]:
     evidence: list[str] = []
+    if signal.service_type is None:
+        evidence.append("Signal does not identify a service type.")
+        return CompatibilityLevel.unclear, evidence
+    if signal.eligible_asset_types is None:
+        evidence.append("Signal does not provide eligible asset type evidence.")
+        return CompatibilityLevel.unclear, evidence
+
     signal_assets = set(signal.eligible_asset_types)
     portfolio_types = {g.asset_type for g in portfolio.assets}
 
@@ -218,7 +233,11 @@ def _check_data_completeness(signal: FlexSignal) -> tuple[DataCompleteness, list
     checks = [
         ("DSO", bool(signal.dso)),
         ("service type", bool(signal.service_type)),
-        ("location", signal.location_type.value != "unknown"),
+        (
+            "location",
+            signal.location_type is not None
+            and signal.location_type.value != "unknown",
+        ),
         ("capacity", signal.capacity_kw is not None),
         ("price/payment", signal.guide_price is not None or signal.payment_type is not None),
         ("timing", signal.duration_minutes is not None or signal.window_start is not None),
@@ -394,7 +413,10 @@ def assess_portfolio(
 
         next_steps: list[str] = []
         if band in (PriorityBand.high, PriorityBand.medium):
-            next_steps.append(f"Investigate {signal.dso} procurement process for {signal.area_name}.")
+            area_name = signal.area_name or "Unknown area"
+            next_steps.append(
+                f"Investigate {signal.dso} procurement process for {area_name}."
+            )
             if not signal.guide_price:
                 next_steps.append("Request indicative pricing from DSO.")
             next_steps.append("Validate metering and baseline requirements against current capabilities.")

@@ -1,15 +1,6 @@
 """API integration tests — exercise endpoints against real DB."""
 
-import pytest
-from app.main import app
-from fastapi.testclient import TestClient
-
-
-@pytest.fixture(scope="module")
-def client():
-    """TestClient that triggers lifespan startup (migrations + data load)."""
-    with TestClient(app) as c:
-        yield c
+from pathlib import Path
 
 
 class TestHealthEndpoints:
@@ -96,6 +87,7 @@ class TestAnalysisEndpoints:
             "portfolio_id": "test_001",
             "portfolio_name": "Test Portfolio",
             "assets": [{
+                "source": "synthetic",
                 "asset_type": "ev_charger",
                 "asset_count": 1000,
                 "rated_power_kw": 7,
@@ -122,6 +114,7 @@ class TestAnalysisEndpoints:
             "portfolio_id": "test_002",
             "portfolio_name": "Test Report",
             "assets": [{
+                "source": "synthetic",
                 "asset_type": "battery",
                 "asset_count": 50,
                 "rated_power_kw": 10,
@@ -152,10 +145,11 @@ class TestAssetGroupEndpoints:
 
     def test_generate_asset_group(self, client):
         r = client.post("/api/asset-groups/generate",
-                       json={"asset_type": "battery", "count": 500, "region": "NGED"})
+                       json={"asset_type": "battery", "count": 500, "portal_id": "nged"})
         assert r.status_code == 200
         data = r.json()
         assert data["asset_group"]["asset_type"] == "battery"
+        assert data["asset_group"]["source"] == "synthetic"
         assert data["estimated_available_kw"] > 0
 
 
@@ -175,3 +169,12 @@ class TestDbStatsEndpoint:
         data = r.json()
         assert data["source"] == "db"
         assert "tables" in data
+
+
+def test_application_database_is_isolated(isolated_api_client) -> None:
+    client, test_db = isolated_api_client
+    repository_db = Path(__file__).resolve().parents[2] / "data" / "flexcompass.db"
+
+    assert client.get("/api/health").status_code == 200
+    assert test_db.exists()
+    assert test_db.resolve() != repository_db.resolve()

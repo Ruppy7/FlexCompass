@@ -9,9 +9,11 @@ from app.matching import (
     _check_market_rule,
     _check_temporal,
     _determine_priority,
+    assess_portfolio,
 )
 from app.models import (
     AssetGroup,
+    AssetSource,
     AssetType,
     CompatibilityLevel,
     DataCompleteness,
@@ -26,6 +28,7 @@ from app.models import (
     ServiceType,
     TemporalLevel,
 )
+from app.report_generator import generate_report
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -35,7 +38,7 @@ def _make_portfolio(**overrides) -> Portfolio:
     defaults = dict(
         portfolio_id="p1",
         portfolio_name="Test Portfolio",
-        assets=[],
+        assets=[_make_asset_group()],
     )
     defaults.update(overrides)
     return Portfolio(**defaults)
@@ -43,6 +46,7 @@ def _make_portfolio(**overrides) -> Portfolio:
 
 def _make_asset_group(**overrides) -> AssetGroup:
     defaults = dict(
+        source=AssetSource.synthetic,
         asset_type=AssetType.ev_charger,
         asset_count=1000,
         rated_power_kw=7.0,
@@ -205,7 +209,7 @@ class TestCheckCapacity:
     def test_strong(self):
         """Estimated kw >= signal capacity → strong."""
         asset = _make_asset_group(
-            asset_count=10000, controllable_power_kw=10.0,
+            asset_count=10000, rated_power_kw=10.0, controllable_power_kw=10.0,
             availability_percent=0.5, response_reliability_percent=0.9,
         )
         portfolio = _make_portfolio(assets=[asset])
@@ -218,7 +222,7 @@ class TestCheckCapacity:
         # 100 * 10 * 0.05 * 0.9 = 45 → 45/100 = 45% → weak
         # Need >= 50%: 100 * 10 * 0.06 * 0.9 = 54
         asset = _make_asset_group(
-            asset_count=100, controllable_power_kw=10.0,
+            asset_count=100, rated_power_kw=10.0, controllable_power_kw=10.0,
             availability_percent=0.06, response_reliability_percent=0.9,
         )
         portfolio = _make_portfolio(assets=[asset])
@@ -457,3 +461,63 @@ class TestDeterminePriority:
             ops_complexity=OperationalComplexity.medium,
         )
         assert band == PriorityBand.insufficient_evidence
+
+
+def test_missing_service_evidence_is_unclear_not_incompatible() -> None:
+    signal = _make_signal(service_type=None)
+    level, _ = _check_asset_compatibility(_make_portfolio(), signal)
+    assert level == CompatibilityLevel.unclear
+
+
+def test_missing_eligibility_evidence_is_unclear_not_incompatible() -> None:
+    signal = _make_signal(eligible_asset_types=None)
+    level, _ = _check_asset_compatibility(_make_portfolio(), signal)
+    assert level == CompatibilityLevel.unclear
+
+
+def test_missing_region_evidence_is_unknown_not_weak() -> None:
+    portfolio = _make_portfolio(
+        assets=[_make_asset_group(regional_distribution={})]
+    )
+    level, _ = _check_geography(portfolio, _make_signal(dso="NGED"))
+    assert level == RatingLevel.unknown
+
+
+def test_assess_portfolio_handles_all_nullable_signal_evidence() -> None:
+    signal = _make_signal(
+        service_type=None,
+        market_name=None,
+        area_name=None,
+        location_type=None,
+        location_reference=None,
+        requirement_type=None,
+        procurement_type=None,
+        eligible_asset_types=None,
+        platform=None,
+    )
+    assessment = assess_portfolio(_make_portfolio(), [signal], [])[0]
+    assert assessment.asset_type_compatibility == CompatibilityLevel.unclear
+    assert "None" not in "\n".join(
+        assessment.evidence_summary + assessment.next_steps
+    )
+
+
+def test_report_renders_nullable_signal_evidence_as_unknown() -> None:
+    portfolio = _make_portfolio()
+    signal = _make_signal(
+        service_type=None,
+        market_name=None,
+        area_name=None,
+        location_type=None,
+        location_reference=None,
+        requirement_type=None,
+        procurement_type=None,
+        eligible_asset_types=None,
+        platform=None,
+    )
+    assessment = assess_portfolio(portfolio, [signal], [])[0]
+
+    report = generate_report(portfolio, [assessment], [signal], [])
+
+    assert "Unknown" in report
+    assert "None" not in report

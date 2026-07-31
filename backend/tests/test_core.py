@@ -3,14 +3,26 @@
 Coverage: confidence rubric, resolver, normaliser, capacity maths, config.
 """
 
+import pytest
 from app.catalogue_models import CATALOGUE_PORTAL_IDS
 from app.confidence import (
     GeographyMatch,
     confidence_from_signal_fields,
 )
 from app.config import config
-from app.models import ConfidenceLevel, FlexZone
-from app.normaliser import normalise_nged_signal, normalise_spen_signal
+from app.models import (
+    AssetType,
+    ConfidenceLevel,
+    FlexZone,
+    LocationType,
+    RequirementType,
+    ServiceType,
+)
+from app.normaliser import (
+    normalise_nged_signal,
+    normalise_nged_zone,
+    normalise_spen_signal,
+)
 from app.resolver import batch_resolve, parse_postcode, resolve_postcode
 from app.sampling import sample_postcodes
 
@@ -185,6 +197,7 @@ class TestNormaliser:
             "service_type": "demand_turn_down",
             "capacity_kw": 150.0,
             "guide_price": 15.0,
+            "platform": "Electron",
         }
         sig = normalise_spen_signal(raw, source_dataset_id="ds_spen")
         assert sig.dso == "SPEN"
@@ -198,6 +211,134 @@ class TestNormaliser:
         assert sig.capacity_kw is None
         assert sig.guide_price is None
         assert sig.zone_id is None
+
+
+def test_missing_service_and_requirement_remain_unknown() -> None:
+    signal = normalise_nged_signal({"trade_id": "T-unknown"})
+    assert signal.service_type is None
+    assert signal.requirement_type is None
+    assert signal.procurement_type is None
+    assert signal.price_unit is None
+
+
+def test_unrecognised_service_type_remains_unknown() -> None:
+    signal = normalise_nged_signal(
+        {"trade_id": "T-other", "service_type": "publisher-new-service"}
+    )
+    assert signal.service_type is None
+
+
+def test_nged_zone_without_source_identity_fails_closed() -> None:
+    with pytest.raises(ValueError, match="missing zone identity"):
+        normalise_nged_zone({"area_name": "Unidentified"})
+
+
+@pytest.mark.parametrize(
+    ("normaliser", "identifier"),
+    [
+        (normalise_nged_signal, {"trade_id": "T-empty"}),
+        (normalise_spen_signal, {"record_id": "S-empty"}),
+    ],
+)
+def test_empty_publisher_evidence_remains_unknown(
+    normaliser,
+    identifier: dict[str, str],
+) -> None:
+    signal = normaliser(
+        {
+            **identifier,
+            "service_type": "",
+            "market_name": "",
+            "area_name": "",
+            "platform": "",
+            "requirement_type": "",
+            "procurement_type": "",
+            "price_unit": "",
+            "eligible_asset_types": None,
+            "zone": "",
+        }
+    )
+
+    assert signal.service_type is None
+    assert signal.market_name is None
+    assert signal.area_name is None
+    assert signal.platform is None
+    assert signal.requirement_type is None
+    assert signal.procurement_type is None
+    assert signal.price_unit is None
+    assert signal.eligible_asset_types is None
+    assert signal.location_reference is None
+    assert signal.location_type is None
+
+
+@pytest.mark.parametrize(
+    ("normaliser", "identifier"),
+    [
+        (normalise_nged_signal, {"trade_id": "T-unrecognised"}),
+        (normalise_spen_signal, {"record_id": "S-unrecognised"}),
+    ],
+)
+def test_unrecognised_allow_list_values_remain_unknown(
+    normaliser,
+    identifier: dict[str, str],
+) -> None:
+    signal = normaliser(
+        {
+            **identifier,
+            "service_type": "publisher-new-service",
+            "requirement_type": "publisher-new-requirement",
+            "eligible_asset_types": ["publisher-new-asset"],
+        }
+    )
+
+    assert signal.service_type is None
+    assert signal.requirement_type is None
+    assert signal.eligible_asset_types is None
+
+
+@pytest.mark.parametrize(
+    ("normaliser", "identifier", "zone_id"),
+    [
+        (normalise_nged_signal, {"trade_id": "T-known"}, "nged_verified"),
+        (normalise_spen_signal, {"record_id": "S-known"}, "spen_verified"),
+    ],
+)
+def test_explicit_publisher_evidence_is_preserved(
+    normaliser,
+    identifier: dict[str, str],
+    zone_id: str,
+) -> None:
+    signal = normaliser(
+        {
+            **identifier,
+            "service_type": "demand_turn_up",
+            "market_name": "Published market",
+            "area_name": "Published area",
+            "platform": "Published platform",
+            "requirement_type": "day_ahead",
+            "procurement_type": "Published procurement",
+            "price_unit": "GBP/MW/h",
+            "eligible_asset_types": ["battery"],
+        },
+        zone_id=zone_id,
+    )
+
+    assert signal.service_type is ServiceType.demand_turn_up
+    assert signal.market_name == "Published market"
+    assert signal.area_name == "Published area"
+    assert signal.platform == "Published platform"
+    assert signal.requirement_type is RequirementType.day_ahead
+    assert signal.procurement_type == "Published procurement"
+    assert signal.price_unit == "GBP/MW/h"
+    assert signal.eligible_asset_types == [AssetType.battery]
+    assert signal.location_reference == zone_id
+    assert signal.location_type is LocationType.zone
+
+
+def test_nged_zone_preserves_only_publisher_area_and_type() -> None:
+    zone = normalise_nged_zone({"zone": "published-zone"})
+    assert zone.area_name is None
+    assert zone.zone_type is None
 
 
 # ---------------------------------------------------------------------------

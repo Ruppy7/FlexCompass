@@ -257,17 +257,14 @@ def get_asset_groups():
 def generate_asset_groups(spec: GenerateAssetGroupRequest):
     """Generate a synthetic asset group from a specification.
 
-    Body: { "asset_type": "ev_charger", "count": 1000, "region": "NGED" }
+    Body: { "asset_type": "ev_charger", "count": 1000, "portal_id": "nged" }
     """
-    from .models import AssetGroup, AssetSource, AssetType, ServiceType
-    asset_type_str = spec.asset_type
-    count = spec.count
-    region = spec.region
+    from .models import AssetGroup, AssetSource, ServiceType
 
-    try:
-        asset_type = AssetType(asset_type_str)
-    except ValueError:
-        raise HTTPException(400, f"Invalid asset_type: {asset_type_str}")
+    asset_type = spec.asset_type
+    asset_type_str = asset_type.value
+    count = spec.count
+    region = spec.portal_id.upper()
 
     # Default power assumptions by type
     power_defaults = {

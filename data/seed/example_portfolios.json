@@ -4,6 +4,7 @@
     "portfolio_name": "Domestic EV Charger Portfolio",
     "assets": [
       {
+        "source": "synthetic",
         "asset_type": "ev_charger",
         "asset_count": 3000,
         "rated_power_kw": 7,
@@ -34,6 +35,7 @@
     "portfolio_name": "Mixed DER Portfolio",
     "assets": [
       {
+        "source": "synthetic",
         "asset_type": "ev_charger",
         "asset_count": 1500,
         "rated_power_kw": 7,
@@ -55,6 +57,7 @@
         "operational_notes": ["User override risk."]
       },
       {
+        "source": "synthetic",
         "asset_type": "battery",
         "asset_count": 50,
         "rated_power_kw": 10,
@@ -76,6 +79,7 @@
         "operational_notes": ["SoC constraints not modelled in v0."]
       },
       {
+        "source": "synthetic",
         "asset_type": "generator",
         "asset_count": 10,
         "rated_power_kw": 100,
