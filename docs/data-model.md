@@ -4,11 +4,11 @@ FlexCompass uses a zone-authoritative model: a postcode or coordinate is a looku
 key into a network zone, and a signal refers to that zone when the public source
 provides enough evidence.
 
-The active public-data workflow is the anonymous, read-only seven-portal
-catalogue CLI. `CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` is the
-sole active portal registry. The web application does not expose this registry
-or verified analytical portal records; it presents research status and a
-separate, explicitly synthetic demonstration.
+The active public-data workflows are the anonymous, read-only seven-portal
+catalogue CLI and the reviewed SSEN historical-HV sync and read-only query API.
+`CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` remains the sole portal
+registry. The Next.js application exposes neither registry nor SSEN records; it
+presents research status and a separate, explicitly synthetic demonstration.
 
 ## Core records
 
