@@ -1592,6 +1592,10 @@ if ($httpStatus -eq 200) {
   if ($tagStatus -eq 200) {
     Assert-ExactLightweightTag $tag $reproCommit
   } elseif ($tagStatus -eq 404) {
+    $login = gh api user --jq .login
+    if ($LASTEXITCODE -ne 0 -or $login -cne "Ruppy7") {
+      throw "STOP: GitHub auth must be repaired by the user"
+    }
     gh api --method POST "repos/Ruppy7/FlexCompass/git/refs" `
       -f "ref=refs/tags/$tag" `
       -f "sha=$reproCommit" `
@@ -1602,6 +1606,10 @@ if ($httpStatus -eq 200) {
     Assert-ExactLightweightTag $tag $reproCommit
   } else {
     throw "STOP: tag preflight HTTP $tagStatus requires user action"
+  }
+  $login = gh api user --jq .login
+  if ($LASTEXITCODE -ne 0 -or $login -cne "Ruppy7") {
+    throw "STOP: GitHub auth must be repaired by the user"
   }
   gh release create $tag $asset `
     --repo Ruppy7/FlexCompass `
