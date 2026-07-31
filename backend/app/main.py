@@ -32,6 +32,7 @@ _LEGACY_OUTAGE_PREFIXES = ("/api/outages", "/api/outage-snapshots")
 
 
 def _is_versioned_outage_path(path: str) -> bool:
+    path = path.rstrip("/")
     if path in _VERSIONED_OUTAGE_STATIC_PATHS:
         return True
     if not path.startswith(_VERSIONED_OUTAGE_DETAIL_PREFIX):

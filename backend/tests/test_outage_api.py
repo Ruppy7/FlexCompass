@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import app.db as app_db
 import pytest
@@ -25,6 +26,16 @@ MIGRATION_MESSAGE = "Outage API moved to /api/v1/outages."
 DATASET_ID = "nafirs-hv-faults"
 PACKAGE_ID = "nafirs-hv-faults"
 ALLOWED_ORIGIN = "http://localhost:3000"
+OUTAGE_REDIRECT_ALIASES = [
+    ("/api/v1/outages/events/", "/api/v1/outages/events"),
+    ("/api/v1/outages/summary/", "/api/v1/outages/summary"),
+    (
+        "/api/v1/outages/events/event-1/",
+        "/api/v1/outages/events/event-1",
+    ),
+    ("/api/v1/outages/snapshots/", "/api/v1/outages/snapshots"),
+    ("/api/v1/outages/events//", "/api/v1/outages/events"),
+]
 
 
 def _snapshot(
@@ -519,6 +530,66 @@ def test_outage_openapi_contains_no_write_method(client: TestClient) -> None:
         "/api/v1/outages/snapshots",
     ):
         assert set(paths[path]) == {"get"}
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+@pytest.mark.parametrize(("alias", "canonical"), OUTAGE_REDIRECT_ALIASES)
+def test_outage_trailing_slash_aliases_redirect_to_accepted_routes(
+    client: TestClient,
+    alias: str,
+    canonical: str,
+    method: str,
+) -> None:
+    response = getattr(client, method)(alias, follow_redirects=False)
+    assert response.status_code == 307
+    assert urlsplit(response.headers["location"]).path == canonical
+
+
+@pytest.mark.parametrize(("alias", "_canonical"), OUTAGE_REDIRECT_ALIASES)
+def test_outage_redirect_alias_preflight_preserves_fixed_405(
+    client: TestClient,
+    alias: str,
+    _canonical: str,
+) -> None:
+    response = client.options(
+        alias,
+        follow_redirects=False,
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 405
+    assert response.json() == {"detail": "Request failed", "code": "http_error"}
+    assert "access-control-allow-methods" not in response.headers
+    assert "POST" not in response.headers.get("access-control-allow-methods", "")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/outages/events//event-1",
+        "/api/v1/outages/events/event%2F1",
+        "/api/v1/outages/unrelated/",
+    ],
+)
+def test_non_route_slash_paths_are_not_captured_as_outage_aliases(
+    client: TestClient,
+    path: str,
+) -> None:
+    actual = client.get(path, follow_redirects=False)
+    assert actual.status_code == 404
+
+    preflight = client.options(
+        path,
+        follow_redirects=False,
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert preflight.status_code == 200
+    assert "POST" in preflight.headers["access-control-allow-methods"]
 
 
 @pytest.mark.parametrize("requested_method", ["GET", "POST", "DELETE"])
