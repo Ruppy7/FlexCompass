@@ -15,6 +15,58 @@ and catalogue access was last checked on 15 July 2026.
 | Northern Powergrid | https://northernpowergrid.opendatasoft.com | `https://northernpowergrid.opendatasoft.com/api/explore/v2.1` | None observed | Verify per dataset | Some network asset datasets have separate access-request conditions |
 | National Energy System Operator | https://www.neso.energy/data-portal | `https://api.neso.energy/api/3/action` (CKAN) | None observed; an account is optional for subscriptions and favourites | Verify per dataset; the current catalogue names the NESO Open Data Licence | National and transmission-system data is context, not a substitute for DSO outage or local-flexibility evidence |
 
+## Accepted SSEN NaFIRS HV source
+
+The reviewed analytical source is SSEN Distribution dataset
+`nafirs-hv-faults`, package `b0a58349-2ce6-4fa8-9238-a5564f966433`:
+
+- SEPD CSV resource: `ab32515f-76f2-421d-8034-7d5b01325a33`.
+- SHEPD CSV resource: `673578c9-f531-41a5-a17c-0b35bc0fae4c`.
+
+The tracked source contract is `data/sources/ssen-nafirs-hv.json`, with reviewed
+licence evidence at `data/sources/evidence/ssen-nafirs-hv-licence.json`.
+Attribution is **SSEN Distribution**. The dataset is licensed under
+[Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/);
+the reviewed evidence says source bytes may be redistributed with attribution.
+The repository's MIT licence does not replace those terms.
+
+The raw CSV downloads are authoritative for parsing. The public CKAN DataStore
+was observed to contain a day/month defect, so it is not used as event-time
+authority. Raw incident timestamps are interpreted day-first. The publisher
+timezone is unknown and publisher cadence is unknown. SEPD and SHEPD have
+different schemas; both exact headers are validated independently.
+
+The collector performs anonymous read-only GET requests to each stable origin
+URL and accepts only the contract's narrowly approved download redirect. It
+does not persist the temporary signed download URL. Source snapshots and event
+versions are immutable and resource-specific. Only a successful two-resource
+transaction advances the atomic current set; an explicit snapshot set supports
+reproducible replay.
+
+Run from the repository root so the CLI defaults resolve to the documented,
+Git-ignored root `data/` paths:
+
+```powershell
+$env:PYTHONPATH = "backend"
+python -m app.outage_cli sync ssen-nafirs-hv
+```
+
+Local outputs are ignored: the SQLite database is
+`data/cache/outages/registry.sqlite3`, and source snapshots are under
+`data/snapshots/outages/`. Parser rejects are retained with safe reason codes;
+accepted events can carry quality flags. The read-only API paths are:
+
+- `/api/v1/outages/events`
+- `/api/v1/outages/events/{event_id}`
+- `/api/v1/outages/summary`
+- `/api/v1/outages/snapshots`
+
+These records are historical aggregate incidents, not household histories,
+real-time status, or a forecast. This non-household network evidence does not establish causality
+between flexibility and outage outcomes, and does not show outage prevention.
+It must not be used to infer individual customer histories, private data,
+bidding eligibility, dispatch actions, or commercial performance.
+
 Anonymous catalogue access does not prove that every dataset resource is
 anonymous or redistributable. `CATALOGUE_PORTALS` in
 `backend/app/catalogue_models.py` is the sole active portal registry; its seven
