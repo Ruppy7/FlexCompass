@@ -8,10 +8,10 @@ it("downloads only the labelled synthetic report filename", async () => {
   vi.stubGlobal("fetch", vi.fn());
   vi.stubGlobal(
     "URL",
-    Object.assign(URL, {
+    {
       createObjectURL: vi.fn(() => "blob:synthetic-report"),
       revokeObjectURL: vi.fn(),
-    }),
+    },
   );
   let downloadName = "";
   vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(

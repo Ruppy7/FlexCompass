@@ -9,7 +9,11 @@ it("submits every custom asset with an explicit synthetic source", async () => {
     "fetch",
     vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ items: [] }),
+      json: async () => ({
+        workflow_kind: "synthetic_demo",
+        portal_data_used: false,
+        items: [],
+      }),
     }),
   );
   const onAnalyse = vi.fn();
@@ -29,4 +33,22 @@ it("submits every custom asset with an explicit synthetic source", async () => {
       ],
     }),
   );
+});
+
+it("labels and constrains availability as a zero-to-one fraction", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise(() => undefined)),
+  );
+  render(<PortfolioForm onAnalyse={vi.fn()} loading={false} />);
+  await userEvent.click(
+    screen.getByRole("button", { name: /custom portfolio/i }),
+  );
+
+  const availability = screen.getByRole("spinbutton", {
+    name: /availability fraction.*0.*1/i,
+  });
+  expect(availability).toHaveAttribute("min", "0");
+  expect(availability).toHaveAttribute("max", "1");
+  expect(availability).toHaveAttribute("step", "0.01");
 });

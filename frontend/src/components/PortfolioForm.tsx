@@ -151,9 +151,17 @@ export default function PortfolioForm({ onAnalyse, loading }: Props) {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500 mb-1">Availability (%)</label>
+                  <label
+                    htmlFor={`availability-${idx}`}
+                    className="block text-xs text-gray-500 mb-1"
+                  >
+                    Availability fraction (0–1)
+                  </label>
                   <input
+                    id={`availability-${idx}`}
                     type="number"
+                    min="0"
+                    max="1"
                     step="0.01"
                     value={asset.availability_percent}
                     onChange={(e) => updateAsset(idx, "availability_percent", Number(e.target.value))}

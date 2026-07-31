@@ -39,6 +39,24 @@ function mockFetchJson(payload: object): void {
   );
 }
 
+const VALID_ANALYSE_RESPONSE = {
+  workflow_kind: "synthetic_demo",
+  portal_data_used: false,
+  portfolio: DEMO_PORTFOLIO,
+  assessments: [],
+  signals_considered: 0,
+  sources_represented: [],
+  dsos_represented: [],
+};
+
+const VALID_REPORT_RESPONSE = {
+  workflow_kind: "synthetic_demo",
+  portal_data_used: false,
+  portfolio: DEMO_PORTFOLIO,
+  assessments: [],
+  markdown: "# Synthetic Flexibility Fit Demonstration",
+};
+
 it("uses only the labelled demo analysis contract", async () => {
   mockFetchJson({
     workflow_kind: "synthetic_demo",
@@ -66,6 +84,68 @@ it("uses only the labelled demo analysis contract", async () => {
         ],
       }),
     }),
+  );
+});
+
+it.each([
+  [
+    "portfolios",
+    () => fetchDemoPortfolios(),
+    { items: [] },
+  ],
+  [
+    "analyse",
+    () => analyseDemoPortfolio(DEMO_PORTFOLIO),
+    {
+      ...VALID_ANALYSE_RESPONSE,
+      workflow_kind: undefined,
+    },
+  ],
+  [
+    "report",
+    () => generateDemoReport(DEMO_PORTFOLIO),
+    {
+      ...VALID_REPORT_RESPONSE,
+      workflow_kind: "unlabelled",
+    },
+  ],
+])("rejects a missing or wrong %s workflow label", async (_name, invoke, payload) => {
+  mockFetchJson(payload);
+  await expect(invoke()).rejects.toThrow(
+    /invalid synthetic demonstration response/i,
+  );
+});
+
+it.each([
+  [
+    "portfolios",
+    () => fetchDemoPortfolios(),
+    {
+      workflow_kind: "synthetic_demo",
+      portal_data_used: true,
+      items: [],
+    },
+  ],
+  [
+    "analyse",
+    () => analyseDemoPortfolio(DEMO_PORTFOLIO),
+    {
+      ...VALID_ANALYSE_RESPONSE,
+      portal_data_used: true,
+    },
+  ],
+  [
+    "report",
+    () => generateDemoReport(DEMO_PORTFOLIO),
+    {
+      ...VALID_REPORT_RESPONSE,
+      portal_data_used: true,
+    },
+  ],
+])("rejects %s data labelled as portal-derived", async (_name, invoke, payload) => {
+  mockFetchJson(payload);
+  await expect(invoke()).rejects.toThrow(
+    /invalid synthetic demonstration response/i,
   );
 });
 

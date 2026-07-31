@@ -16,8 +16,12 @@ export default function SyntheticDemo() {
   const [reportMarkdown, setReportMarkdown] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hasCompletedRun, setHasCompletedRun] = useState(false);
 
   const handleAnalyse = async (portfolio: Portfolio) => {
+    setAssessments([]);
+    setReportMarkdown("");
+    setHasCompletedRun(false);
     setLoading(true);
     setError(null);
     try {
@@ -27,6 +31,7 @@ export default function SyntheticDemo() {
       ]);
       setAssessments(analysis.assessments);
       setReportMarkdown(report.markdown);
+      setHasCompletedRun(true);
     } catch (caught) {
       setError(
         caught instanceof Error
@@ -55,7 +60,7 @@ export default function SyntheticDemo() {
         </div>
         <div className="lg:col-span-2">
           {error && <ErrorBanner message={error} />}
-          {!reportMarkdown && !loading && (
+          {!hasCompletedRun && !loading && !error && (
             <div className="bg-surface rounded-lg shadow-card p-8 text-center text-gray-500">
               Build a synthetic scenario to explore the demonstration.
             </div>
@@ -65,13 +70,22 @@ export default function SyntheticDemo() {
               Running synthetic demonstration…
             </div>
           )}
-          {reportMarkdown && !loading && (
+          {hasCompletedRun && assessments.length === 0 && !loading && (
+            <div className="bg-surface rounded-lg shadow-card p-8 text-center text-gray-600">
+              No verified flexibility signals are available in this release,
+              so no fit assessments can be produced.
+            </div>
+          )}
+          {hasCompletedRun
+            && assessments.length > 0
+            && reportMarkdown
+            && !loading && (
             <ReportView
               markdown={reportMarkdown}
               assessments={assessments}
               signals={[]}
             />
-          )}
+            )}
         </div>
       </div>
     </section>

@@ -9,6 +9,10 @@ import type {
 
 const DEMO_BASE = "/api/demo";
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 async function parseResponse<T>(
   response: Response,
   failureMessage: string,
@@ -16,7 +20,15 @@ async function parseResponse<T>(
   if (!response.ok) {
     throw new Error(failureMessage);
   }
-  return response.json() as Promise<T>;
+  const payload: unknown = await response.json();
+  if (
+    !isRecord(payload)
+    || payload.workflow_kind !== "synthetic_demo"
+    || payload.portal_data_used !== false
+  ) {
+    throw new Error("Invalid synthetic demonstration response");
+  }
+  return payload as T;
 }
 
 export async function fetchDemoPortfolios(): Promise<Portfolio[]> {
