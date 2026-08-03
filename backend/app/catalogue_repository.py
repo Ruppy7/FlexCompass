@@ -49,7 +49,7 @@ class PortalState:
 class CatalogueObservationRecord:
     observation_id: str
     portal_id: str
-    observed_at: datetime
+    observed_at: datetime | None
     status: str
     adapter_version: str | None
     schema_version: int | None
@@ -344,11 +344,11 @@ class CatalogueRepository:
         query += " ORDER BY observed_at DESC, created_at DESC, observation_id DESC"
         with get_connection(self.db_path) as connection:
             rows = connection.execute(query, parameters).fetchall()
-        return tuple(
+        records = tuple(
             CatalogueObservationRecord(
                 observation_id=row["observation_id"],
                 portal_id=row["portal_id"],
-                observed_at=_timestamp(row["observed_at"]),  # type: ignore[arg-type]
+                observed_at=_safe_timestamp(row["observed_at"]),
                 status=row["status"],
                 adapter_version=None,
                 schema_version=None,
@@ -359,4 +359,16 @@ class CatalogueRepository:
                 complete=row["status"] == "complete",
             )
             for row in rows
+        )
+        earliest = datetime.min.replace(tzinfo=timezone.utc)
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    item.observed_at is not None,
+                    item.observed_at or earliest,
+                    item.observation_id,
+                ),
+                reverse=True,
+            )
         )

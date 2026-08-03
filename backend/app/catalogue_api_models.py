@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from datetime import datetime
 from typing import Generic, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
@@ -116,7 +117,7 @@ class CatalogueAssessmentPublicV1(BaseModel):
 class CatalogueObservationPublicV1(BaseModel):
     observation_id: str
     portal_id: str
-    observed_at: datetime
+    observed_at: datetime | None
     status: Literal["complete", "partial", "failed"]
     adapter_version: str | None
     schema_version: int | None
@@ -153,20 +154,20 @@ def sanitise_public_url(value: str | None) -> str | None:
     ):
         return None
     canonical_host = hostname.rstrip(".").casefold()
-    if (
-        "." not in canonical_host
-        or canonical_host.replace(".", "").isdigit()
-        or canonical_host.startswith("0x")
-        or canonical_host == "localhost"
-        or canonical_host.endswith(
-            (".localhost", ".local", ".internal", ".home", ".lan")
-        )
-    ):
-        return None
     try:
         address = ipaddress.ip_address(canonical_host)
     except ValueError:
-        pass
+        numeric_part = r"(?:0[xX][0-9a-fA-F]+|\d+)"
+        if re.fullmatch(rf"{numeric_part}(?:\.{numeric_part})*", canonical_host):
+            return None
+        if (
+            "." not in canonical_host
+            or canonical_host == "localhost"
+            or canonical_host.endswith(
+                (".localhost", ".local", ".internal", ".home", ".lan")
+            )
+        ):
+            return None
     else:
         if not address.is_global:
             return None

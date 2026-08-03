@@ -298,6 +298,11 @@ def test_dataset_ref_encoder_enforces_decoder_length_boundary() -> None:
         "http://192.168.1.1/path",
         "http://[::1]/path",
         "http://2130706433/path",
+        "http://127.0.0x0.1/private?token=secret#fragment",
+        "http://0x7f.0.0.1/private",
+        "http://0177.0.0.1/private",
+        "http://127.0x0.01.1/private",
+        "http://0300.0250.1.1/private",
         "http://localhost/path",
         "http://catalogue.local/path",
         "http://catalogue.internal/path",
@@ -310,6 +315,23 @@ def test_public_url_sanitiser_omits_credentials_and_local_or_malformed_urls(
     value: str,
 ) -> None:
     assert sanitise_public_url(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "https://catalogue.example/path?public=value#section",
+            "https://catalogue.example/path",
+        ),
+        ("https://8.8.8.8/path?public=value#section", "https://8.8.8.8/path"),
+    ],
+)
+def test_public_url_sanitiser_preserves_public_domains_and_global_ip_addresses(
+    value: str,
+    expected: str,
+) -> None:
+    assert sanitise_public_url(value) == expected
 
 
 @pytest.mark.parametrize(
@@ -512,6 +534,75 @@ def test_corrupt_newest_complete_projects_degraded_older_fallback(
         "middle",
         "z-last",
     }
+
+
+@pytest.mark.parametrize(
+    "malformed_observed_at",
+    [
+        pytest.param("not-a-timestamp", id="text"),
+        pytest.param(sqlite3.Binary(b"not-a-timestamp"), id="blob"),
+    ],
+)
+def test_observation_history_retains_malformed_timestamp_after_valid_records(
+    catalogue_client: TestClient,
+    malformed_observed_at: object,
+) -> None:
+    settings = catalogue_client.app.state.settings
+    newest_id, _ = _seed_complete_catalogue(
+        settings.catalogue_db_path,
+        settings.catalogue_snapshot_dir,
+        observed_at=NOW + timedelta(hours=2),
+        snapshot_name="malformed-newest.json",
+        datasets=(
+            _dataset(
+                "newest-only",
+                "Newest only",
+                observed_at=NOW + timedelta(hours=2),
+            ),
+        ),
+    )
+    other_invalid_id = _seed_partial_observation(
+        settings.catalogue_db_path,
+        settings.catalogue_snapshot_dir,
+        observed_at=NOW - timedelta(days=2),
+    )
+    with get_connection(settings.catalogue_db_path) as connection:
+        connection.execute(
+            """UPDATE catalogue_observations SET observed_at = ?
+               WHERE observation_id IN (?, ?)""",
+            (malformed_observed_at, newest_id, other_invalid_id),
+        )
+
+    portal_response = catalogue_client.get("/api/v1/catalogue/portals/nged")
+    dataset_response = catalogue_client.get(
+        "/api/v1/catalogue/datasets", params={"portal_id": "nged"}
+    )
+    history_response = catalogue_client.get(
+        "/api/v1/catalogue/observations", params={"portal_id": "nged"}
+    )
+
+    assert portal_response.status_code == 200
+    assert portal_response.json()["latest_complete_validation_state"] == "invalid"
+    assert portal_response.json()["snapshot_available"] is True
+    assert dataset_response.status_code == 200
+    assert {item["source_dataset_id"] for item in dataset_response.json()["items"]} == {
+        "folder/dataset:id",
+        "middle",
+        "z-last",
+    }
+    assert history_response.status_code == 200
+    history = history_response.json()
+    assert history["total"] == 4
+    assert [item["status"] for item in history["items"][:2]] == [
+        "complete",
+        "partial",
+    ]
+    assert history["items"][0]["observed_at"] > history["items"][1]["observed_at"]
+    invalid_items = history["items"][-2:]
+    assert [item["observation_id"] for item in invalid_items] == sorted(
+        [newest_id, other_invalid_id], reverse=True
+    )
+    assert all(item["observed_at"] is None for item in invalid_items)
 
 
 def test_dataset_listing_has_stable_pagination_and_filters(
