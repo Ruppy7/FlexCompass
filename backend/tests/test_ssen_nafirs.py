@@ -3056,6 +3056,15 @@ def csv_with_invalid_first_row(content: bytes) -> bytes:
     return ("\n".join(rows) + "\n").encode()
 
 
+def csv_with_first_row_value(content: bytes, field: str, value: str) -> bytes:
+    rows = list(csv.reader(io.StringIO(content.decode())))
+    field_index = rows[0].index(field)
+    rows[1][field_index] = value
+    csv_text = io.StringIO(newline="")
+    csv.writer(csv_text, lineterminator="\n").writerows(rows)
+    return csv_text.getvalue().encode()
+
+
 def _active_child_pids() -> set[int]:
     return {
         child.pid
@@ -4853,6 +4862,104 @@ def test_sync_signed_target_never_crosses_output_log_file_or_sqlite(
     )
     assert marker not in output
     assert "X-Amz-Signature" not in output
+
+
+@pytest.mark.parametrize("depth", [0, 1, 4, 8, 9])
+def test_sync_rejects_unsafe_source_bytes_before_blob_promotion(
+    depth: int,
+    monkeypatch: pytest.MonkeyPatch,
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
+        seeded = sync_ssen_nafirs_hv(
+            db_path=temp_db,
+            snapshot_dir=snapshot_dir,
+            client=client,
+        )
+    assert seeded.status == "completed"
+    before_current = current_outage_snapshot_ids(db_path=temp_db)
+    before_files = {
+        path.relative_to(snapshot_dir).as_posix(): path.read_bytes()
+        for path in snapshot_dir.rglob("*")
+        if path.is_file()
+    }
+
+    marker = f"PR4_SYNTHETIC_BLOB_MARKER_{depth}"
+    target = synthetic_signed_target(marker)
+    unsafe = fully_byte_encoded(target, depth)
+    unsafe_sepd = csv_with_first_row_value(
+        sepd_csv_bytes,
+        "CAUSE",
+        unsafe,
+    )
+    changed_shepd = csv_with_first_row_value(
+        shepd_csv_bytes,
+        "CAUSE",
+        "ordinary changed cause",
+    )
+    changed_shepd_digest = hashlib.sha256(changed_shepd).hexdigest()
+    unsafe_sepd_digest = hashlib.sha256(unsafe_sepd).hexdigest()
+    captured_errors: list[Exception] = []
+    real_record_failed_run = outage_source.record_failed_ingestion_run
+
+    def capture_failed_run(**kwargs: Any) -> SyncResult:
+        captured_errors.append(kwargs["error"])
+        return real_record_failed_run(**kwargs)
+
+    monkeypatch.setattr(
+        outage_source,
+        "record_failed_ingestion_run",
+        capture_failed_run,
+    )
+    for logger_name in ("app.outage_source", "httpx", "httpcore"):
+        caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    with sync_client(unsafe_sepd, changed_shepd) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db,
+            snapshot_dir=snapshot_dir,
+            client=client,
+        )
+
+    after_files = {
+        path.relative_to(snapshot_dir).as_posix(): path.read_bytes()
+        for path in snapshot_dir.rglob("*")
+        if path.is_file()
+    }
+    with get_connection(temp_db) as connection:
+        sqlite_text = "\n".join(connection.iterdump())
+
+    assert result.status == "failed"
+    assert len(captured_errors) == 1
+    error = captured_errors[0]
+    assert isinstance(error, SourceContractError)
+    assert error.code == "unsafe_source_content"
+    assert str(error) == "SSEN resource contains unsafe raw outage evidence"
+    assert current_outage_snapshot_ids(db_path=temp_db) == before_current
+    assert after_files == before_files
+    assert (
+        f"blobs/{changed_shepd_digest[:2]}/{changed_shepd_digest}.csv"
+        not in after_files
+    )
+    assert (
+        f"blobs/{unsafe_sepd_digest[:2]}/{unsafe_sepd_digest}.csv"
+        not in after_files
+    )
+
+    exception_text = "\n".join(
+        (str(error), repr(error), repr(error.__dict__))
+    )
+    rendered = result.model_dump_json() + caplog.text + exception_text + sqlite_text
+    for forbidden in (marker, target, unsafe):
+        assert forbidden not in rendered
+        for relative_path, content in after_files.items():
+            assert forbidden not in relative_path
+            assert forbidden.encode() not in content
 
 
 @pytest.mark.parametrize("depth", [0, 1, 4, 8, 9])

@@ -913,11 +913,6 @@ def sync_ssen_nafirs_hv(
                 content = download_ssen_hv_resource(active_transport, resource)
                 digest = hashlib.sha256(content).hexdigest()
                 snapshot_id = source_snapshot_id(resource.source_resource_id, digest)
-                relative_path, created_path = _write_blob(
-                    content, digest, resolved_snapshot_dir, run_id
-                )
-                if created_path is not None:
-                    created_files.append(created_path)
                 parsed = list(
                     iter_ssen_hv_csv(
                         content,
@@ -927,6 +922,20 @@ def sync_ssen_nafirs_hv(
                         snapshot_id=snapshot_id,
                     )
                 )
+                if any(
+                    isinstance(item, OutageRowError)
+                    and item.code == "unsafe_raw_record"
+                    for item in parsed
+                ):
+                    raise SourceContractError(
+                        "SSEN resource contains unsafe raw outage evidence",
+                        error_code="unsafe_source_content",
+                    )
+                relative_path, created_path = _write_blob(
+                    content, digest, resolved_snapshot_dir, run_id
+                )
+                if created_path is not None:
+                    created_files.append(created_path)
                 resource_events = [item for item in parsed if not isinstance(item, OutageRowError)]
                 resource_rejects = [item for item in parsed if isinstance(item, OutageRowError)]
                 events.extend(resource_events)
