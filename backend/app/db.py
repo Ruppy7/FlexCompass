@@ -440,7 +440,369 @@ ALTER TABLE catalogue_datasets ADD COLUMN declared_update_frequency_text TEXT;
 INSERT OR IGNORE INTO schema_version (version) VALUES (5);
 COMMIT;
 """),
+    # -- Migration 6: SSEN NaFIRS HV snapshots and outage evidence --
+    (6, """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS source_snapshots (
+    snapshot_id          TEXT PRIMARY KEY,
+    source_dataset_id    TEXT NOT NULL,
+    package_id           TEXT NOT NULL,
+    source_resource_id   TEXT NOT NULL,
+    licence_area         TEXT NOT NULL CHECK (licence_area IN ('SEPD', 'SHEPD')),
+    stable_source_url    TEXT NOT NULL,
+    source_modified_at   TEXT,
+    fetched_at           TEXT NOT NULL,
+    content_sha256       TEXT NOT NULL,
+    byte_size            INTEGER NOT NULL,
+    row_count            INTEGER NOT NULL,
+    observed_columns_json TEXT NOT NULL,
+    licence_id           TEXT NOT NULL,
+    licence_title        TEXT NOT NULL,
+    licence_url          TEXT NOT NULL,
+    attribution          TEXT NOT NULL,
+    parser_version       TEXT NOT NULL,
+    local_snapshot_path  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    run_id               TEXT PRIMARY KEY,
+    status               TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+    resources_seen       INTEGER NOT NULL,
+    snapshots_created    INTEGER NOT NULL DEFAULT 0,
+    snapshots_reused     INTEGER NOT NULL DEFAULT 0,
+    events_written       INTEGER NOT NULL DEFAULT 0,
+    rejects_written      INTEGER NOT NULL DEFAULT 0,
+    warnings_json        TEXT NOT NULL DEFAULT '[]',
+    error                TEXT,
+    started_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS outage_events (
+    event_id                       TEXT PRIMARY KEY,
+    source_dataset_id              TEXT NOT NULL,
+    source_resource_id             TEXT NOT NULL,
+    source_snapshot_id             TEXT NOT NULL,
+    operator                       TEXT NOT NULL,
+    licence_area                   TEXT NOT NULL CHECK (licence_area IN ('SEPD', 'SHEPD')),
+    incident_started_local         TEXT NOT NULL,
+    timezone_name                  TEXT,
+    reporting_year                 INTEGER NOT NULL,
+    voltage_kv                     REAL,
+    district_short_code            TEXT NOT NULL,
+    district_hv_reference          TEXT NOT NULL,
+    network_reference              TEXT NOT NULL,
+    primary_nrn                    TEXT,
+    primary_name                   TEXT,
+    customers_affected             INTEGER,
+    customer_minutes_lost          INTEGER,
+    average_minutes_off_supply     REAL,
+    equipment_code                 TEXT,
+    equipment                      TEXT,
+    component_code                 TEXT,
+    component                      TEXT,
+    cause_code                     TEXT,
+    cause                          TEXT,
+    contributory_cause_code        TEXT,
+    contributory_cause             TEXT,
+    damage                         TEXT,
+    exceptional_event              TEXT,
+    quality_flags_json             TEXT NOT NULL,
+    raw_record_json                TEXT NOT NULL,
+    FOREIGN KEY (source_snapshot_id)
+        REFERENCES source_snapshots(snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS outage_rejects (
+    reject_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                TEXT NOT NULL,
+    source_resource_id    TEXT NOT NULL,
+    row_number            INTEGER NOT NULL CHECK (row_number >= 1),
+    error_code            TEXT NOT NULL,
+    error_message         TEXT NOT NULL,
+    raw_row_json          TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_dataset_resource
+    ON source_snapshots(source_dataset_id, source_resource_id);
+CREATE INDEX IF NOT EXISTS idx_source_snapshots_fetched
+    ON source_snapshots(fetched_at DESC, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_outage_events_area_year
+    ON outage_events(licence_area, reporting_year);
+CREATE INDEX IF NOT EXISTS idx_outage_events_district
+    ON outage_events(district_short_code);
+CREATE INDEX IF NOT EXISTS idx_outage_events_cause
+    ON outage_events(cause_code);
+CREATE INDEX IF NOT EXISTS idx_outage_events_incident
+    ON outage_events(incident_started_local, event_id);
+CREATE INDEX IF NOT EXISTS idx_outage_rejects_run
+    ON outage_rejects(run_id);
+INSERT OR IGNORE INTO schema_version (version) VALUES (6);
+COMMIT;
+"""),
+    # -- Migration 7: Immutable outage source and materialisation versions --
+    (7, """
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS outage_content_blobs (
+    content_sha256       TEXT PRIMARY KEY,
+    byte_size            INTEGER NOT NULL,
+    relative_snapshot_path TEXT,
+    available            INTEGER NOT NULL CHECK (available IN (0, 1)),
+    CHECK (
+        (available = 0 AND relative_snapshot_path IS NULL)
+        OR (available = 1 AND relative_snapshot_path IS NOT NULL)
+    )
+);
+CREATE TABLE IF NOT EXISTS outage_source_observations (
+    snapshot_id           TEXT PRIMARY KEY,
+    source_dataset_id     TEXT NOT NULL,
+    package_id            TEXT NOT NULL,
+    source_resource_id    TEXT NOT NULL,
+    licence_area          TEXT NOT NULL,
+    stable_source_url     TEXT NOT NULL,
+    content_sha256        TEXT NOT NULL,
+    row_count             INTEGER NOT NULL,
+    observed_columns_json TEXT NOT NULL,
+    licence_id            TEXT NOT NULL,
+    licence_title         TEXT NOT NULL,
+    licence_url           TEXT NOT NULL,
+    attribution           TEXT NOT NULL,
+    parser_version        TEXT NOT NULL,
+    source_contract_version TEXT NOT NULL,
+    canonical_event_schema_version INTEGER NOT NULL,
+    FOREIGN KEY (content_sha256)
+        REFERENCES outage_content_blobs(content_sha256)
+);
+CREATE TABLE IF NOT EXISTS outage_event_versions (
+    snapshot_id                    TEXT NOT NULL,
+    event_id                       TEXT NOT NULL,
+    source_resource_id             TEXT NOT NULL,
+    licence_area                   TEXT NOT NULL,
+    incident_started_local         TEXT NOT NULL,
+    reporting_year                 INTEGER NOT NULL,
+    voltage_kv                     REAL,
+    district_short_code            TEXT NOT NULL,
+    equipment_code                 TEXT,
+    cause_code                     TEXT,
+    customers_affected             INTEGER,
+    customer_minutes_lost          INTEGER,
+    average_minutes_off_supply     REAL,
+    quality_flags_json             TEXT NOT NULL,
+    event_json                     TEXT NOT NULL,
+    event_sha256                   TEXT NOT NULL,
+    canonical_event_schema_version INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, event_id),
+    FOREIGN KEY (snapshot_id)
+        REFERENCES outage_source_observations(snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS outage_reject_versions (
+    snapshot_id       TEXT NOT NULL,
+    reject_id         TEXT NOT NULL,
+    source_resource_id TEXT NOT NULL,
+    row_number        INTEGER NOT NULL,
+    reason_code       TEXT NOT NULL,
+    safe_detail_json  TEXT NOT NULL,
+    reject_sha256     TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, reject_id),
+    FOREIGN KEY (snapshot_id)
+        REFERENCES outage_source_observations(snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS current_outage_snapshots (
+    source_resource_id  TEXT PRIMARY KEY,
+    snapshot_id         TEXT NOT NULL,
+    run_id              TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id)
+        REFERENCES outage_source_observations(snapshot_id),
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id)
+);
+CREATE TABLE IF NOT EXISTS ingestion_run_snapshots (
+    run_id      TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    PRIMARY KEY (run_id, snapshot_id),
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id),
+    FOREIGN KEY (snapshot_id)
+        REFERENCES outage_source_observations(snapshot_id)
+);
+CREATE TABLE IF NOT EXISTS outage_fetch_attempts (
+    attempt_id         TEXT PRIMARY KEY,
+    run_id             TEXT NOT NULL,
+    source_resource_id TEXT NOT NULL,
+    attempted_at       TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    response_status    INTEGER,
+    source_modified_at TEXT,
+    snapshot_id        TEXT,
+    content_sha256     TEXT,
+    byte_size          INTEGER,
+    error_code         TEXT,
+    FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id),
+    FOREIGN KEY (snapshot_id)
+        REFERENCES outage_source_observations(snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_outage_observation_resource_content
+    ON outage_source_observations(source_resource_id, content_sha256);
+CREATE INDEX IF NOT EXISTS idx_outage_event_versions_area_year
+    ON outage_event_versions(licence_area, reporting_year);
+CREATE INDEX IF NOT EXISTS idx_outage_event_versions_district
+    ON outage_event_versions(district_short_code);
+CREATE INDEX IF NOT EXISTS idx_outage_event_versions_cause
+    ON outage_event_versions(cause_code);
+CREATE INDEX IF NOT EXISTS idx_outage_event_versions_incident
+    ON outage_event_versions(incident_started_local, event_id);
+CREATE INDEX IF NOT EXISTS idx_outage_event_versions_resource
+    ON outage_event_versions(source_resource_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_outage_event_versions_event_snapshot
+    ON outage_event_versions(event_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_outage_reject_versions_snapshot_row
+    ON outage_reject_versions(snapshot_id, row_number);
+CREATE INDEX IF NOT EXISTS idx_ingestion_run_snapshots_run
+    ON ingestion_run_snapshots(run_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_ingestion_run_snapshots_snapshot
+    ON ingestion_run_snapshots(snapshot_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_outage_fetch_attempts_run
+    ON outage_fetch_attempts(run_id, source_resource_id);
+CREATE INDEX IF NOT EXISTS idx_outage_fetch_attempts_snapshot
+    ON outage_fetch_attempts(snapshot_id);
+CREATE TRIGGER IF NOT EXISTS outage_blob_immutable_update
+BEFORE UPDATE ON outage_content_blobs
+WHEN NOT (
+    OLD.available = 0
+    AND OLD.relative_snapshot_path IS NULL
+    AND NEW.available = 1
+    AND NEW.relative_snapshot_path IS NOT NULL
+    AND OLD.content_sha256 = NEW.content_sha256
+    AND OLD.byte_size = NEW.byte_size
+)
+BEGIN
+    SELECT RAISE(ABORT, 'outage content blob is immutable');
+END;
+"""),
 ]
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _source_snapshot_id(source_resource_id: str, content_sha256: str) -> str:
+    return f"ssen-nafirs-hv:{source_resource_id}:sha256:{content_sha256}"
+
+
+def _backfill_outage_version_seven(conn: sqlite3.Connection) -> None:
+    """Backfill only legacy evidence whose snapshot association is provable."""
+    from .persistence_safety import require_exact_safe_raw_record
+
+    legacy_snapshots = conn.execute(
+        "SELECT * FROM source_snapshots ORDER BY snapshot_id"
+    ).fetchall()
+    snapshot_map: dict[str, str] = {}
+    for row in legacy_snapshots:
+        snapshot_id = _source_snapshot_id(
+            row["source_resource_id"], row["content_sha256"]
+        )
+        snapshot_map[row["snapshot_id"]] = snapshot_id
+        blob = conn.execute(
+            "SELECT byte_size FROM outage_content_blobs WHERE content_sha256 = ?",
+            (row["content_sha256"],),
+        ).fetchone()
+        if blob is None:
+            conn.execute(
+                """INSERT INTO outage_content_blobs (
+                   content_sha256, byte_size, relative_snapshot_path, available
+               ) VALUES (?, ?, NULL, 0)""",
+                (row["content_sha256"], row["byte_size"]),
+            )
+        elif blob["byte_size"] != row["byte_size"]:
+            raise sqlite3.IntegrityError(
+                "legacy outage blob conflicts with immutable identity"
+            )
+        observation_values = (
+            snapshot_id,
+            row["source_dataset_id"],
+            row["package_id"],
+            row["source_resource_id"],
+            row["licence_area"],
+            row["stable_source_url"],
+            row["content_sha256"],
+            row["row_count"],
+            _canonical_json(json.loads(row["observed_columns_json"])),
+            row["licence_id"],
+            row["licence_title"],
+            row["licence_url"],
+            row["attribution"],
+            row["parser_version"],
+            "ssen-nafirs-hv-v1",
+            1,
+        )
+        existing = conn.execute(
+            "SELECT * FROM outage_source_observations WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO outage_source_observations (
+                   snapshot_id, source_dataset_id, package_id,
+                   source_resource_id, licence_area, stable_source_url,
+                   content_sha256, row_count, observed_columns_json,
+                   licence_id, licence_title, licence_url, attribution,
+                   parser_version, source_contract_version,
+                   canonical_event_schema_version
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                observation_values[:-1],
+            )
+        elif tuple(existing) != observation_values:
+            raise sqlite3.IntegrityError(
+                "legacy outage observation conflicts with immutable identity"
+            )
+
+    for row in conn.execute("SELECT * FROM outage_events ORDER BY event_id"):
+        snapshot_id = snapshot_map.get(row["source_snapshot_id"])
+        if snapshot_id is None:
+            raise sqlite3.IntegrityError(
+                "legacy outage event has no provable source snapshot"
+            )
+        event = dict(row)
+        event["source_snapshot_id"] = snapshot_id
+        event["quality_flags"] = json.loads(event.pop("quality_flags_json"))
+        event["raw_record"] = json.loads(event.pop("raw_record_json"))
+        require_exact_safe_raw_record(event["raw_record"])
+        event_json = _canonical_json(event)
+        event_sha256 = __import__("hashlib").sha256(event_json.encode()).hexdigest()
+        conn.execute(
+            """INSERT INTO outage_event_versions (
+                   snapshot_id, event_id, source_resource_id, licence_area,
+                   incident_started_local, reporting_year, voltage_kv,
+                   district_short_code, equipment_code, cause_code,
+                   customers_affected, customer_minutes_lost,
+                   average_minutes_off_supply, quality_flags_json, event_json,
+                   event_sha256, canonical_event_schema_version
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+            (
+                snapshot_id,
+                row["event_id"],
+                row["source_resource_id"],
+                row["licence_area"],
+                row["incident_started_local"],
+                row["reporting_year"],
+                row["voltage_kv"],
+                row["district_short_code"],
+                row["equipment_code"],
+                row["cause_code"],
+                row["customers_affected"],
+                row["customer_minutes_lost"],
+                row["average_minutes_off_supply"],
+                _canonical_json(event["quality_flags"]),
+                event_json,
+                event_sha256,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +849,8 @@ def run_migrations(db_path: Path | None = None) -> int:
         for version, ddl in MIGRATIONS:
             if version not in applied:
                 conn.executescript(ddl)
+                if version == 7:
+                    _backfill_outage_version_seven(conn)
                 conn.execute(
                     "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
                     (version,),

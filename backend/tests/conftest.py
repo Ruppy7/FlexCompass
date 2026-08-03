@@ -14,6 +14,7 @@ def isolated_api_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[tuple[TestClient, Path]]:
     test_db = tmp_path / "flexcompass-test.sqlite3"
+    outage_test_db = tmp_path / "flexcompass-outages-test.sqlite3"
     opened: list[Path] = []
     real_connect = sqlite3.connect
 
@@ -23,13 +24,15 @@ def isolated_api_client(
         **kwargs: object,
     ) -> sqlite3.Connection:
         resolved = Path(database).resolve()
-        if resolved != test_db.resolve():
+        if resolved not in {test_db.resolve(), outage_test_db.resolve()}:
             raise AssertionError(f"application opened unexpected DB: {resolved}")
         opened.append(resolved)
         return real_connect(str(resolved), *args, **kwargs)
 
     original_db = config.db_path
+    original_outage_db = config.outage_db_path
     object.__setattr__(config, "db_path", test_db)
+    object.__setattr__(config, "outage_db_path", outage_test_db)
     try:
         monkeypatch.setattr(app_db.sqlite3, "connect", guarded_connect)
 
@@ -44,10 +47,11 @@ def isolated_api_client(
             yield client, test_db
     finally:
         object.__setattr__(config, "db_path", original_db)
+        object.__setattr__(config, "outage_db_path", original_outage_db)
 
-    # Startup no longer opens a database; zero connections is valid. If an
-    # application connection returns, it must still fail closed to this path.
-    allowed_databases = {test_db.resolve()}
+    # Startup opens only the separately injected outage store. All application
+    # connections remain fail-closed to the two explicit temporary paths.
+    allowed_databases = {test_db.resolve(), outage_test_db.resolve()}
     assert set(opened) <= allowed_databases
 
 

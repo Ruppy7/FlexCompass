@@ -5,12 +5,13 @@ data about Great Britain's electricity networks and local flexibility markets.
 It bridges energy-domain research with reproducible Python data pipelines, a
 FastAPI research API, and a small Next.js interface.
 
-The active public-data workflow is the anonymous, read-only seven-portal
-catalogue CLI.
+The active public-data workflows are the anonymous, read-only seven-portal
+catalogue CLI and the reviewed SSEN historical-HV outage sync and query path.
 
-The web application exposes a research-status overview and an explicitly
-synthetic demonstration. It does not yet expose the catalogue registry or
-verified analytical portal records.
+The local API exposes verified SSEN outage evidence after a user runs the local
+sync. The Next.js application remains a research-status overview and an
+explicitly synthetic demonstration; it does not expose the catalogue registry
+or SSEN records.
 
 The legacy generic portal ingestors and browser-triggered mutation routes were
 retired because they lacked accepted source contracts and end-to-end
@@ -20,9 +21,53 @@ The repository also contains SQLite storage, provenance-preserving models,
 postcode and geometry matching, data-quality utilities, synthetic portfolio
 examples, and directional report generation.
 
+The first accepted analytical source is the public SSEN Distribution NaFIRS HV
+historical-outage dataset. From the repository root, sync its two reviewed CSV
+resources so the default output paths remain under the root `data/` directory:
+
+```powershell
+$env:PYTHONPATH = "backend"
+python -m app.outage_cli sync ssen-nafirs-hv
+python -m uvicorn app.main:app --reload --port 8099
+```
+
+This writes the Git-ignored local database
+`data/cache/outages/registry.sqlite3` and immutable source artifacts under
+`data/snapshots/outages/`. Start the API as shown below, then query the four
+read-only paths `/api/v1/outages/events`,
+`/api/v1/outages/events/{event_id}`, `/api/v1/outages/summary`, and
+`/api/v1/outages/snapshots`. Event filters use the atomic current set unless an
+explicit snapshot set is supplied for replay. With the API running, use a
+second repository-root PowerShell terminal for this copyable query workflow:
+
+```powershell
+$apiBase = "http://127.0.0.1:8099/api/v1/outages"
+$snapshots = Invoke-RestMethod -Uri "$apiBase/snapshots"
+$list = Invoke-RestMethod -Uri "$apiBase/events?limit=1"
+$event = $list.items | Select-Object -First 1
+$eventId = [uri]::EscapeDataString($event.event_id)
+$detailSnapshotId = [uri]::EscapeDataString($event.source_snapshot_id)
+$detail = Invoke-RestMethod -Uri "$apiBase/events/$eventId`?source_snapshot_id=$detailSnapshotId"
+$replayQuery = ($list.evidence_scope.snapshot_ids | ForEach-Object { "source_snapshot_id=$([uri]::EscapeDataString($_))" }) -join "&"
+$replayList = Invoke-RestMethod -Uri "$apiBase/events`?$replayQuery"
+$replaySummary = Invoke-RestMethod -Uri "$apiBase/summary`?$replayQuery"
+```
+
+Detail identity requires exactly one `source_snapshot_id`: use the returned
+event's `event_id` and its own `source_snapshot_id`, URI-escaped as above. Zero
+or two detail selectors return `422`. List and summary replay instead use the
+repeatable singular `source_snapshot_id` wire name supplied as an exact
+two-resource snapshot set; this is distinct from the detail route's one-snapshot
+event-version identity.
+
 This is a research project, not a product. It does not bid, dispatch or control
 assets, establish eligibility, forecast revenue, or provide commercial advice.
 Any scores are heuristic and directional.
+
+The SSEN records are aggregate incidents, not household histories or a
+real-time operational feed. They are non-household network evidence, do not
+establish causality between flexibility and outages, and do not demonstrate
+outage prevention.
 
 ## Data status
 
@@ -97,9 +142,10 @@ licence cautions, and limitations.
 
 ## Current product boundary
 
-The catalogue registry is available through the local CLI only. The FastAPI and
-web surfaces do not provide catalogue sync, analytical portal ingestion, drift
-execution, bidding, dispatch, or asset control. No verified canonical
+The catalogue registry is available through the local CLI only. The FastAPI
+surface provides read-only SSEN historical-outage queries after explicit local
+sync; neither API nor web surface starts catalogue or analytical ingestion,
+drift execution, bidding, dispatch, or asset control. No verified canonical
 flexibility-signal or zone dataset is exposed in this release.
 
 ## Verification
@@ -114,8 +160,9 @@ npm run build
 
 ## Project layout
 
-- `backend/app/`: research-status and synthetic-demo API, read-only catalogue
-  CLI, public portal adapters, storage, models, matching, and reports.
+- `backend/app/`: read-only catalogue CLI, SSEN outage sync/query CLI and API,
+  research-status and synthetic-demo API, public portal adapters, storage,
+  models, matching, and reports.
 - `backend/tests/`: API and unit tests using disposable data and explicit fixtures.
 - `frontend/`: research-status overview and explicitly synthetic demonstration.
 - `data/seed/`: explicitly synthetic demonstration portfolios only.

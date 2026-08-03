@@ -26,11 +26,13 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         assert response.json() == {
             "status": "ok",
-            "data_status": "no_verified_analytical_data",
+            "data_status": (
+                "verified_analytical_source_available_for_local_sync"
+            ),
         }
 
 
-def test_phase_zero_public_api_contains_health_and_demo_only() -> None:
+def test_public_api_contains_only_verified_surfaces() -> None:
     paths = set(app.openapi()["paths"])
     assert paths == {
         "/",
@@ -40,10 +42,14 @@ def test_phase_zero_public_api_contains_health_and_demo_only() -> None:
         "/api/demo/analyse",
         "/api/demo/report",
         "/api/demo/asset-groups/generate",
+        "/api/v1/outages/events",
+        "/api/v1/outages/summary",
+        "/api/v1/outages/events/{event_id}",
+        "/api/v1/outages/snapshots",
     }
 
 
-def test_root_metadata_lists_the_complete_phase_zero_public_surface(
+def test_root_metadata_lists_the_complete_verified_public_surface(
     client,
 ) -> None:
     response = client.get("/")
@@ -56,6 +62,10 @@ def test_root_metadata_lists_the_complete_phase_zero_public_surface(
         "/api/demo/analyse",
         "/api/demo/report",
         "/api/demo/asset-groups/generate",
+        "/api/v1/outages/events",
+        "/api/v1/outages/summary",
+        "/api/v1/outages/events/{event_id}",
+        "/api/v1/outages/snapshots",
     ]
 
 
@@ -77,12 +87,16 @@ def test_unverified_product_routes_are_retired(path: str) -> None:
     assert path not in app.openapi()["paths"]
 
 
-def test_application_starts_without_opening_a_database(
+def test_application_starts_without_opening_the_primary_database(
     isolated_api_client,
 ) -> None:
     client, test_db = isolated_api_client
 
-    assert client.get("/api/health").status_code == 200
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["data_status"] == (
+        "verified_analytical_source_available_for_local_sync"
+    )
     assert not test_db.exists()
 
 

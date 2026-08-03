@@ -144,6 +144,22 @@ class FlexCompassConfig:
             )
         )
     )
+    outage_db_path: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get(
+                "FLEXCOMPASS_OUTAGE_DB_PATH",
+                "data/cache/outages/registry.sqlite3",
+            )
+        )
+    )
+    outage_snapshot_dir: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get(
+                "FLEXCOMPASS_OUTAGE_SNAPSHOT_DIR",
+                "data/snapshots/outages",
+            )
+        )
+    )
 
     default_seed: int = field(
         default_factory=lambda: int(os.environ.get("FLEXCOMPASS_SEED", "42"))

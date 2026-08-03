@@ -1,0 +1,39 @@
+{
+  "success": true,
+  "result": {
+    "id": "b0a58349-2ce6-4fa8-9238-a5564f966433",
+    "name": "nafirs-hv-faults",
+    "license_id": "CC-BY-4.0",
+    "license_title": "Creative Commons Attribution 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "resources": [
+      {
+        "id": "ab32515f-76f2-421d-8034-7d5b01325a33",
+        "name": "NaFIRS HV Faults SEPD (CSV)",
+        "url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/ab32515f-76f2-421d-8034-7d5b01325a33/download/20260728_nafirs_hv_sepd_csv.csv",
+        "format": "CSV",
+        "mimetype": "text/csv",
+        "datastore_active": true,
+        "last_modified": "2026-07-28T06:07:34.107076"
+      },
+      {
+        "id": "673578c9-f531-41a5-a17c-0b35bc0fae4c",
+        "name": "NaFIRS HV Faults SHEPD (CSV)",
+        "url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/673578c9-f531-41a5-a17c-0b35bc0fae4c/download/20260728_nafirs_hv_shepd_csv.csv",
+        "format": "CSV",
+        "mimetype": "text/csv",
+        "datastore_active": true,
+        "last_modified": "2026-07-28T06:07:44.657353"
+      },
+      {
+        "id": "b88bc531-bdff-4cb3-80e8-eb6646a0d22f",
+        "name": "NaFIRS Methodology Statement",
+        "url": "https://data-api.ssen.co.uk/dataset/b0a58349-2ce6-4fa8-9238-a5564f966433/resource/b88bc531-bdff-4cb3-80e8-eb6646a0d22f/download/methodology-statement-nafirs.pdf",
+        "format": "PDF",
+        "mimetype": "application/pdf",
+        "datastore_active": false,
+        "last_modified": "2026-04-16T13:05:23.697884"
+      }
+    ]
+  }
+}

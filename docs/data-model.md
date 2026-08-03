@@ -4,11 +4,11 @@ FlexCompass uses a zone-authoritative model: a postcode or coordinate is a looku
 key into a network zone, and a signal refers to that zone when the public source
 provides enough evidence.
 
-The active public-data workflow is the anonymous, read-only seven-portal
-catalogue CLI. `CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` is the
-sole active portal registry. The web application does not expose this registry
-or verified analytical portal records; it presents research status and a
-separate, explicitly synthetic demonstration.
+The active public-data workflows are the anonymous, read-only seven-portal
+catalogue CLI and the reviewed SSEN historical-HV sync and read-only query API.
+`CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` remains the sole portal
+registry. The Next.js application exposes neither registry nor SSEN records; it
+presents research status and a separate, explicitly synthetic demonstration.
 
 ## Core records
 
@@ -31,6 +31,29 @@ separate, explicitly synthetic demonstration.
 Every zone or signal derived from a portal response must retain both the public
 dataset identifier and the original source record. A normaliser must not invent
 missing prices, dates, capacities, eligibility, or geographic precision.
+
+## SSEN historical-outage evidence
+
+The accepted SSEN NaFIRS HV collector reads the reviewed tracked manifest at
+`data/sources/ssen-nafirs-hv.json`. Each resource produces a resource-specific
+immutable snapshot whose identity includes the resource ID and source-byte
+SHA-256. Canonical records are immutable event versions scoped to that
+snapshot. A completed two-resource sync replaces the atomic current set in one
+transaction; a failed or incomplete sync leaves it unchanged. Queries may use
+that current set or an explicit snapshot set to replay earlier evidence.
+
+The raw CSV is authoritative. Parsing retains each source row, records rejects
+with safe reason codes, and attaches quality flags where a usable record needs
+qualification. Incident timestamps are parsed day-first, but the publisher
+timezone is unknown; canonical values therefore do not claim a UTC instant.
+The publisher cadence is unknown. SEPD and SHEPD have different schemas, so
+each resource has a separately validated header contract rather than a merged
+inferred schema.
+
+Only the stable origin URL from the reviewed manifest is persisted. A temporary
+signed download URL returned by the approved redirect is neither provenance
+nor stored data. Local materialisations remain ignored at
+`data/cache/outages/registry.sqlite3` and `data/snapshots/outages/`.
 
 ## Confidence
 

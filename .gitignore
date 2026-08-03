@@ -25,6 +25,8 @@ id_rsa*
 *.db
 *.sqlite
 *.sqlite3
+/data/raw/
+/data/exports/
 data/cache/
 data/snapshots/
 reports/
