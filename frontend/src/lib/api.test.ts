@@ -67,11 +67,124 @@ const VALID_REPORT_RESPONSE = {
 
 const EMPTY_PAGE = { items: [], total: 0, limit: 50, offset: 0 };
 
+const VALID_PORTAL = {
+  portal_id: "ssen",
+  operator_name: "Scottish and Southern Electricity Networks",
+  platform: "ckan",
+  portal_url: "https://example.test/portal",
+  current_attempt_status: null,
+  current_attempt_at: null,
+  current_attempt_warning_count: 0,
+  operational_review_window_hours: 168,
+  review_due_at: null,
+  review_status: "current",
+  last_complete_observation_id: null,
+  last_complete_observed_at: null,
+  latest_complete_snapshot_valid: null,
+  latest_complete_validation_state: "unavailable",
+  last_valid_observation_id: null,
+  last_valid_observed_at: null,
+  last_valid_dataset_count: 0,
+  last_valid_resource_count: 0,
+  degraded: false,
+  snapshot_available: false,
+};
+
+const VALID_DATASET = {
+  dataset_ref: "ssen:dataset-1",
+  portal_id: "ssen",
+  source_dataset_id: "dataset-1",
+  title: "Dataset",
+  description: null,
+  publisher: null,
+  licence: null,
+  licence_identifier: null,
+  licence_title: null,
+  licence_url: null,
+  attribution: null,
+  themes: ["network"],
+  catalogue_page_url: null,
+  metadata_api_url: null,
+  declared_update_frequency: null,
+  declared_update_frequency_text: null,
+  portal_url: null,
+  api_url: null,
+  source_created_at: null,
+  source_updated_at: null,
+  observed_at: "2026-08-03T12:00:00Z",
+  lifecycle_status: "active",
+  publication_pattern: "periodic",
+  access_status: "public",
+  tags: ["flexibility"],
+};
+
+const VALID_RESOURCE = {
+  id: "resource-1",
+  portal_id: "ssen",
+  source_dataset_id: "dataset-1",
+  name: null,
+  description: null,
+  url: null,
+  format: null,
+  media_type: null,
+  size_bytes: null,
+  source_created_at: null,
+  source_updated_at: null,
+  observed_at: null,
+};
+
+const VALID_EVIDENCE = {
+  id: "evidence-1",
+  portal_id: "ssen",
+  source_dataset_id: "dataset-1",
+  classification: "publication_pattern",
+  evidence: "Declared cadence",
+  confidence: "high",
+  source_url: null,
+  observed_at: null,
+};
+
+const VALID_ASSESSMENT = {
+  assessment_id: "assessment-1",
+  observation_id: "observation-1",
+  assessment_type: "maintenance_state",
+  assessment_value: "on_schedule",
+  confidence: "high",
+  assessed_at: "2026-08-03T12:00:00Z",
+};
+
+const VALID_OBSERVATION = {
+  observation_id: "observation-1",
+  portal_id: "ssen",
+  observed_at: null,
+  status: "complete",
+  adapter_version: null,
+  schema_version: null,
+  content_hash: null,
+  expected_count: null,
+  dataset_count: null,
+  resource_count: null,
+  complete: null,
+};
+
+function pageWith(item: unknown): object {
+  return { items: [item], total: 1, limit: 50, offset: 0 };
+}
+
 function mockCatalogueFetch(payload: unknown = EMPTY_PAGE): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
     json: async () => payload,
   });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function mockCatalogueFetchSequence(...payloads: unknown[]): ReturnType<typeof vi.fn> {
+  const fetchMock = vi.fn();
+  for (const payload of payloads) {
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => payload });
+  }
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
@@ -111,7 +224,16 @@ it("omits undefined dataset filters without changing parameter order", async () 
 });
 
 it("uses only versioned GET endpoints for every catalogue request", async () => {
-  const fetchMock = mockCatalogueFetch();
+  const fetchMock = mockCatalogueFetchSequence(
+    pageWith(VALID_PORTAL),
+    VALID_PORTAL,
+    pageWith(VALID_DATASET),
+    VALID_DATASET,
+    pageWith(VALID_RESOURCE),
+    pageWith(VALID_EVIDENCE),
+    pageWith(VALID_ASSESSMENT),
+    pageWith(VALID_OBSERVATION),
+  );
   const datasetRef = "opaque-ref";
 
   await fetchCataloguePortals();
@@ -134,7 +256,12 @@ it("uses only versioned GET endpoints for every catalogue request", async () => 
 });
 
 it("encodes opaque dataset references only at the path boundary", async () => {
-  const fetchMock = mockCatalogueFetch(EMPTY_PAGE);
+  const fetchMock = mockCatalogueFetchSequence(
+    VALID_DATASET,
+    pageWith(VALID_RESOURCE),
+    pageWith(VALID_EVIDENCE),
+    pageWith(VALID_ASSESSMENT),
+  );
   const datasetRef = "folder/ref?query#fragment%value";
   const encodedRef = encodeURIComponent(datasetRef);
 
@@ -272,6 +399,94 @@ it("maps malformed catalogue JSON to a stable message without raw parser text", 
     "Invalid catalogue portals response",
   );
   await expect(fetchCataloguePortals()).rejects.not.toThrow(rawSentinel);
+});
+
+it.each([
+  ["dataset detail", () => fetchCatalogueDataset("ref"), {}],
+  ["portal page item", () => fetchCataloguePortals(), pageWith(null)],
+  ["dataset page item", () => fetchCatalogueDatasets({}), pageWith({})],
+  ["resource page item", () => fetchCatalogueDatasetResources("ref"), pageWith({})],
+  ["evidence page item", () => fetchCatalogueDatasetEvidence("ref"), pageWith({})],
+  [
+    "assessment page item",
+    () => fetchCatalogueDatasetAssessments("ref"),
+    pageWith({}),
+  ],
+  ["observation page item", () => fetchCatalogueObservations(), pageWith({})],
+])("rejects a malformed required public contract for %s", async (
+  _name,
+  invoke,
+  payload,
+) => {
+  mockCatalogueFetch(payload);
+
+  await expect(invoke()).rejects.toThrow(/invalid catalogue/i);
+});
+
+it.each([
+  { items: [VALID_PORTAL], total: -1, limit: 50, offset: 0 },
+  { items: [VALID_PORTAL], total: 1.5, limit: 50, offset: 0 },
+  { items: [VALID_PORTAL], total: 1, limit: 0, offset: 0 },
+  { items: [VALID_PORTAL], total: 1, limit: 201, offset: 0 },
+  { items: [VALID_PORTAL], total: 1, limit: 50, offset: -1 },
+  { items: [VALID_PORTAL], total: 1, limit: 50, offset: Number.NaN },
+])("rejects invalid catalogue page metadata %#", async (payload) => {
+  mockCatalogueFetch(payload);
+
+  await expect(fetchCataloguePortals()).rejects.toThrow(
+    "Invalid catalogue portals response",
+  );
+});
+
+it("rejects wrong required field types, nullability, arrays, and enums", async () => {
+  const malformedDataset = {
+    ...VALID_DATASET,
+    title: 42,
+    themes: [null],
+    lifecycle_status: "invented",
+  };
+  mockCatalogueFetch(malformedDataset);
+
+  await expect(fetchCatalogueDataset("ref")).rejects.toThrow(
+    "Invalid catalogue dataset response",
+  );
+});
+
+it.each([
+  ["portals", () => fetchCataloguePortals(), "Failed to fetch catalogue portals"],
+  ["portal", () => fetchCataloguePortal("ssen"), "Failed to fetch catalogue portal"],
+  ["datasets", () => fetchCatalogueDatasets({}), "Failed to fetch catalogue datasets"],
+  ["dataset", () => fetchCatalogueDataset("ref"), "Failed to fetch catalogue dataset"],
+  [
+    "resources",
+    () => fetchCatalogueDatasetResources("ref"),
+    "Failed to fetch catalogue resources",
+  ],
+  [
+    "evidence",
+    () => fetchCatalogueDatasetEvidence("ref"),
+    "Failed to fetch catalogue evidence",
+  ],
+  [
+    "assessments",
+    () => fetchCatalogueDatasetAssessments("ref"),
+    "Failed to fetch catalogue assessments",
+  ],
+  [
+    "observations",
+    () => fetchCatalogueObservations(),
+    "Failed to fetch catalogue observations",
+  ],
+])("maps %s transport failures to fixed safe messages", async (
+  _name,
+  invoke,
+  message,
+) => {
+  const rawSentinel = "private-transport-sentinel";
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error(rawSentinel)));
+
+  await expect(invoke()).rejects.toThrow(message);
+  await expect(invoke()).rejects.not.toThrow(rawSentinel);
 });
 
 it("does not swallow AbortError", async () => {
