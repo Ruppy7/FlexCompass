@@ -148,6 +148,7 @@ def sanitise_public_url(value: str | None) -> str | None:
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.netloc
+        or "%" in parsed.netloc
         or not hostname
         or parsed.username is not None
         or parsed.password is not None

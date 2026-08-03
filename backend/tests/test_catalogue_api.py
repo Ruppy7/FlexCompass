@@ -303,6 +303,12 @@ def test_dataset_ref_encoder_enforces_decoder_length_boundary() -> None:
         "http://0177.0.0.1/private",
         "http://127.0x0.01.1/private",
         "http://0300.0250.1.1/private",
+        "http://127.0%2e0.1/private",
+        "http://127%2e0.0.1/private",
+        "http://%31%32%37.0.0.1/private",
+        "http://catalogue%2eexample/path",
+        "http://user%40catalogue.example/path",
+        "http://catalogue.example%3a80/path",
         "http://localhost/path",
         "http://catalogue.local/path",
         "http://catalogue.internal/path",
@@ -325,6 +331,14 @@ def test_public_url_sanitiser_omits_credentials_and_local_or_malformed_urls(
             "https://catalogue.example/path",
         ),
         ("https://8.8.8.8/path?public=value#section", "https://8.8.8.8/path"),
+        (
+            "https://[2606:4700:4700::1111]/dns-query?name=example#answer",
+            "https://[2606:4700:4700::1111]/dns-query",
+        ),
+        (
+            "https://catalogue.example/folder%2Fdataset?public=value#section",
+            "https://catalogue.example/folder%2Fdataset",
+        ),
     ],
 )
 def test_public_url_sanitiser_preserves_public_domains_and_global_ip_addresses(
