@@ -1332,7 +1332,7 @@ def _commit_exact_run(
 def test_outage_schema_migrates_with_required_tables_and_indexes(
     temp_db: Path,
 ) -> None:
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
     with get_connection(temp_db) as connection:
         tables = {
             row[0]
@@ -1383,8 +1383,8 @@ def test_migration_six_upgrades_populated_version_five_without_data_loss(
         )
         connection.commit()
 
-    assert run_migrations(temp_db) == 7
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
     with get_connection(temp_db) as connection:
         row = connection.execute(
             "SELECT name FROM portal_datasets WHERE id = ?", ("legacy",)
@@ -4053,7 +4053,7 @@ def _insert_legacy_snapshot_and_event(
 
 
 def test_migration_seven_adds_immutable_snapshot_version_tables(temp_db: Path) -> None:
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
     with get_connection(temp_db) as connection:
         tables = {
             row[0]
@@ -4118,7 +4118,7 @@ def test_migration_seven_backfills_legacy_rows_without_inventing_current_state(
         )
         connection.commit()
 
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
     with get_connection(temp_db) as connection:
         observation = connection.execute(
             "SELECT snapshot_id FROM outage_source_observations"
@@ -4227,7 +4227,7 @@ def test_migration_seven_preserves_exact_safe_legacy_raw_record_bytes(
         raw_record=safe_raw_record,
     )
 
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
 
     with get_connection(temp_db) as connection:
         event_json = connection.execute(
@@ -4295,7 +4295,7 @@ def test_legacy_unknown_fetch_time_is_null_and_orders_deterministically(
             )
         connection.commit()
 
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
     unknown = list_source_snapshots(db_path=temp_db)
     assert [item.snapshot_id for item in unknown] == sorted(
         item.snapshot_id for item in unknown
@@ -4640,7 +4640,7 @@ def test_unavailable_legacy_blob_becomes_available_only_after_hash_verification(
             ),
         )
         connection.commit()
-    assert run_migrations(temp_db) == 7
+    assert run_migrations(temp_db) == MIGRATIONS[-1][0]
 
     with sync_client(sepd_csv_bytes, shepd_csv_bytes) as client:
         result = sync_ssen_nafirs_hv(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from app.catalogue_adapters import CatalogueFetchResult
@@ -27,6 +27,8 @@ from app.catalogue_store import (
     observation_key,
     persist_catalogue_assessment,
     persist_catalogue_result,
+    record_catalogue_refresh_attempt,
+    refresh_attempt_key,
 )
 from app.db import MIGRATIONS, get_connection, run_migrations
 
@@ -98,6 +100,206 @@ def make_result(
 
 def count_rows(conn: sqlite3.Connection, table: str) -> int:
     return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def test_migration_eight_adds_refresh_attempts(tmp_path):
+    db_path = tmp_path / "registry.sqlite3"
+
+    assert run_migrations(db_path) == 8
+
+    with get_connection(db_path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(catalogue_refresh_attempts)"
+            )
+        }
+        indexes = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA index_list(catalogue_refresh_attempts)"
+            )
+        }
+        foreign_keys = {
+            (row[3], row[4])
+            for row in conn.execute(
+                "PRAGMA foreign_key_list(catalogue_refresh_attempts)"
+            )
+        }
+    assert columns == {
+        "attempt_id",
+        "portal_id",
+        "attempted_at",
+        "status",
+        "observation_id",
+        "warning_count",
+        "safe_error",
+        "created_at",
+    }
+    assert "idx_catalogue_attempts_portal_time" in indexes
+    assert foreign_keys == {
+        ("observation_id", "observation_id"),
+        ("portal_id", "portal_id"),
+        ("status", "status"),
+    }
+
+
+def test_migration_eight_rolls_back_schema_and_version_on_failure(tmp_path):
+    db_path = tmp_path / "migration-eight-failure.sqlite3"
+    connection = sqlite3.connect(db_path)
+    try:
+        for version, ddl in MIGRATIONS[:7]:
+            connection.executescript(ddl)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
+                (version,),
+            )
+        connection.execute(
+            "CREATE TABLE catalogue_refresh_attempts (attempt_id TEXT)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(sqlite3.OperationalError, match="no such column"):
+        run_migrations(db_path)
+
+    with sqlite3.connect(db_path) as failed:
+        columns = {
+            row[1]
+            for row in failed.execute(
+                "PRAGMA table_info(catalogue_refresh_attempts)"
+            )
+        }
+        versions = {
+            row[0] for row in failed.execute("SELECT version FROM schema_version")
+        }
+        indexes = {
+            row[0]
+            for row in failed.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+
+    assert columns == {"attempt_id"}
+    assert 8 not in versions
+    assert "idx_catalogue_observations_attempt_integrity" not in indexes
+
+
+def test_refresh_attempt_identity_is_deterministic_and_portal_scoped():
+    first = refresh_attempt_key("nged", OBSERVED_AT)
+
+    assert first == refresh_attempt_key("nged", OBSERVED_AT)
+    assert first != refresh_attempt_key("spen", OBSERVED_AT)
+    assert first != refresh_attempt_key("nged", OBSERVED_AT + timedelta(seconds=1))
+
+
+def test_successful_refresh_attempt_references_matching_observation(conn):
+    persisted = persist_catalogue_result(
+        conn,
+        make_result(),
+        "snapshot.json",
+        "abc",
+    )
+
+    attempt_id = record_catalogue_refresh_attempt(
+        conn,
+        portal_id="nged",
+        attempted_at=OBSERVED_AT,
+        status="complete",
+        observation_id=persisted.observation_id,
+        warnings=[],
+        safe_error_text=None,
+    )
+    row = conn.execute(
+        """SELECT attempt_id, portal_id, attempted_at, status,
+                  observation_id, warning_count, safe_error
+           FROM catalogue_refresh_attempts"""
+    ).fetchone()
+
+    assert tuple(row) == (
+        attempt_id,
+        "nged",
+        OBSERVED_AT.isoformat(),
+        "complete",
+        persisted.observation_id,
+        0,
+        None,
+    )
+
+
+def test_refresh_attempt_rejects_cross_portal_and_cross_status_observations(conn):
+    persisted = persist_catalogue_result(
+        conn,
+        make_result(),
+        "snapshot.json",
+        "abc",
+    )
+
+    with pytest.raises(ValueError, match="portal and status"):
+        record_catalogue_refresh_attempt(
+            conn,
+            portal_id="spen",
+            attempted_at=OBSERVED_AT,
+            status="complete",
+            observation_id=persisted.observation_id,
+            warnings=[],
+            safe_error_text=None,
+        )
+    with pytest.raises(ValueError, match="portal and status"):
+        record_catalogue_refresh_attempt(
+            conn,
+            portal_id="nged",
+            attempted_at=OBSERVED_AT,
+            status="partial",
+            observation_id=persisted.observation_id,
+            warnings=[],
+            safe_error_text=None,
+        )
+
+
+def test_failed_refresh_attempt_has_no_observation(conn):
+    attempt_id = record_catalogue_refresh_attempt(
+        conn,
+        portal_id="nged",
+        attempted_at=OBSERVED_AT,
+        status="failed",
+        observation_id=None,
+        warnings=[],
+        safe_error_text="The public catalogue request failed.",
+    )
+
+    assert tuple(conn.execute(
+        """SELECT attempt_id, status, observation_id, safe_error
+           FROM catalogue_refresh_attempts"""
+    ).fetchone()) == (
+        attempt_id,
+        "failed",
+        None,
+        "The public catalogue request failed.",
+    )
+
+
+def test_refresh_attempt_exact_replay_is_idempotent_but_conflict_fails(conn):
+    values = {
+        "portal_id": "nged",
+        "attempted_at": OBSERVED_AT,
+        "status": "failed",
+        "observation_id": None,
+        "warnings": ["One", "Two"],
+        "safe_error_text": "The public catalogue request failed.",
+    }
+
+    first = record_catalogue_refresh_attempt(conn, **values)
+    second = record_catalogue_refresh_attempt(conn, **values)
+
+    assert first == second
+    assert count_rows(conn, "catalogue_refresh_attempts") == 1
+    with pytest.raises(ValueError, match="conflicting catalogue refresh attempt"):
+        record_catalogue_refresh_attempt(
+            conn,
+            **{**values, "safe_error_text": "A different safe failure."},
+        )
 
 
 def test_explicit_nested_database_path_creates_missing_parent(tmp_path):

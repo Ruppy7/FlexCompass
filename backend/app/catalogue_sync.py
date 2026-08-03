@@ -19,7 +19,11 @@ import httpx
 from app.catalogue_adapters import CatalogueFetchResult, fetch_catalogue
 from app.catalogue_classifier import DatasetAssessment, MaintenancePolicy, classify_dataset, load_policy
 from app.catalogue_models import CATALOGUE_PORTALS, CatalogueDataset, CataloguePortalConfig, DatasetResource
-from app.catalogue_store import persist_catalogue_assessment, persist_catalogue_result
+from app.catalogue_store import (
+    persist_catalogue_assessment,
+    persist_catalogue_result,
+    record_catalogue_refresh_attempt,
+)
 from app.db import get_connection, run_migrations
 
 ADAPTER_VERSION = "1"
@@ -704,6 +708,15 @@ def _sync_one(
                 status=status,
             )
             _persist_assessments(conn, persisted.observation_id, assessments, now)
+            record_catalogue_refresh_attempt(
+                conn,
+                portal_id=portal_id,
+                attempted_at=now,
+                status=status,
+                observation_id=persisted.observation_id,
+                warnings=result.warnings,
+                safe_error_text=None,
+            )
             _write_json_atomic(snapshot_path, {"manifest": manifest, **core})
     except Exception:
         if not snapshot_existed:
@@ -762,11 +775,22 @@ def sync_catalogues(
             outcomes[portal_id] = outcome
             review_items.extend(items)
         except Exception as error:  # failures are isolated at the portal boundary
+            error_text = safe_error(error)
+            with get_connection(db_path) as conn:
+                record_catalogue_refresh_attempt(
+                    conn,
+                    portal_id=portal_id,
+                    attempted_at=now,
+                    status="failed",
+                    observation_id=None,
+                    warnings=(),
+                    safe_error_text=error_text,
+                )
             outcomes[portal_id] = PortalSyncOutcome(
                 portal_id=portal_id,
                 status="failed",
                 observed_at=now,
-                error=safe_error(error),
+                error=error_text,
             )
     statuses = {outcome.status for outcome in outcomes.values()}
     if statuses == {"complete"}:

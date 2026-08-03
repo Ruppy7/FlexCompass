@@ -679,6 +679,31 @@ BEGIN
     SELECT RAISE(ABORT, 'outage content blob is immutable');
 END;
 """),
+    # -- Migration 8: Durable catalogue refresh-attempt ledger --
+    (8, """
+BEGIN IMMEDIATE;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_catalogue_observations_attempt_integrity
+    ON catalogue_observations(observation_id, portal_id, status);
+CREATE TABLE IF NOT EXISTS catalogue_refresh_attempts (
+    attempt_id      TEXT PRIMARY KEY,
+    portal_id       TEXT NOT NULL,
+    attempted_at    TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('complete', 'partial', 'failed')),
+    observation_id  TEXT,
+    warning_count   INTEGER NOT NULL DEFAULT 0 CHECK (warning_count >= 0),
+    safe_error      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (portal_id, attempted_at),
+    FOREIGN KEY (observation_id, portal_id, status)
+        REFERENCES catalogue_observations(observation_id, portal_id, status),
+    CHECK (
+        (status = 'failed' AND observation_id IS NULL)
+        OR (status IN ('complete', 'partial') AND observation_id IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_catalogue_attempts_portal_time
+    ON catalogue_refresh_attempts(portal_id, attempted_at DESC);
+"""),
 ]
 
 

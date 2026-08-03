@@ -21,6 +21,7 @@ from app.catalogue_models import (
     EvidenceConfidence,
 )
 from app.catalogue_sync import diff_snapshots, sync_catalogues
+from app.config import FlexCompassConfig
 from app.db import get_connection, run_migrations
 
 NOW = datetime(2026, 7, 16, 8, 9, 10, tzinfo=timezone.utc)
@@ -95,7 +96,12 @@ def fake_fetch(portal, client: FakeClient, observed_at: datetime) -> CatalogueFe
     return outcome
 
 
-def run_sync(tmp_path: Path, results: dict[str, CatalogueFetchResult | Exception]):
+def run_sync(
+    tmp_path: Path,
+    results: dict[str, CatalogueFetchResult | Exception],
+    *,
+    now: datetime = NOW,
+):
     db_path = tmp_path / "catalogue.sqlite3"
     run_migrations(db_path)
     return sync_catalogues(
@@ -106,7 +112,7 @@ def run_sync(tmp_path: Path, results: dict[str, CatalogueFetchResult | Exception
         ),
         db_path,
         tmp_path / "snapshots",
-        NOW,
+        now,
         fetcher=fake_fetch,
         review_queue_path=tmp_path / "cache" / "review-queue.json",
         policy_path=Path(__file__).parents[2] / "data" / "catalogue" / "maintenance-policy.json",
@@ -121,6 +127,7 @@ def test_one_failed_portal_does_not_block_successful_portal_or_overwrite_registr
             "nged": RuntimeError("synthetic-secret"),
             "spen": make_result("spen"),
         },
+        now=NOW + timedelta(minutes=5),
     )
 
     assert initial.status == "complete"
@@ -133,7 +140,19 @@ def test_one_failed_portal_does_not_block_successful_portal_or_overwrite_registr
         title = conn.execute(
             "SELECT title FROM catalogue_datasets WHERE portal_id = 'nged'"
         ).fetchone()[0]
+        attempts = [
+            tuple(row)
+            for row in conn.execute(
+                """SELECT portal_id, status, observation_id
+                   FROM catalogue_refresh_attempts
+                   ORDER BY attempted_at, portal_id"""
+            )
+        ]
     assert title == "Last valid title"
+    assert attempts[-2][0:2] == ("nged", "failed")
+    assert attempts[-2][2] is None
+    assert attempts[-1][0:2] == ("spen", "complete")
+    assert attempts[-1][2] is not None
     queue = json.loads(summary.review_queue_path.read_text(encoding="utf-8"))
     assert {item["portal_id"] for item in queue} == {"nged", "spen"}
 
@@ -150,6 +169,89 @@ def test_sync_summary_status_and_exit_semantics(tmp_path: Path, results, status:
     summary = run_sync(tmp_path, results)
     assert summary.status == status
     assert summary.exit_code == exit_code
+
+    with get_connection(tmp_path / "catalogue.sqlite3") as conn:
+        attempts = conn.execute(
+            """SELECT status, observation_id, warning_count, safe_error
+               FROM catalogue_refresh_attempts"""
+        ).fetchall()
+    assert len(attempts) == len(results)
+    assert attempts[0]["status"] == status
+    if status == "failed":
+        assert attempts[0]["observation_id"] is None
+        assert attempts[0]["safe_error"] == "RuntimeError: operation failed"
+    else:
+        assert attempts[0]["observation_id"] is not None
+        assert attempts[0]["warning_count"] == (1 if status == "partial" else 0)
+
+
+def test_fetch_failure_records_attempt_without_calling_result_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def forbidden_persist(*args, **kwargs):
+        raise AssertionError("fetch failure must not persist a catalogue result")
+
+    monkeypatch.setattr(catalogue_sync, "persist_catalogue_result", forbidden_persist)
+
+    summary = run_sync(tmp_path, {"nged": RuntimeError("offline")})
+
+    assert summary.status == "failed"
+    with get_connection(tmp_path / "catalogue.sqlite3") as conn:
+        assert tuple(
+            conn.execute(
+                """SELECT status, observation_id
+                   FROM catalogue_refresh_attempts"""
+            ).fetchone()
+        ) == ("failed", None)
+
+
+def test_attempt_record_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_attempt(*args, **kwargs):
+        raise sqlite3.OperationalError("attempt ledger unavailable")
+
+    monkeypatch.setattr(
+        catalogue_sync,
+        "record_catalogue_refresh_attempt",
+        fail_attempt,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="attempt ledger unavailable"):
+        run_sync(tmp_path, {"nged": RuntimeError("offline")})
+
+
+def test_catalogue_paths_are_repository_root_resolved_and_env_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.delenv("FLEXCOMPASS_CATALOGUE_DB_PATH", raising=False)
+    monkeypatch.delenv("FLEXCOMPASS_CATALOGUE_SNAPSHOT_DIR", raising=False)
+
+    defaults = FlexCompassConfig()
+
+    assert defaults.catalogue_db_path == (
+        root / "data" / "cache" / "catalogue" / "registry.sqlite3"
+    )
+    assert defaults.catalogue_snapshot_dir == (
+        root / "data" / "snapshots" / "catalogues"
+    )
+
+    monkeypatch.setenv(
+        "FLEXCOMPASS_CATALOGUE_DB_PATH",
+        "custom/catalogue.sqlite3",
+    )
+    monkeypatch.setenv(
+        "FLEXCOMPASS_CATALOGUE_SNAPSHOT_DIR",
+        str(tmp_path / "custom-snapshots"),
+    )
+    overridden = FlexCompassConfig()
+
+    assert overridden.catalogue_db_path == root / "custom" / "catalogue.sqlite3"
+    assert overridden.catalogue_snapshot_dir == tmp_path / "custom-snapshots"
 
 
 def test_snapshot_is_canonical_atomic_redacted_and_repeatable(tmp_path: Path):
@@ -583,8 +685,18 @@ def test_persistence_failure_rolls_back_registry_without_publishing_artifacts(
         observation_count = conn.execute(
             "SELECT COUNT(*) FROM catalogue_observations WHERE portal_id = 'nged'"
         ).fetchone()[0]
+        attempts = [
+            tuple(row)
+            for row in conn.execute(
+                """SELECT status, observation_id
+                   FROM catalogue_refresh_attempts
+                   WHERE portal_id = 'nged'
+                   ORDER BY attempted_at"""
+            )
+        ]
     assert row["title"] == "Last valid title"
     assert observation_count == 1
+    assert attempts[-1] == ("failed", None)
     assert original_snapshot.read_bytes() == original_snapshot_bytes
     assert initial.review_queue_path.read_bytes() == original_queue_bytes
     assert list((tmp_path / "snapshots").rglob("nged.json")) == [original_snapshot]

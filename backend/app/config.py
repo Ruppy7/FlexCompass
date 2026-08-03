@@ -24,6 +24,12 @@ except ImportError:
 
 _CORS_ORIGIN_ERROR = "CORS origins must be absolute HTTP(S) origins"
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _repository_path_from_env(name: str, default: Path) -> Path:
+    value = Path(os.environ.get(name, str(default)))
+    return value if value.is_absolute() else _REPOSITORY_ROOT / value
 
 
 def _canonical_cors_host(hostname: str) -> str:
@@ -158,6 +164,24 @@ class FlexCompassConfig:
                 "FLEXCOMPASS_OUTAGE_SNAPSHOT_DIR",
                 "data/snapshots/outages",
             )
+        )
+    )
+    # These paths locate FlexCompass's operational catalogue review evidence.
+    # The review window is our SLA, not a claim about publisher cadence.
+    catalogue_db_path: Path = field(
+        default_factory=lambda: _repository_path_from_env(
+            "FLEXCOMPASS_CATALOGUE_DB_PATH",
+            _REPOSITORY_ROOT
+            / "data"
+            / "cache"
+            / "catalogue"
+            / "registry.sqlite3",
+        )
+    )
+    catalogue_snapshot_dir: Path = field(
+        default_factory=lambda: _repository_path_from_env(
+            "FLEXCOMPASS_CATALOGUE_SNAPSHOT_DIR",
+            _REPOSITORY_ROOT / "data" / "snapshots" / "catalogues",
         )
     )
 

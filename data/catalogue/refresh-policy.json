@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "review_window_hours": {
+    "nged": 168,
+    "spen": 168,
+    "enwl": 168,
+    "ssen": 168,
+    "ukpn": 168,
+    "npg": 168,
+    "neso": 168
+  }
+}
