@@ -36,30 +36,25 @@ class UnsafePersistenceValueError(ValueError):
     """A value cannot cross an exact-preservation persistence boundary."""
 
 
-def _decoded_layers(value: str) -> tuple[list[str], bool]:
-    layers = [value]
+def _string_is_unsafe(value: str, *, key: bool = False) -> bool:
     current = value
-    for _ in range(MAX_DECODE_PASSES):
+    for decode_pass in range(MAX_DECODE_PASSES + 1):
+        if _R2_HOSTNAME.search(current) or _X_AMZ_FIELD.search(current):
+            return True
+        if key and current.strip().casefold() in _UNSAFE_MAPPING_KEYS:
+            return True
         decoded = unquote(current)
         if decoded == current:
-            return layers, False
-        layers.append(decoded)
+            return False
+        if decode_pass == MAX_DECODE_PASSES:
+            return True
         current = decoded
-    return layers, unquote(current) != current
+    return True
 
 
-def _string_is_unsafe(value: str, *, key: bool = False) -> bool:
-    layers, decode_budget_exhausted = _decoded_layers(value)
-    if decode_budget_exhausted:
-        return True
-    if any(
-        _R2_HOSTNAME.search(layer) or _X_AMZ_FIELD.search(layer)
-        for layer in layers
-    ):
-        return True
-    return key and any(
-        layer.strip().casefold() in _UNSAFE_MAPPING_KEYS for layer in layers
-    )
+def source_bytes_contain_unsafe_material(content: bytes) -> bool:
+    """Scan a complete bounded source response without persisted-leaf limits."""
+    return _string_is_unsafe(content.decode("latin-1"))
 
 
 def _bounded_json_size(value: Any) -> int:

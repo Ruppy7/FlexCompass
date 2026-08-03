@@ -3065,6 +3065,31 @@ def csv_with_first_row_value(content: bytes, field: str, value: str) -> bytes:
     return csv_text.getvalue().encode()
 
 
+def csv_with_first_row_payload(
+    content: bytes,
+    value: str,
+    *,
+    row_shape: str,
+) -> bytes:
+    if row_shape == "valid":
+        return csv_with_first_row_value(content, "CAUSE", value)
+    if row_shape == "extra-column":
+        rows = list(csv.reader(io.StringIO(content.decode())))
+        rows[1].append(value)
+        csv_text = io.StringIO(newline="")
+        csv.writer(csv_text, lineterminator="\n").writerows(rows)
+        return csv_text.getvalue().encode()
+    if row_shape == "malformed-quote":
+        lines = content.decode().splitlines()
+        malformed = lines[1].replace(
+            "Switchgear",
+            f'"bad"tail{value}',
+            1,
+        )
+        return "\n".join((lines[0], malformed, lines[2])).encode()
+    raise AssertionError(f"unsupported row shape: {row_shape}")
+
+
 def _active_child_pids() -> set[int]:
     return {
         child.pid
@@ -4864,8 +4889,13 @@ def test_sync_signed_target_never_crosses_output_log_file_or_sqlite(
     assert "X-Amz-Signature" not in output
 
 
+@pytest.mark.parametrize(
+    "row_shape",
+    ["valid", "extra-column", "malformed-quote"],
+)
 @pytest.mark.parametrize("depth", [0, 1, 4, 8, 9])
 def test_sync_rejects_unsafe_source_bytes_before_blob_promotion(
+    row_shape: str,
     depth: int,
     monkeypatch: pytest.MonkeyPatch,
     temp_db: Path,
@@ -4892,10 +4922,10 @@ def test_sync_rejects_unsafe_source_bytes_before_blob_promotion(
     marker = f"PR4_SYNTHETIC_BLOB_MARKER_{depth}"
     target = synthetic_signed_target(marker)
     unsafe = fully_byte_encoded(target, depth)
-    unsafe_sepd = csv_with_first_row_value(
+    unsafe_sepd = csv_with_first_row_payload(
         sepd_csv_bytes,
-        "CAUSE",
         unsafe,
+        row_shape=row_shape,
     )
     changed_shepd = csv_with_first_row_value(
         shepd_csv_bytes,
@@ -4960,6 +4990,70 @@ def test_sync_rejects_unsafe_source_bytes_before_blob_promotion(
         for relative_path, content in after_files.items():
             assert forbidden not in relative_path
             assert forbidden.encode() not in content
+
+
+@pytest.mark.parametrize("row_shape", ["extra-column", "malformed-quote"])
+def test_sync_preserves_non_sensitive_structural_rejects(
+    row_shape: str,
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    ordinary_sepd = csv_with_first_row_payload(
+        sepd_csv_bytes,
+        "ordinary structural evidence",
+        row_shape=row_shape,
+    )
+    snapshot_dir = tmp_path / "snapshots"
+
+    with sync_client(ordinary_sepd, shepd_csv_bytes) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db,
+            snapshot_dir=snapshot_dir,
+            client=client,
+        )
+
+    assert result.status == "completed"
+    assert result.rejects_written == 1
+    assert ordinary_sepd in [
+        path.read_bytes() for path in snapshot_dir.rglob("*.csv")
+    ]
+
+
+def test_sync_accepts_large_source_with_benign_percent_and_multiline_text(
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    shepd_csv_bytes: bytes,
+) -> None:
+    rows = list(csv.reader(io.StringIO(sepd_csv_bytes.decode())))
+    cause_index = rows[0].index("CAUSE")
+    district_index = rows[0].index("DIST_HV_REF")
+    network_index = rows[0].index("NRN_SOUTH")
+    repeated_rows = []
+    for index in range(700):
+        row = list(rows[1])
+        row[cause_index] = "95%; 95%25; %GG; ordinary\nmultiline text"
+        row[district_index] = f"LARGE-{index:04d}"
+        row[network_index] = f"LARGE-NETWORK-{index:04d}"
+        repeated_rows.append(row)
+    csv_text = io.StringIO(newline="")
+    csv.writer(csv_text, lineterminator="\n").writerows(
+        [rows[0], *repeated_rows]
+    )
+    large_sepd = csv_text.getvalue().encode()
+    assert len(large_sepd) > MAX_PERSISTED_STRING_BYTES
+
+    with sync_client(large_sepd, shepd_csv_bytes) as client:
+        result = sync_ssen_nafirs_hv(
+            db_path=temp_db,
+            snapshot_dir=tmp_path / "snapshots",
+            client=client,
+        )
+
+    assert result.status == "completed"
+    assert result.rejects_written == 0
 
 
 @pytest.mark.parametrize("depth", [0, 1, 4, 8, 9])

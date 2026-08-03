@@ -35,6 +35,7 @@ from app.outages import (
     SyncResult,
     source_snapshot_id,
 )
+from app.persistence_safety import source_bytes_contain_unsafe_material
 from app.ssen_nafirs import (
     LICENCE_ID,
     LICENCE_TITLE,
@@ -911,6 +912,11 @@ def sync_ssen_nafirs_hv(
             attempted_at = datetime.now(timezone.utc)
             try:
                 content = download_ssen_hv_resource(active_transport, resource)
+                if source_bytes_contain_unsafe_material(content):
+                    raise SourceContractError(
+                        "SSEN resource contains unsafe raw outage evidence",
+                        error_code="unsafe_source_content",
+                    )
                 digest = hashlib.sha256(content).hexdigest()
                 snapshot_id = source_snapshot_id(resource.source_resource_id, digest)
                 parsed = list(
@@ -922,15 +928,6 @@ def sync_ssen_nafirs_hv(
                         snapshot_id=snapshot_id,
                     )
                 )
-                if any(
-                    isinstance(item, OutageRowError)
-                    and item.code == "unsafe_raw_record"
-                    for item in parsed
-                ):
-                    raise SourceContractError(
-                        "SSEN resource contains unsafe raw outage evidence",
-                        error_code="unsafe_source_content",
-                    )
                 relative_path, created_path = _write_blob(
                     content, digest, resolved_snapshot_dir, run_id
                 )
