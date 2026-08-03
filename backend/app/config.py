@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import idna
 
-__all__ = ["config"]
+__all__ = ["FlexCompassConfig", "config"]
 
 # Load .env early so local public-portal settings are available.
 try:
@@ -184,7 +184,6 @@ class FlexCompassConfig:
             _REPOSITORY_ROOT / "data" / "snapshots" / "catalogues",
         )
     )
-
     default_seed: int = field(
         default_factory=lambda: int(os.environ.get("FLEXCOMPASS_SEED", "42"))
     )

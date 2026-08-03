@@ -45,6 +45,21 @@ class PortalState:
     snapshot_available: bool
 
 
+@dataclass(frozen=True)
+class CatalogueObservationRecord:
+    observation_id: str
+    portal_id: str
+    observed_at: datetime
+    status: str
+    adapter_version: str | None
+    schema_version: int | None
+    content_hash: str | None
+    expected_count: int | None
+    dataset_count: int | None
+    resource_count: int | None
+    complete: bool | None
+
+
 def _timestamp(value: object | None) -> datetime | None:
     if value is None:
         return None
@@ -312,4 +327,36 @@ class CatalogueRepository:
                 snapshot.observation_id,
                 str(row["assessment_type"]),
             )
+        )
+
+    def list_observations(
+        self,
+        portal_id: PortalId | None = None,
+    ) -> tuple[CatalogueObservationRecord, ...]:
+        """Return deterministic safe observation history without local metadata."""
+        query = """SELECT observation_id, portal_id, observed_at, status,
+                          content_hash, expected_count, dataset_count, resource_count
+                   FROM catalogue_observations"""
+        parameters: tuple[str, ...] = ()
+        if portal_id is not None:
+            query += " WHERE portal_id = ?"
+            parameters = (portal_id,)
+        query += " ORDER BY observed_at DESC, created_at DESC, observation_id DESC"
+        with get_connection(self.db_path) as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(
+            CatalogueObservationRecord(
+                observation_id=row["observation_id"],
+                portal_id=row["portal_id"],
+                observed_at=_timestamp(row["observed_at"]),  # type: ignore[arg-type]
+                status=row["status"],
+                adapter_version=None,
+                schema_version=None,
+                content_hash=row["content_hash"],
+                expected_count=row["expected_count"],
+                dataset_count=row["dataset_count"],
+                resource_count=row["resource_count"],
+                complete=row["status"] == "complete",
+            )
+            for row in rows
         )

@@ -46,6 +46,14 @@ def test_public_api_contains_only_verified_surfaces() -> None:
         "/api/v1/outages/summary",
         "/api/v1/outages/events/{event_id}",
         "/api/v1/outages/snapshots",
+        "/api/v1/catalogue/portals",
+        "/api/v1/catalogue/portals/{portal_id}",
+        "/api/v1/catalogue/datasets",
+        "/api/v1/catalogue/datasets/{dataset_ref}",
+        "/api/v1/catalogue/datasets/{dataset_ref}/resources",
+        "/api/v1/catalogue/datasets/{dataset_ref}/evidence",
+        "/api/v1/catalogue/datasets/{dataset_ref}/assessments",
+        "/api/v1/catalogue/observations",
     }
 
 
@@ -66,6 +74,14 @@ def test_root_metadata_lists_the_complete_verified_public_surface(
         "/api/v1/outages/summary",
         "/api/v1/outages/events/{event_id}",
         "/api/v1/outages/snapshots",
+        "/api/v1/catalogue/portals",
+        "/api/v1/catalogue/portals/{portal_id}",
+        "/api/v1/catalogue/datasets",
+        "/api/v1/catalogue/datasets/{dataset_ref}",
+        "/api/v1/catalogue/datasets/{dataset_ref}/resources",
+        "/api/v1/catalogue/datasets/{dataset_ref}/evidence",
+        "/api/v1/catalogue/datasets/{dataset_ref}/assessments",
+        "/api/v1/catalogue/observations",
     ]
 
 
@@ -78,7 +94,6 @@ def test_root_metadata_lists_the_complete_verified_public_surface(
         "/api/example-portfolios",
         "/api/analyse",
         "/api/report",
-        "/api/portal/datasets",
         "/api/zones",
         "/api/ingest/status",
     ],
@@ -98,6 +113,72 @@ def test_application_starts_without_opening_the_primary_database(
         "verified_analytical_source_available_for_local_sync"
     )
     assert not test_db.exists()
+
+
+def test_injected_settings_govern_existing_outage_route_reads(client) -> None:
+    response = client.get("/api/v1/outages/snapshots")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["get", "head", "post", "put", "patch", "delete", "options"],
+)
+def test_legacy_catalogue_route_has_deterministic_migration_response(
+    client,
+    method: str,
+) -> None:
+    response = getattr(client, method)("/api/portal/datasets")
+    assert response.status_code == 410
+    if method != "head":
+        assert response.json() == {
+            "detail": "Use /api/v1/catalogue/datasets"
+        }
+
+
+def test_legacy_catalogue_cors_preflight_is_410_without_advertised_methods(
+    client,
+) -> None:
+    response = client.options(
+        "/api/portal/datasets",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 410
+    assert response.json() == {"detail": "Use /api/v1/catalogue/datasets"}
+    assert "access-control-allow-methods" not in response.headers
+
+
+def test_legacy_catalogue_trailing_alias_redirects_but_subpaths_are_absent(
+    client,
+) -> None:
+    trailing = client.get(
+        "/api/portal/datasets/",
+        follow_redirects=False,
+    )
+    assert trailing.status_code in {307, 308}
+    assert client.get("/api/portal/datasets/private").status_code == 404
+    trailing_preflight = client.options(
+        "/api/portal/datasets/",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert trailing_preflight.status_code == 410
+    assert "access-control-allow-methods" not in trailing_preflight.headers
+    subpath_preflight = client.options(
+        "/api/portal/datasets/private",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert subpath_preflight.status_code == 200
+    assert "POST" in subpath_preflight.headers["access-control-allow-methods"]
 
 
 @pytest.fixture
