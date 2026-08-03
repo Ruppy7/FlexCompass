@@ -36,10 +36,15 @@ from app.outages import (
     source_snapshot_id,
 )
 from app.ssen_nafirs import (
+    LICENCE_ID,
+    LICENCE_TITLE,
+    LICENCE_URL,
+    PACKAGE_ID,
     SEPD_COLUMNS,
     SEPD_RESOURCE_ID,
     SHEPD_COLUMNS,
     SHEPD_RESOURCE_ID,
+    SOURCE_DATASET_ID,
     OutageRowError,
     SourceContractError,
     iter_ssen_hv_csv,
@@ -56,6 +61,11 @@ _REDIRECT_HOST = (
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_MANIFEST_PATH = _REPOSITORY_ROOT / "data/sources/ssen-nafirs-hv.json"
 _EXPECTED_RESOURCE_IDS = tuple(sorted((SEPD_RESOURCE_ID, SHEPD_RESOURCE_ID)))
+_EXPECTED_RESOURCE_CONTRACTS = {
+    SEPD_RESOURCE_ID: ("SEPD", "NaFIRS HV Faults SEPD (CSV)"),
+    SHEPD_RESOURCE_ID: ("SHEPD", "NaFIRS HV Faults SHEPD (CSV)"),
+}
+_EXPECTED_ATTRIBUTION = "SSEN Distribution"
 _PROCESS_MESSAGE_SUCCESS = b"O"
 _PROCESS_MESSAGE_ERROR = b"E"
 _PROCESS_ERROR_REQUEST_FAILED = 1
@@ -720,11 +730,27 @@ class SsenSourceManifestV1(BaseModel):
         )
         if any(getattr(self, name) != getattr(evidence, name) for name in shared):
             raise ValueError("manifest and licence evidence fields differ")
+        if (
+            self.source_dataset_id != SOURCE_DATASET_ID
+            or self.package_id != PACKAGE_ID
+            or self.licence_id != LICENCE_ID
+            or self.licence_title != LICENCE_TITLE
+            or self.licence_url != LICENCE_URL
+            or self.attribution != _EXPECTED_ATTRIBUTION
+            or self.source_byte_redistribution != "permitted_with_attribution"
+        ):
+            raise ValueError("manifest identity differs from reviewed contract")
         resource_ids = tuple(sorted(item.source_resource_id for item in self.resources))
         if resource_ids != _EXPECTED_RESOURCE_IDS or resource_ids != evidence.source_resource_ids:
             raise ValueError("manifest resource set differs from reviewed evidence")
         if len(self.resources) != 2:
             raise ValueError("manifest must contain exactly two resources")
+        resource_contracts = {
+            item.source_resource_id: (item.licence_area, item.name)
+            for item in self.resources
+        }
+        if resource_contracts != _EXPECTED_RESOURCE_CONTRACTS:
+            raise ValueError("manifest resource identity differs from reviewed contract")
         if self.redirect_host != _REDIRECT_HOST:
             raise ValueError("manifest redirect host differs from reviewed contract")
         if self.redirect_path_prefix != "/dx-sse-prod/resources/":

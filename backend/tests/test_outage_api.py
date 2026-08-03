@@ -344,6 +344,35 @@ def test_outage_list_uses_seeded_temporary_database(
     }
 
 
+def test_health_reports_static_sync_capability_without_local_evidence(
+    empty_client: TestClient,
+) -> None:
+    health = empty_client.get("/api/health")
+    events = empty_client.get("/api/v1/outages/events")
+
+    assert health.status_code == 200
+    assert health.json() == {
+        "status": "ok",
+        "data_status": "verified_analytical_source_available_for_local_sync",
+    }
+    assert events.status_code == 503
+
+
+def test_health_never_denies_queryable_verified_outage_evidence(
+    client: TestClient,
+) -> None:
+    health = client.get("/api/health")
+    events = client.get("/api/v1/outages/events")
+
+    assert health.status_code == 200
+    assert health.json()["data_status"] == (
+        "verified_analytical_source_available_for_local_sync"
+    )
+    assert health.json()["data_status"] != "no_verified_analytical_data"
+    assert events.status_code == 200
+    assert events.json()["total"] == 3
+
+
 def test_outage_detail_exposes_exact_safe_provenance(
     client: TestClient, seeded_db: tuple[Path, dict[str, Any]]
 ) -> None:

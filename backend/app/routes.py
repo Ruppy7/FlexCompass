@@ -64,7 +64,7 @@ def _evidence_scope(
 def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "data_status": "no_verified_analytical_data",
+        "data_status": "verified_analytical_source_available_for_local_sync",
     }
 
 

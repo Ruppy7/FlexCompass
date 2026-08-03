@@ -26,7 +26,9 @@ class TestHealthEndpoints:
         assert response.status_code == 200
         assert response.json() == {
             "status": "ok",
-            "data_status": "no_verified_analytical_data",
+            "data_status": (
+                "verified_analytical_source_available_for_local_sync"
+            ),
         }
 
 
@@ -90,7 +92,11 @@ def test_application_starts_without_opening_the_primary_database(
 ) -> None:
     client, test_db = isolated_api_client
 
-    assert client.get("/api/health").status_code == 200
+    response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["data_status"] == (
+        "verified_analytical_source_available_for_local_sync"
+    )
     assert not test_db.exists()
 
 

@@ -27,6 +27,7 @@ from app.outage_cli import main as outage_cli_main
 from app.outage_source import (
     OwnedProcessSsenTransport,
     SourceLicenceEvidenceArtifactV1,
+    SsenSourceManifestV1,
     _download_resource_in_child,
     _ssen_download_process_worker,
     download_ssen_hv_resource,
@@ -2291,6 +2292,67 @@ def test_ninth_decoding_layer_fails_closed() -> None:
     )
 
     assert sanitise_diagnostic_value(value) == UNSAFE_VALUE_SENTINEL
+
+
+@pytest.mark.parametrize("depth", [0, 1, 4, 8, 9])
+def test_reachable_source_contract_error_hides_signed_header_observation(
+    depth: int,
+) -> None:
+    marker = f"SYNTHETIC_SOURCE_CONTRACT_MARKER_{depth}"
+    target = synthetic_signed_target(marker)
+    unsafe = fully_byte_encoded(target, depth)
+    observed = [*SEPD_COLUMNS[:-1], unsafe]
+    csv_bytes = (",".join(observed) + "\n").encode()
+
+    with pytest.raises(SourceContractError) as caught:
+        list(iter_ssen_hv_csv(csv_bytes, licence_area="SEPD"))
+
+    error = caught.value
+    rendered = "\n".join((str(error), repr(error), repr(error.__dict__)))
+    for forbidden in (marker, target, unsafe):
+        assert forbidden not in rendered
+    assert error.observed == [*SEPD_COLUMNS[:-1], UNSAFE_VALUE_SENTINEL]
+
+
+@pytest.mark.parametrize(
+    "observation_factory",
+    [
+        pytest.param(
+            lambda: "x" * (MAX_PERSISTED_STRING_BYTES + 1),
+            id="oversize",
+        ),
+        pytest.param(
+            lambda: _nested_observation(MAX_CONTAINER_DEPTH + 1),
+            id="too-deep",
+        ),
+        pytest.param(lambda: _cyclic_observation(), id="cyclic"),
+        pytest.param(lambda: {"value": object()}, id="non-json"),
+    ],
+)
+def test_source_contract_error_uses_bounded_diagnostic_fallback(
+    observation_factory: Any,
+) -> None:
+    error = SourceContractError(
+        "SSEN schema drift",
+        observed=observation_factory(),
+    )
+
+    assert error.observed == UNSAFE_VALUE_SENTINEL
+    assert UNSAFE_VALUE_SENTINEL in str(error)
+    assert len(str(error)) < 256
+
+
+def _nested_observation(depth: int) -> list[Any]:
+    value: Any = "leaf"
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _cyclic_observation() -> list[Any]:
+    value: list[Any] = []
+    value.append(value)
+    return value
 
 
 @pytest.mark.parametrize(
@@ -4791,6 +4853,125 @@ def test_sync_signed_target_never_crosses_output_log_file_or_sqlite(
     )
     assert marker not in output
     assert "X-Amz-Signature" not in output
+
+
+@pytest.mark.parametrize("depth", [0, 1, 4, 8, 9])
+def test_sync_schema_contract_error_never_crosses_return_log_file_or_sqlite(
+    depth: int,
+    temp_db: Path,
+    tmp_path: Path,
+    sepd_csv_bytes: bytes,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = f"SYNTHETIC_SYNC_SCHEMA_MARKER_{depth}"
+    target = synthetic_signed_target(marker)
+    unsafe = fully_byte_encoded(target, depth)
+    invalid_shepd = (",".join((*SHEPD_COLUMNS[:-1], unsafe)) + "\n").encode()
+    snapshot_dir = tmp_path / "snapshots"
+    transport = ScriptedDeadlineTransport(
+        {
+            SEPD_RESOURCE_ID: sepd_csv_bytes,
+            SHEPD_RESOURCE_ID: invalid_shepd,
+        }
+    )
+
+    result = sync_ssen_nafirs_hv(
+        db_path=temp_db,
+        snapshot_dir=snapshot_dir,
+        client=transport,
+    )
+
+    with get_connection(temp_db) as connection:
+        sqlite_text = "\n".join(connection.iterdump())
+    file_text = "".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in snapshot_dir.rglob("*")
+        if path.is_file()
+    )
+    rendered = result.model_dump_json() + caplog.text + file_text + sqlite_text
+    assert result.status == "failed"
+    for forbidden in (marker, target, unsafe):
+        assert forbidden not in rendered
+
+
+def _reviewed_manifest_payload() -> dict[str, Any]:
+    manifest_path = (
+        Path(__file__).resolve().parents[2]
+        / "data/sources/ssen-nafirs-hv.json"
+    )
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [
+        ("source_dataset_id", "drifted-nafirs-hv-faults"),
+        ("package_id", "11111111-2222-3333-4444-555555555555"),
+        ("licence_id", "DRIFTED-CC-BY-4.0"),
+        ("licence_title", "Drifted Creative Commons Attribution 4.0"),
+        ("licence_url", "https://example.invalid/drifted-licence"),
+        ("attribution", "Drifted operator"),
+    ],
+)
+def test_runtime_manifest_rejects_coherent_scalar_identity_drift(
+    field: str,
+    drifted_value: str,
+) -> None:
+    raw = _reviewed_manifest_payload()
+    original_value = raw[field]
+    raw[field] = drifted_value
+    raw["licence_evidence"][field] = drifted_value
+    if field in {"source_dataset_id", "package_id"}:
+        for resource in raw["resources"]:
+            resource[field] = drifted_value
+            if field == "package_id":
+                resource["stable_url"] = resource["stable_url"].replace(
+                    original_value,
+                    drifted_value,
+                )
+
+    with pytest.raises(ValidationError):
+        SsenSourceManifestV1.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["swap-areas", "change-sepd-name", "change-shepd-name"],
+)
+def test_runtime_manifest_rejects_resource_drift_before_transport(
+    mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _reviewed_manifest_payload()
+    resources = {
+        resource["source_resource_id"]: resource
+        for resource in raw["resources"]
+    }
+    if mutation == "swap-areas":
+        resources[SEPD_RESOURCE_ID]["licence_area"] = "SHEPD"
+        resources[SHEPD_RESOURCE_ID]["licence_area"] = "SEPD"
+    elif mutation == "change-sepd-name":
+        resources[SEPD_RESOURCE_ID]["name"] = "WRONG SEPD RESOURCE NAME"
+    else:
+        resources[SHEPD_RESOURCE_ID]["name"] = "WRONG SHEPD RESOURCE NAME"
+    mutated_path = tmp_path / f"{mutation}.json"
+    mutated_path.write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setattr(outage_source, "_SOURCE_MANIFEST_PATH", mutated_path)
+    transport = ScriptedDeadlineTransport({})
+    db_path = tmp_path / "must-not-open.sqlite3"
+    snapshot_dir = tmp_path / "must-not-create-snapshots"
+
+    with pytest.raises(ValidationError):
+        sync_ssen_nafirs_hv(
+            db_path=db_path,
+            snapshot_dir=snapshot_dir,
+            client=transport,
+        )
+
+    assert transport.requests == []
+    assert not db_path.exists()
+    assert not snapshot_dir.exists()
 
 
 def test_source_manifest_matches_exact_reviewed_contract() -> None:

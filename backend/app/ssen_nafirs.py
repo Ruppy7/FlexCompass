@@ -16,7 +16,6 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import ValidationError
 
-from app.catalogue_sync import redact
 from app.outages import (
     PARSER_VERSION as OUTAGE_PARSER_VERSION,
 )
@@ -110,7 +109,7 @@ class SourceContractError(ValueError):
         response_status: int | None = None,
         error_code: str = "source_contract_error",
     ) -> None:
-        self.observed = redact(observed)
+        self.observed = sanitise_diagnostic_value(observed)
         self.response_status = response_status
         self.code = error_code
         suffix = (
