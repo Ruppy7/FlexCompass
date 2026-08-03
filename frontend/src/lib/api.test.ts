@@ -12,6 +12,7 @@ import {
   fetchCataloguePortals,
   fetchDemoPortfolios,
   generateDemoReport,
+  isCatalogueAbortError,
 } from "./api";
 import type { Portfolio } from "./types";
 
@@ -494,6 +495,16 @@ it("does not swallow AbortError", async () => {
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(abortError));
 
   await expect(fetchCataloguePortals()).rejects.toBe(abortError);
+});
+
+it("identifies only AbortError values for catalogue UI cancellation", () => {
+  expect(
+    isCatalogueAbortError(new DOMException("The operation was aborted", "AbortError")),
+  ).toBe(true);
+  expect(isCatalogueAbortError(new Error("Failed to fetch catalogue portals"))).toBe(
+    false,
+  );
+  expect(isCatalogueAbortError(null)).toBe(false);
 });
 
 it("uses only the labelled demo analysis contract", async () => {

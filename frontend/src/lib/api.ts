@@ -236,7 +236,7 @@ function isPageOf<T>(
   );
 }
 
-function isAbortError(error: unknown): boolean {
+export function isCatalogueAbortError(error: unknown): boolean {
   return isRecord(error) && error.name === "AbortError";
 }
 
@@ -253,7 +253,7 @@ async function parseCatalogueResponse<T>(
   try {
     payload = await response.json();
   } catch (error: unknown) {
-    if (isAbortError(error)) {
+    if (isCatalogueAbortError(error)) {
       throw error;
     }
     throw new Error(invalidMessage);
@@ -283,7 +283,7 @@ async function catalogueGet<T>(
   try {
     response = await fetch(`${CATALOGUE_BASE}${path}`, catalogueRequestInit(options));
   } catch (error: unknown) {
-    if (isAbortError(error)) {
+    if (isCatalogueAbortError(error)) {
       throw error;
     }
     throw new Error(failureMessage);
