@@ -50,6 +50,20 @@ def refresh_attempt_key(portal_id: str, attempted_at: datetime) -> str:
     return f"{portal_id}:attempt:{digest}"
 
 
+def catalogue_assessment_key(
+    portal_id: str,
+    source_dataset_id: str,
+    observation_id: str,
+    assessment_type: str,
+) -> str:
+    """Return an observation-specific identity for a derived assessment."""
+    stable = (
+        f"{portal_id}\n{source_dataset_id}\n"
+        f"{observation_id}\n{assessment_type}"
+    )
+    return hashlib.sha256(stable.encode()).hexdigest()
+
+
 def record_catalogue_refresh_attempt(
     conn: sqlite3.Connection,
     *,
@@ -634,6 +648,23 @@ def list_catalogue_assessments(
            WHERE dataset.portal_id = ? AND dataset.source_dataset_id = ?
            ORDER BY assessment.assessed_at, assessment.assessment_id""",
         (portal_id, source_dataset_id),
+    )
+    columns = [item[0] for item in cursor.description]
+    return [_decoded_row(row, columns) for row in cursor.fetchall()]
+
+
+def list_catalogue_assessments_for_observation(
+    conn: sqlite3.Connection,
+    portal_id: str,
+    source_dataset_id: str,
+    observation_id: str,
+) -> list[dict[str, Any]]:
+    """Return assessments recorded for one exact immutable observation."""
+    cursor = conn.execute(
+        """SELECT assessment.* FROM catalogue_assessments AS assessment
+           WHERE assessment.dataset_key = ? AND assessment.observation_id = ?
+           ORDER BY assessment.assessment_type, assessment.assessment_id""",
+        (_dataset_key(portal_id, source_dataset_id), observation_id),
     )
     columns = [item[0] for item in cursor.description]
     return [_decoded_row(row, columns) for row in cursor.fetchall()]

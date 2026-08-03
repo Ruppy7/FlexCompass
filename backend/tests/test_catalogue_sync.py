@@ -816,3 +816,31 @@ def test_q3_snapshot_does_not_mutate_fetched_adapter_objects(tmp_path: Path):
         summary.portals["nged"].snapshot_path.read_text(encoding="utf-8")
     )
     assert snapshot["datasets"][0]["lifecycle_status"] == "unknown"
+
+
+def test_fresh_assessment_ids_are_observation_specific(tmp_path: Path):
+    summary = run_sync(tmp_path, {"nged": make_result("nged")})
+    with get_connection(tmp_path / "catalogue.sqlite3") as conn:
+        observation_id = conn.execute(
+            "SELECT observation_id FROM catalogue_observations"
+        ).fetchone()[0]
+        rows = [
+            tuple(row)
+            for row in conn.execute(
+                """SELECT assessment_id, assessment_type, observation_id
+                   FROM catalogue_assessments ORDER BY assessment_type"""
+            )
+        ]
+
+    assert summary.status == "complete"
+    assert rows
+    assert {row[2] for row in rows} == {observation_id}
+    assert {
+        row[0]
+        for row in rows
+    } == {
+        hashlib.sha256(
+            f"nged\npublic-dataset\n{observation_id}\n{row[1]}".encode()
+        ).hexdigest()
+        for row in rows
+    }
