@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -482,8 +483,16 @@ def test_legacy_assessment_id_is_not_relabelled_as_snapshot_truth(
     assert repository.list_last_valid_assessments("nged", "newest") == ()
 
 
+@pytest.mark.parametrize(
+    "malformed_observed_at",
+    [
+        pytest.param("not-a-timestamp", id="text"),
+        pytest.param(sqlite3.Binary(b"not-a-timestamp"), id="blob"),
+    ],
+)
 def test_malformed_newest_observation_metadata_preserves_older_fallback(
     tmp_path: Path,
+    malformed_observed_at: object,
 ) -> None:
     repository, _, older_id, newest_id = (
         _repository_with_two_complete_snapshots(tmp_path)
@@ -492,7 +501,7 @@ def test_malformed_newest_observation_metadata_preserves_older_fallback(
         connection.execute(
             """UPDATE catalogue_observations SET observed_at = ?
                WHERE observation_id = ?""",
-            ("not-a-timestamp", newest_id),
+            (malformed_observed_at, newest_id),
         )
 
     state = repository.portal_state("nged", now=NOW)

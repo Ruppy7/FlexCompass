@@ -45,16 +45,18 @@ class PortalState:
     snapshot_available: bool
 
 
-def _timestamp(value: str | None) -> datetime | None:
+def _timestamp(value: object | None) -> datetime | None:
     if value is None:
         return None
+    if not isinstance(value, str):
+        raise ValueError("catalogue repository timestamp must be text")
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("catalogue repository timestamps must include a timezone")
     return parsed.astimezone(timezone.utc)
 
 
-def _safe_timestamp(value: str | None) -> datetime | None:
+def _safe_timestamp(value: object | None) -> datetime | None:
     """Project unvalidated display metadata without defeating fallback."""
     try:
         return _timestamp(value)
