@@ -54,6 +54,14 @@ def _timestamp(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _safe_timestamp(value: str | None) -> datetime | None:
+    """Project unvalidated display metadata without defeating fallback."""
+    try:
+        return _timestamp(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class CatalogueRepository:
     """Select last-valid evidence without consulting mutable registry rows."""
 
@@ -191,7 +199,7 @@ class CatalogueRepository:
                 latest_complete["observation_id"] if latest_complete else None
             ),
             last_complete_observed_at=(
-                _timestamp(latest_complete["observed_at"])
+                _safe_timestamp(latest_complete["observed_at"])
                 if latest_complete
                 else None
             ),
@@ -279,6 +287,11 @@ class CatalogueRepository:
     ) -> tuple[dict[str, object], ...]:
         snapshot = self._last_valid_snapshot(portal_id)
         if snapshot is None:
+            return ()
+        if not any(
+            dataset.source_dataset_id == source_dataset_id
+            for dataset in snapshot.datasets
+        ):
             return ()
         with get_connection(self.db_path) as connection:
             rows = list_catalogue_assessments_for_observation(

@@ -20,6 +20,7 @@ from app.catalogue_models import (
 from app.catalogue_repository import CatalogueRepository
 from app.catalogue_snapshot import load_catalogue_snapshot
 from app.catalogue_store import (
+    catalogue_assessment_key,
     observation_key,
     persist_catalogue_assessment,
     persist_catalogue_result,
@@ -479,3 +480,70 @@ def test_legacy_assessment_id_is_not_relabelled_as_snapshot_truth(
         )
 
     assert repository.list_last_valid_assessments("nged", "newest") == ()
+
+
+def test_malformed_newest_observation_metadata_preserves_older_fallback(
+    tmp_path: Path,
+) -> None:
+    repository, _, older_id, newest_id = (
+        _repository_with_two_complete_snapshots(tmp_path)
+    )
+    with get_connection(repository.db_path) as connection:
+        connection.execute(
+            """UPDATE catalogue_observations SET observed_at = ?
+               WHERE observation_id = ?""",
+            ("not-a-timestamp", newest_id),
+        )
+
+    state = repository.portal_state("nged", now=NOW)
+
+    assert state.last_complete_observation_id == newest_id
+    assert state.last_complete_observed_at is None
+    assert state.latest_complete_snapshot_valid is False
+    assert state.last_valid_observation_id == older_id
+    assert state.degraded is True
+    assert state.snapshot_available is True
+
+
+def test_assessments_exclude_mutable_only_dataset_absent_from_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository, _, _, newest_id = _repository_with_two_complete_snapshots(
+        tmp_path
+    )
+    partial_path, partial_hash, partial_result = _write_snapshot(
+        repository.snapshot_root,
+        "partial/phantom.json",
+        NOW,
+        (_dataset("phantom", NOW),),
+        complete=False,
+    )
+    _persist_snapshot(
+        repository.db_path,
+        partial_path,
+        partial_hash,
+        partial_result,
+        status="partial",
+    )
+    with get_connection(repository.db_path) as connection:
+        persist_catalogue_assessment(
+            connection,
+            assessment_id=catalogue_assessment_key(
+                "nged",
+                "phantom",
+                newest_id,
+                "maintenance",
+            ),
+            portal_id="nged",
+            source_dataset_id="phantom",
+            observation_id=newest_id,
+            assessment_type="maintenance",
+            assessment_value="unknown",
+            confidence="unknown",
+            rationale=["Mutable-only derived row."],
+            missing_evidence=["immutable dataset membership"],
+            assessed_at=NOW,
+        )
+
+    assert repository.get_last_valid_dataset("nged", "phantom") is None
+    assert repository.list_last_valid_assessments("nged", "phantom") == ()
