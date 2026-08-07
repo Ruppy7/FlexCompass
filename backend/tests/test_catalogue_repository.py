@@ -456,6 +456,28 @@ def test_valid_historical_backfill_does_not_replace_chronologically_latest_attem
     assert state.current_attempt_at == NOW - timedelta(days=1)
 
 
+def test_more_than_one_thousand_backfills_preserve_chronological_current_attempt(
+    tmp_path: Path,
+) -> None:
+    repository, _, _, _ = _repository_with_two_complete_snapshots(tmp_path)
+    with get_connection(repository.db_path) as connection:
+        for seconds in range(1000):
+            record_catalogue_refresh_attempt(
+                connection,
+                portal_id="nged",
+                attempted_at=NOW - timedelta(days=10, seconds=seconds),
+                status="failed",
+                observation_id=None,
+                warnings=(),
+                safe_error_text="Historical backfill.",
+            )
+
+    state = repository.portal_state("nged", now=NOW)
+
+    assert state.current_attempt_status == "complete"
+    assert state.current_attempt_at == NOW - timedelta(days=1)
+
+
 def test_later_valid_append_restores_current_attempt_after_malformed_row(
     tmp_path: Path,
 ) -> None:

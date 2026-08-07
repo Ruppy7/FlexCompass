@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +23,6 @@ from app.catalogue_store import (
 from app.db import get_connection
 
 ReviewStatus = Literal["current", "overdue", "never_attempted"]
-ATTEMPT_SELECTION_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -111,18 +111,20 @@ def _project_attempt(
 
 
 def _select_current_attempt(
-    attempts: list[sqlite3.Row],
+    attempts: Iterable[sqlite3.Row],
 ) -> tuple[str, datetime, int, str | None] | None:
-    if not attempts:
+    attempt_iterator = iter(attempts)
+    latest_appended = next(attempt_iterator, None)
+    if latest_appended is None:
         return None
     try:
-        selected = _project_attempt(attempts[0])
+        selected = _project_attempt(latest_appended)
     except ValueError:
         return None
     if selected is None:
         return None
-    selected_rowid = attempts[0]["ledger_rowid"]
-    for attempt in attempts[1:]:
+    selected_rowid = latest_appended["ledger_rowid"]
+    for attempt in attempt_iterator:
         try:
             candidate = _project_attempt(attempt)
         except ValueError:
@@ -220,10 +222,10 @@ class CatalogueRepository:
                           warning_count, safe_error
                    FROM catalogue_refresh_attempts
                    WHERE portal_id = ?
-                   ORDER BY rowid DESC
-                   LIMIT ?""",
-                (portal_id, ATTEMPT_SELECTION_LIMIT),
-            ).fetchall()
+                   ORDER BY rowid DESC""",
+                (portal_id,),
+            )
+            projected_attempt = _select_current_attempt(attempts)
             complete_rows = self._complete_rows(connection, portal_id)
 
         latest_complete = complete_rows[0] if complete_rows else None
@@ -243,7 +245,6 @@ class CatalogueRepository:
             last_valid_snapshot = loaded
             break
 
-        projected_attempt = _select_current_attempt(attempts)
         current_attempt_status = (
             projected_attempt[0] if projected_attempt is not None else None
         )
