@@ -405,6 +405,8 @@ def test_blob_snapshot_path_preserves_older_valid_snapshot(
 @pytest.mark.parametrize(
     "malformed_attempted_at",
     [
+        pytest.param("", id="empty-text"),
+        pytest.param(" ", id="whitespace-text"),
         pytest.param("zz-not-a-timestamp", id="text"),
         pytest.param(sqlite3.Binary(b"not-a-timestamp"), id="blob"),
     ],
@@ -431,6 +433,56 @@ def test_malformed_latest_attempt_is_absent_without_relabelling_older_attempt(
     assert state.review_status == "never_attempted"
     assert state.last_valid_observation_id == newest_id
     assert state.snapshot_available is True
+
+
+def test_valid_historical_backfill_does_not_replace_chronologically_latest_attempt(
+    tmp_path: Path,
+) -> None:
+    repository, _, _, _ = _repository_with_two_complete_snapshots(tmp_path)
+    with get_connection(repository.db_path) as connection:
+        record_catalogue_refresh_attempt(
+            connection,
+            portal_id="nged",
+            attempted_at=NOW - timedelta(days=3),
+            status="failed",
+            observation_id=None,
+            warnings=(),
+            safe_error_text="Historical failure.",
+        )
+
+    state = repository.portal_state("nged", now=NOW)
+
+    assert state.current_attempt_status == "complete"
+    assert state.current_attempt_at == NOW - timedelta(days=1)
+
+
+def test_later_valid_append_restores_current_attempt_after_malformed_row(
+    tmp_path: Path,
+) -> None:
+    repository, _, _, _ = _repository_with_two_complete_snapshots(tmp_path)
+    with get_connection(repository.db_path) as connection:
+        connection.execute(
+            """UPDATE catalogue_refresh_attempts SET attempted_at = ''
+               WHERE attempted_at = ?""",
+            ((NOW - timedelta(days=1)).isoformat(),),
+        )
+        record_catalogue_refresh_attempt(
+            connection,
+            portal_id="nged",
+            attempted_at=NOW,
+            status="failed",
+            observation_id=None,
+            warnings=("One warning.",),
+            safe_error_text="Latest safe failure.",
+        )
+
+    state = repository.portal_state("nged", now=NOW)
+
+    assert state.current_attempt_status == "failed"
+    assert state.current_attempt_at == NOW
+    assert state.current_attempt_warning_count == 1
+    assert state.current_attempt_safe_error == "Latest safe failure."
+    assert state.review_status == "current"
 
 
 def test_all_complete_snapshots_invalid_is_unavailable_without_mutable_fallback(

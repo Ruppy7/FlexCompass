@@ -22,6 +22,7 @@ from app.catalogue_store import (
 from app.db import get_connection
 
 ReviewStatus = Literal["current", "overdue", "never_attempted"]
+ATTEMPT_SELECTION_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,32 @@ def _project_attempt(
     return status, attempted_at, warning_count, safe_error
 
 
+def _select_current_attempt(
+    attempts: list[sqlite3.Row],
+) -> tuple[str, datetime, int, str | None] | None:
+    if not attempts:
+        return None
+    try:
+        selected = _project_attempt(attempts[0])
+    except ValueError:
+        return None
+    if selected is None:
+        return None
+    selected_rowid = attempts[0]["ledger_rowid"]
+    for attempt in attempts[1:]:
+        try:
+            candidate = _project_attempt(attempt)
+        except ValueError:
+            continue
+        if candidate is not None and (candidate[1], attempt["ledger_rowid"]) > (
+            selected[1],
+            selected_rowid,
+        ):
+            selected = candidate
+            selected_rowid = attempt["ledger_rowid"]
+    return selected
+
+
 class CatalogueRepository:
     """Select last-valid evidence without consulting mutable registry rows."""
 
@@ -188,14 +215,15 @@ class CatalogueRepository:
             raise ValueError("now must include a timezone")
         now_utc = now.astimezone(timezone.utc)
         with get_connection(self.db_path) as connection:
-            attempt = connection.execute(
-                """SELECT status, attempted_at, warning_count, safe_error
+            attempts = connection.execute(
+                """SELECT rowid AS ledger_rowid, status, attempted_at,
+                          warning_count, safe_error
                    FROM catalogue_refresh_attempts
                    WHERE portal_id = ?
-                   ORDER BY attempted_at DESC, created_at DESC, attempt_id DESC
-                   LIMIT 1""",
-                (portal_id,),
-            ).fetchone()
+                   ORDER BY rowid DESC
+                   LIMIT ?""",
+                (portal_id, ATTEMPT_SELECTION_LIMIT),
+            ).fetchall()
             complete_rows = self._complete_rows(connection, portal_id)
 
         latest_complete = complete_rows[0] if complete_rows else None
@@ -215,10 +243,7 @@ class CatalogueRepository:
             last_valid_snapshot = loaded
             break
 
-        try:
-            projected_attempt = _project_attempt(attempt)
-        except ValueError:
-            projected_attempt = None
+        projected_attempt = _select_current_attempt(attempts)
         current_attempt_status = (
             projected_attempt[0] if projected_attempt is not None else None
         )
