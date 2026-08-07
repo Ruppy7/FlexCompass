@@ -7,7 +7,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from app.catalogue_adapters import CatalogueFetchResult
 from app.catalogue_models import CatalogueDataset, ClassificationEvidence, DatasetResource
@@ -41,6 +41,91 @@ def observation_key(portal_id: str, observed_at: datetime, content_hash: str) ->
     observed = _timestamp(observed_at)
     digest = hashlib.sha256(f"{portal_id}\n{observed}\n{content_hash}".encode()).hexdigest()
     return f"{portal_id}:{digest}"
+
+
+def refresh_attempt_key(portal_id: str, attempted_at: datetime) -> str:
+    """Return the deterministic identity of one portal refresh attempt."""
+    attempted = _timestamp(attempted_at)
+    digest = hashlib.sha256(f"{portal_id}\n{attempted}".encode()).hexdigest()
+    return f"{portal_id}:attempt:{digest}"
+
+
+def catalogue_assessment_key(
+    portal_id: str,
+    source_dataset_id: str,
+    observation_id: str,
+    assessment_type: str,
+) -> str:
+    """Return an observation-specific identity for a derived assessment."""
+    stable = (
+        f"{portal_id}\n{source_dataset_id}\n"
+        f"{observation_id}\n{assessment_type}"
+    )
+    return hashlib.sha256(stable.encode()).hexdigest()
+
+
+def record_catalogue_refresh_attempt(
+    conn: sqlite3.Connection,
+    *,
+    portal_id: str,
+    attempted_at: datetime,
+    status: ObservationStatus,
+    observation_id: str | None,
+    warnings: Sequence[str],
+    safe_error_text: str | None,
+) -> str:
+    """Append one safe, immutable refresh outcome to the attempt ledger."""
+    if status not in {"complete", "partial", "failed"}:
+        raise ValueError(f"unsupported catalogue refresh status: {status}")
+    if status == "failed":
+        if observation_id is not None:
+            raise ValueError("failed catalogue refresh attempts cannot reference an observation")
+    elif observation_id is None:
+        raise ValueError("successful catalogue refresh attempts require an observation")
+    else:
+        observation = conn.execute(
+            """SELECT portal_id, status FROM catalogue_observations
+               WHERE observation_id = ?""",
+            (observation_id,),
+        ).fetchone()
+        if observation is None or tuple(observation) != (portal_id, status):
+            raise ValueError(
+                "catalogue refresh observation must match attempt portal and status"
+            )
+
+    attempted = _timestamp(attempted_at)
+    attempt_id = refresh_attempt_key(portal_id, attempted_at)
+    values = (
+        attempt_id,
+        portal_id,
+        attempted,
+        status,
+        observation_id,
+        len(warnings),
+        safe_error_text,
+    )
+    try:
+        conn.execute(
+            """INSERT INTO catalogue_refresh_attempts (
+                   attempt_id, portal_id, attempted_at, status, observation_id,
+                   warning_count, safe_error
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            values,
+        )
+    except sqlite3.IntegrityError as error:
+        existing = conn.execute(
+            """SELECT attempt_id, portal_id, attempted_at, status,
+                      observation_id, warning_count, safe_error
+               FROM catalogue_refresh_attempts
+               WHERE portal_id = ? AND attempted_at = ?""",
+            (portal_id, attempted),
+        ).fetchone()
+        if existing is not None and tuple(existing) == values:
+            return attempt_id
+        raise ValueError(
+            "conflicting catalogue refresh attempt already exists for portal and time"
+        ) from error
+    return attempt_id
 
 
 def _dataset_key(portal_id: str, source_dataset_id: str) -> str:
@@ -563,6 +648,23 @@ def list_catalogue_assessments(
            WHERE dataset.portal_id = ? AND dataset.source_dataset_id = ?
            ORDER BY assessment.assessed_at, assessment.assessment_id""",
         (portal_id, source_dataset_id),
+    )
+    columns = [item[0] for item in cursor.description]
+    return [_decoded_row(row, columns) for row in cursor.fetchall()]
+
+
+def list_catalogue_assessments_for_observation(
+    conn: sqlite3.Connection,
+    portal_id: str,
+    source_dataset_id: str,
+    observation_id: str,
+) -> list[dict[str, Any]]:
+    """Return assessments recorded for one exact immutable observation."""
+    cursor = conn.execute(
+        """SELECT assessment.* FROM catalogue_assessments AS assessment
+           WHERE assessment.dataset_key = ? AND assessment.observation_id = ?
+           ORDER BY assessment.assessment_type, assessment.assessment_id""",
+        (_dataset_key(portal_id, source_dataset_id), observation_id),
     )
     columns = [item[0] for item in cursor.description]
     return [_decoded_row(row, columns) for row in cursor.fetchall()]

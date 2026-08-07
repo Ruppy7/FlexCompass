@@ -16,14 +16,30 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from app import catalogue_snapshot
 from app.catalogue_adapters import CatalogueFetchResult, fetch_catalogue
 from app.catalogue_classifier import DatasetAssessment, MaintenancePolicy, classify_dataset, load_policy
 from app.catalogue_models import CATALOGUE_PORTALS, CatalogueDataset, CataloguePortalConfig, DatasetResource
-from app.catalogue_store import persist_catalogue_assessment, persist_catalogue_result
+from app.catalogue_store import (
+    catalogue_assessment_key,
+    persist_catalogue_assessment,
+    persist_catalogue_result,
+    record_catalogue_refresh_attempt,
+)
 from app.db import get_connection, run_migrations
 
 ADAPTER_VERSION = "1"
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = catalogue_snapshot.SNAPSHOT_SCHEMA_VERSION
+_canonical_json = catalogue_snapshot.canonical_json
+_comparable_resources = catalogue_snapshot.comparable_resources
+_normalise_semantically_unordered = (
+    catalogue_snapshot.normalise_semantically_unordered
+)
+_snapshot_identity = catalogue_snapshot.snapshot_identity
+_validated_snapshot = catalogue_snapshot.validate_catalogue_snapshot_payload
+_without_model_observation_clock = (
+    catalogue_snapshot.without_model_observation_clock
+)
 SyncStatus = Literal["complete", "partial", "failed"]
 
 
@@ -73,15 +89,6 @@ class SnapshotDiff:
     before: Path
     after: Path
     changes: tuple[SnapshotChange, ...]
-
-
-def _canonical_json(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
 
 
 _SENSITIVE_KEY = re.compile(
@@ -437,95 +444,6 @@ def _snapshot_core(result: CatalogueFetchResult) -> dict[str, Any]:
     )
 
 
-def _without_model_observation_clock(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Strip generated model clocks without changing embedded source provenance."""
-    cleaned = {key: item for key, item in value.items() if key != "observed_at"}
-    for nested_field in ("resources", "classification_evidence"):
-        nested = cleaned.get(nested_field)
-        if isinstance(nested, list):
-            cleaned[nested_field] = [
-                _without_model_observation_clock(item) if isinstance(item, Mapping) else item
-                for item in nested
-            ]
-    return cleaned
-
-
-def _snapshot_identity(core: Mapping[str, Any]) -> dict[str, Any]:
-    """Return hash input with only FlexCompass-generated clocks removed."""
-    identity = dict(core)
-    for model_collection in ("datasets", "resources"):
-        values = identity.get(model_collection)
-        if isinstance(values, list):
-            identity[model_collection] = [
-                _without_model_observation_clock(item) if isinstance(item, Mapping) else item
-                for item in values
-            ]
-    normalised = _normalise_semantically_unordered(identity)
-    if not isinstance(normalised, dict):
-        raise ValueError("snapshot identity must be a JSON object")
-    return normalised
-
-
-_UNORDERED_SOURCE_LIST_KEYS = frozenset(
-    {
-        "attachments",
-        "alternative_exports",
-        "classification_evidence",
-        "datasets",
-        "groups",
-        "resources",
-        "results",
-        "tags",
-        "themes",
-    }
-)
-_UNORDERED_IDENTITY_FIELDS = {
-    "attachments": ("id", "url", "name", "title"),
-    "alternative_exports": ("id", "url", "name", "title"),
-    "classification_evidence": ("id",),
-    "datasets": ("source_dataset_id", "id"),
-    "groups": ("id", "name", "title"),
-    "resources": ("id", "source_resource_id", "url", "name", "title"),
-    "results": ("name", "id", "dataset_id", "dataset_uid"),
-}
-
-
-def _unordered_source_item_key(
-    field_name: str | None,
-    value: Any,
-) -> tuple[str, bytes]:
-    if isinstance(value, Mapping):
-        for identity_field in _UNORDERED_IDENTITY_FIELDS.get(field_name or "", ()):
-            identity = value.get(identity_field)
-            if isinstance(identity, str) and identity:
-                return identity, _canonical_json(value)
-    return "", _canonical_json(value)
-
-
-def _normalise_semantically_unordered(
-    value: Any,
-    field_name: str | None = None,
-) -> Any:
-    """Normalise known set-like source arrays without mutating raw provenance."""
-    if isinstance(value, Mapping):
-        return {
-            key: _normalise_semantically_unordered(item, str(key))
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        items = [
-            _normalise_semantically_unordered(item)
-            for item in value
-        ]
-        if field_name in _UNORDERED_SOURCE_LIST_KEYS:
-            return sorted(
-                items,
-                key=lambda item: _unordered_source_item_key(field_name, item),
-            )
-        return items
-    return value
-
-
 def _redacted_result(result: CatalogueFetchResult, core: Mapping[str, Any]) -> CatalogueFetchResult:
     """Rebuild persistence contracts from the same redacted snapshot content."""
     return CatalogueFetchResult(
@@ -611,7 +529,12 @@ def _persist_assessments(
             unknown = getattr(value, "value", value) == "unknown"
             persist_catalogue_assessment(
                 conn,
-                assessment_id=f"{dataset.portal_id}:{dataset.source_dataset_id}:{name}",
+                assessment_id=catalogue_assessment_key(
+                    dataset.portal_id,
+                    dataset.source_dataset_id,
+                    observation_id,
+                    name,
+                ),
                 portal_id=dataset.portal_id,
                 source_dataset_id=dataset.source_dataset_id,
                 observation_id=observation_id,
@@ -704,6 +627,15 @@ def _sync_one(
                 status=status,
             )
             _persist_assessments(conn, persisted.observation_id, assessments, now)
+            record_catalogue_refresh_attempt(
+                conn,
+                portal_id=portal_id,
+                attempted_at=now,
+                status=status,
+                observation_id=persisted.observation_id,
+                warnings=result.warnings,
+                safe_error_text=None,
+            )
             _write_json_atomic(snapshot_path, {"manifest": manifest, **core})
     except Exception:
         if not snapshot_existed:
@@ -762,11 +694,22 @@ def sync_catalogues(
             outcomes[portal_id] = outcome
             review_items.extend(items)
         except Exception as error:  # failures are isolated at the portal boundary
+            error_text = safe_error(error)
+            with get_connection(db_path) as conn:
+                record_catalogue_refresh_attempt(
+                    conn,
+                    portal_id=portal_id,
+                    attempted_at=now,
+                    status="failed",
+                    observation_id=None,
+                    warnings=(),
+                    safe_error_text=error_text,
+                )
             outcomes[portal_id] = PortalSyncOutcome(
                 portal_id=portal_id,
                 status="failed",
                 observed_at=now,
-                error=safe_error(error),
+                error=error_text,
             )
     statuses = {outcome.status for outcome in outcomes.values()}
     if statuses == {"complete"}:
@@ -828,107 +771,6 @@ def _normalise_review_item(value: Any) -> dict[str, Any] | None:
         stable = "\n".join(str(item[field]) for field in stable_fields)
         item["id"] = hashlib.sha256(stable.encode()).hexdigest()
     return item
-
-
-def _snapshot_portal(payload: Any) -> str:
-    if not isinstance(payload, Mapping):
-        raise ValueError("snapshot must be a JSON object")
-    manifest = payload.get("manifest")
-    portal_id = manifest.get("portal_id") if isinstance(manifest, Mapping) else None
-    if not isinstance(portal_id, str) or not portal_id:
-        raise ValueError("snapshot manifest must contain portal_id")
-    return portal_id
-
-
-@dataclass(frozen=True)
-class _ValidatedSnapshot:
-    portal_id: str
-    complete: bool
-    datasets: Mapping[str, Mapping[str, Any]]
-
-
-def _validated_snapshot(payload: Any) -> _ValidatedSnapshot:
-    """Validate manifest, provenance graph, and content identity for a snapshot."""
-    portal_id = _snapshot_portal(payload)
-    manifest = payload["manifest"]
-    if manifest.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
-        raise ValueError("unsupported snapshot schema version")
-    status = manifest.get("portal_status")
-    complete = manifest.get("complete")
-    if status not in {"complete", "partial"} or not isinstance(complete, bool):
-        raise ValueError("snapshot manifest has invalid completeness semantics")
-    if complete != (status == "complete"):
-        raise ValueError("snapshot manifest has inconsistent completeness semantics")
-
-    collections: dict[str, list[Any]] = {}
-    for field in ("datasets", "resources", "raw_pages"):
-        value = payload.get(field)
-        if not isinstance(value, list):
-            raise ValueError(f"snapshot {field} must be a list")
-        collections[field] = value
-    datasets = collections["datasets"]
-    resources = collections["resources"]
-    if manifest.get("dataset_count") != len(datasets):
-        raise ValueError("snapshot manifest dataset count is inconsistent")
-    if manifest.get("resource_count") != len(resources):
-        raise ValueError("snapshot manifest resource count is inconsistent")
-
-    dataset_map: dict[str, Mapping[str, Any]] = {}
-    nested_resources: list[Any] = []
-    for dataset in datasets:
-        if not isinstance(dataset, Mapping):
-            raise ValueError("snapshot dataset must be a JSON object")
-        source_id = dataset.get("source_dataset_id")
-        if not isinstance(source_id, str) or not source_id:
-            raise ValueError("snapshot dataset must contain source_dataset_id")
-        if dataset.get("portal_id") != portal_id:
-            raise ValueError("snapshot dataset portal association is invalid")
-        if source_id in dataset_map:
-            raise ValueError("snapshot dataset identifiers must be unique")
-        dataset_map[source_id] = dataset
-        dataset_resources = dataset.get("resources")
-        if not isinstance(dataset_resources, list):
-            raise ValueError("snapshot nested resources must be a list")
-        nested_resources.extend(dataset_resources)
-
-    for resource in resources:
-        if not isinstance(resource, Mapping):
-            raise ValueError("snapshot resource must be a JSON object")
-        if resource.get("portal_id") != portal_id:
-            raise ValueError("snapshot resource portal association is invalid")
-        if resource.get("source_dataset_id") not in dataset_map:
-            raise ValueError("snapshot resource dataset association is invalid")
-    if _comparable_resources(nested_resources) != _comparable_resources(resources):
-        raise ValueError("snapshot nested and top-level resources are inconsistent")
-
-    expected_count = manifest.get("expected_count")
-    if complete and (
-        not isinstance(expected_count, int)
-        or isinstance(expected_count, bool)
-        or expected_count < 0
-        or len(dataset_map) != expected_count
-    ):
-        raise ValueError(
-            "complete snapshot must match its expected unique usable dataset count"
-        )
-
-    core = {field: collections[field] for field in collections}
-    expected_hash = hashlib.sha256(
-        _canonical_json(_snapshot_identity(core))
-    ).hexdigest()
-    if manifest.get("content_hash") != expected_hash:
-        raise ValueError("snapshot content hash does not match its source state")
-    return _ValidatedSnapshot(portal_id, complete, dataset_map)
-
-
-def _comparable_resources(value: Any) -> Any:
-    if not isinstance(value, list):
-        return value
-    resources = [
-        _without_model_observation_clock(item) if isinstance(item, Mapping) else item
-        for item in value
-    ]
-    return _normalise_semantically_unordered(resources, "resources")
 
 
 _SOURCE_METADATA_FIELDS = (

@@ -13,6 +13,7 @@ import httpx
 
 from app.catalogue_models import CATALOGUE_PORTALS, CataloguePortalConfig
 from app.catalogue_sync import diff_snapshots, redact, safe_error, summary_as_json, sync_catalogues
+from app.config import config
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -35,8 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=sync_description,
     )
     sync.add_argument("--portal", choices=("all", *CATALOGUE_PORTALS), default="all")
-    sync.add_argument("--db-path", type=Path, default=ROOT / "data" / "cache" / "catalogue" / "registry.sqlite3")
-    sync.add_argument("--output-dir", type=Path, default=ROOT / "data" / "snapshots" / "catalogues")
+    sync.add_argument("--db-path", type=Path, default=config.catalogue_db_path)
+    sync.add_argument("--output-dir", type=Path, default=config.catalogue_snapshot_dir)
     sync.add_argument(
         "--review-queue-path",
         type=Path,

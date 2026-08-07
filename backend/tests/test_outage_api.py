@@ -276,7 +276,13 @@ def client(
 ) -> Iterator[TestClient]:
     outage_db, _ = seeded_db
     app_db_path = tmp_path / "app.sqlite3"
-    permitted = {outage_db.resolve(), app_db_path.resolve()}
+    catalogue_db = tmp_path / "catalogue.sqlite3"
+    catalogue_snapshots = tmp_path / "catalogue-snapshots"
+    permitted = {
+        outage_db.resolve(),
+        app_db_path.resolve(),
+        catalogue_db.resolve(),
+    }
     opened: list[Path] = []
     real_connect = sqlite3.connect
 
@@ -291,8 +297,12 @@ def client(
 
     old_app_db = config.db_path
     old_outage_db = config.outage_db_path
+    old_catalogue_db = config.catalogue_db_path
+    old_catalogue_snapshots = config.catalogue_snapshot_dir
     object.__setattr__(config, "db_path", app_db_path)
     object.__setattr__(config, "outage_db_path", outage_db)
+    object.__setattr__(config, "catalogue_db_path", catalogue_db)
+    object.__setattr__(config, "catalogue_snapshot_dir", catalogue_snapshots)
     monkeypatch.setattr(app_db.sqlite3, "connect", guarded_connect)
     try:
         from app.main import app
@@ -302,7 +312,14 @@ def client(
     finally:
         object.__setattr__(config, "db_path", old_app_db)
         object.__setattr__(config, "outage_db_path", old_outage_db)
+        object.__setattr__(config, "catalogue_db_path", old_catalogue_db)
+        object.__setattr__(
+            config,
+            "catalogue_snapshot_dir",
+            old_catalogue_snapshots,
+        )
     assert outage_db.resolve() in opened
+    assert catalogue_db.resolve() in opened
     assert app_db_path.resolve() not in opened
     assert set(opened) <= permitted
 
@@ -314,10 +331,34 @@ def empty_client(
 ) -> Iterator[TestClient]:
     outage_db = tmp_path / "empty-outages.sqlite3"
     app_db_path = tmp_path / "empty-app.sqlite3"
+    catalogue_db = tmp_path / "empty-catalogue.sqlite3"
+    catalogue_snapshots = tmp_path / "empty-catalogue-snapshots"
+    permitted = {
+        outage_db.resolve(),
+        app_db_path.resolve(),
+        catalogue_db.resolve(),
+    }
+    opened: list[Path] = []
+    real_connect = sqlite3.connect
+
+    def guarded_connect(
+        database: str | Path, *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        resolved = Path(database).resolve()
+        if resolved not in permitted:
+            raise AssertionError(f"application opened unexpected DB: {resolved}")
+        opened.append(resolved)
+        return real_connect(str(resolved), *args, **kwargs)
+
     old_app_db = config.db_path
     old_outage_db = config.outage_db_path
+    old_catalogue_db = config.catalogue_db_path
+    old_catalogue_snapshots = config.catalogue_snapshot_dir
     object.__setattr__(config, "db_path", app_db_path)
     object.__setattr__(config, "outage_db_path", outage_db)
+    object.__setattr__(config, "catalogue_db_path", catalogue_db)
+    object.__setattr__(config, "catalogue_snapshot_dir", catalogue_snapshots)
+    monkeypatch.setattr(app_db.sqlite3, "connect", guarded_connect)
     try:
         from app.main import app
 
@@ -326,6 +367,16 @@ def empty_client(
     finally:
         object.__setattr__(config, "db_path", old_app_db)
         object.__setattr__(config, "outage_db_path", old_outage_db)
+        object.__setattr__(config, "catalogue_db_path", old_catalogue_db)
+        object.__setattr__(
+            config,
+            "catalogue_snapshot_dir",
+            old_catalogue_snapshots,
+        )
+    assert outage_db.resolve() in opened
+    assert catalogue_db.resolve() in opened
+    assert app_db_path.resolve() not in opened
+    assert set(opened) <= permitted
 
 
 def test_outage_list_uses_seeded_temporary_database(
