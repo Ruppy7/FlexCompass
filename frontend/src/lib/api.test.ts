@@ -297,6 +297,28 @@ it("uses deterministic observation filter names and preserves page metadata", as
   );
 });
 
+it("encodes bounded child page options and preserves truncated page metadata", async () => {
+  const expectedPages = [
+    { items: [VALID_RESOURCE], total: 245, limit: 200, offset: 0 },
+    { items: [VALID_EVIDENCE], total: 244, limit: 200, offset: 0 },
+    { items: [VALID_ASSESSMENT], total: 243, limit: 200, offset: 0 },
+  ];
+  const fetchMock = mockCatalogueFetchSequence(...expectedPages);
+
+  const pages = await Promise.all([
+    fetchCatalogueDatasetResources("opaque-ref", { limit: 200, offset: 0 }),
+    fetchCatalogueDatasetEvidence("opaque-ref", { limit: 200, offset: 0 }),
+    fetchCatalogueDatasetAssessments("opaque-ref", { limit: 200, offset: 0 }),
+  ]);
+
+  expect(pages).toEqual(expectedPages);
+  expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+    "/api/v1/catalogue/datasets/opaque-ref/resources?limit=200&offset=0",
+    "/api/v1/catalogue/datasets/opaque-ref/evidence?limit=200&offset=0",
+    "/api/v1/catalogue/datasets/opaque-ref/assessments?limit=200&offset=0",
+  ]);
+});
+
 it("forwards AbortSignal only when the caller supplies it", async () => {
   const fetchMock = mockCatalogueFetch();
   const controller = new AbortController();

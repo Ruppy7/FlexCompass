@@ -377,6 +377,62 @@ def test_invalid_newest_complete_falls_back_to_older_valid_snapshot(
     ] == ["older"]
 
 
+def test_blob_snapshot_path_preserves_older_valid_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository, _, older_id, newest_id = (
+        _repository_with_two_complete_snapshots(tmp_path)
+    )
+    with get_connection(repository.db_path) as connection:
+        connection.execute(
+            """UPDATE catalogue_observations SET snapshot_path = ?
+               WHERE observation_id = ?""",
+            (sqlite3.Binary(b"not-a-text-path"), newest_id),
+        )
+
+    state = repository.portal_state("nged", now=NOW)
+
+    assert state.last_complete_observation_id == newest_id
+    assert state.latest_complete_validation_state == "invalid"
+    assert state.last_valid_observation_id == older_id
+    assert state.snapshot_available is True
+    assert [
+        item.source_dataset_id
+        for item in repository.list_last_valid_datasets("nged")
+    ] == ["older"]
+
+
+@pytest.mark.parametrize(
+    "malformed_attempted_at",
+    [
+        pytest.param("zz-not-a-timestamp", id="text"),
+        pytest.param(sqlite3.Binary(b"not-a-timestamp"), id="blob"),
+    ],
+)
+def test_malformed_latest_attempt_is_absent_without_relabelling_older_attempt(
+    tmp_path: Path,
+    malformed_attempted_at: object,
+) -> None:
+    repository, _, _, newest_id = _repository_with_two_complete_snapshots(tmp_path)
+    with get_connection(repository.db_path) as connection:
+        connection.execute(
+            """UPDATE catalogue_refresh_attempts SET attempted_at = ?
+               WHERE attempted_at = ?""",
+            (malformed_attempted_at, (NOW - timedelta(days=1)).isoformat()),
+        )
+
+    state = repository.portal_state("nged", now=NOW)
+
+    assert state.current_attempt_status is None
+    assert state.current_attempt_at is None
+    assert state.current_attempt_warning_count == 0
+    assert state.current_attempt_safe_error is None
+    assert state.review_due_at is None
+    assert state.review_status == "never_attempted"
+    assert state.last_valid_observation_id == newest_id
+    assert state.snapshot_available is True
+
+
 def test_all_complete_snapshots_invalid_is_unavailable_without_mutable_fallback(
     tmp_path: Path,
 ) -> None:

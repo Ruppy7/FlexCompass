@@ -223,6 +223,11 @@ export interface CatalogueRequestOptions {
   signal?: AbortSignal;
 }
 
+export interface CataloguePageRequestOptions extends CatalogueRequestOptions {
+  limit?: number;
+  offset?: number;
+}
+
 export interface CatalogueDatasetFilters {
   portalId?: CataloguePortalId;
   query?: string;

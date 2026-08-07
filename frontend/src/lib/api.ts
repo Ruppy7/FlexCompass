@@ -9,6 +9,7 @@ import type {
   CatalogueEvidence,
   CatalogueObservation,
   CatalogueObservationFilters,
+  CataloguePageRequestOptions,
   CataloguePortalId,
   CataloguePortalSummary,
   CatalogueRequestOptions,
@@ -377,10 +378,13 @@ export async function fetchCatalogueDataset(
 
 export async function fetchCatalogueDatasetResources(
   datasetRef: string,
-  options?: CatalogueRequestOptions,
+  options?: CataloguePageRequestOptions,
 ): Promise<Page<CatalogueResource>> {
+  const parameters = new URLSearchParams();
+  appendDefined(parameters, "limit", options?.limit);
+  appendDefined(parameters, "offset", options?.offset);
   return catalogueGet(
-    `/datasets/${encodeURIComponent(datasetRef)}/resources`,
+    withQuery(`/datasets/${encodeURIComponent(datasetRef)}/resources`, parameters),
     "Failed to fetch catalogue resources",
     "Invalid catalogue resources response",
     (value): value is Page<CatalogueResource> => (
@@ -392,10 +396,13 @@ export async function fetchCatalogueDatasetResources(
 
 export async function fetchCatalogueDatasetEvidence(
   datasetRef: string,
-  options?: CatalogueRequestOptions,
+  options?: CataloguePageRequestOptions,
 ): Promise<Page<CatalogueEvidence>> {
+  const parameters = new URLSearchParams();
+  appendDefined(parameters, "limit", options?.limit);
+  appendDefined(parameters, "offset", options?.offset);
   return catalogueGet(
-    `/datasets/${encodeURIComponent(datasetRef)}/evidence`,
+    withQuery(`/datasets/${encodeURIComponent(datasetRef)}/evidence`, parameters),
     "Failed to fetch catalogue evidence",
     "Invalid catalogue evidence response",
     (value): value is Page<CatalogueEvidence> => (
@@ -407,10 +414,13 @@ export async function fetchCatalogueDatasetEvidence(
 
 export async function fetchCatalogueDatasetAssessments(
   datasetRef: string,
-  options?: CatalogueRequestOptions,
+  options?: CataloguePageRequestOptions,
 ): Promise<Page<CatalogueAssessment>> {
+  const parameters = new URLSearchParams();
+  appendDefined(parameters, "limit", options?.limit);
+  appendDefined(parameters, "offset", options?.offset);
   return catalogueGet(
-    `/datasets/${encodeURIComponent(datasetRef)}/assessments`,
+    withQuery(`/datasets/${encodeURIComponent(datasetRef)}/assessments`, parameters),
     "Failed to fetch catalogue assessments",
     "Invalid catalogue assessments response",
     (value): value is Page<CatalogueAssessment> => (

@@ -79,6 +79,36 @@ def _safe_timestamp(value: object | None) -> datetime | None:
         return None
 
 
+def _snapshot_path(value: object | None) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("catalogue snapshot path must be non-empty text")
+    return Path(value)
+
+
+def _project_attempt(
+    attempt: sqlite3.Row | None,
+) -> tuple[str, datetime, int, str | None] | None:
+    if attempt is None:
+        return None
+    status = attempt["status"]
+    warning_count = attempt["warning_count"]
+    safe_error = attempt["safe_error"]
+    if not isinstance(status, str) or status not in {"complete", "partial", "failed"}:
+        raise ValueError("catalogue refresh status is invalid")
+    if (
+        not isinstance(warning_count, int)
+        or isinstance(warning_count, bool)
+        or warning_count < 0
+    ):
+        raise ValueError("catalogue refresh warning count is invalid")
+    if safe_error is not None and not isinstance(safe_error, str):
+        raise ValueError("catalogue refresh safe error must be text")
+    attempted_at = _timestamp(attempt["attempted_at"])
+    if attempted_at is None:
+        raise ValueError("catalogue refresh timestamp is required")
+    return status, attempted_at, warning_count, safe_error
+
+
 class CatalogueRepository:
     """Select last-valid evidence without consulting mutable registry rows."""
 
@@ -109,7 +139,7 @@ class CatalogueRepository:
 
     def _load_row(self, row: sqlite3.Row) -> CatalogueSnapshot:
         snapshot = load_catalogue_snapshot(
-            Path(row["snapshot_path"]),
+            _snapshot_path(row["snapshot_path"]),
             snapshot_root=self.snapshot_root,
             expected_portal_id=row["portal_id"],
             expected_content_hash=row["content_hash"],
@@ -185,7 +215,20 @@ class CatalogueRepository:
             last_valid_snapshot = loaded
             break
 
-        attempted_at = _timestamp(attempt["attempted_at"]) if attempt else None
+        try:
+            projected_attempt = _project_attempt(attempt)
+        except ValueError:
+            projected_attempt = None
+        current_attempt_status = (
+            projected_attempt[0] if projected_attempt is not None else None
+        )
+        attempted_at = projected_attempt[1] if projected_attempt is not None else None
+        current_attempt_warning_count = (
+            projected_attempt[2] if projected_attempt is not None else 0
+        )
+        current_attempt_safe_error = (
+            projected_attempt[3] if projected_attempt is not None else None
+        )
         review_due_at = (
             attempted_at + timedelta(hours=self.review_window_hours)
             if attempted_at is not None
@@ -206,10 +249,10 @@ class CatalogueRepository:
         )
         return PortalState(
             portal_id=portal_id,
-            current_attempt_status=attempt["status"] if attempt else None,
+            current_attempt_status=current_attempt_status,
             current_attempt_at=attempted_at,
-            current_attempt_warning_count=attempt["warning_count"] if attempt else 0,
-            current_attempt_safe_error=attempt["safe_error"] if attempt else None,
+            current_attempt_warning_count=current_attempt_warning_count,
+            current_attempt_safe_error=current_attempt_safe_error,
             review_due_at=review_due_at,
             review_status=review_status,
             last_complete_observation_id=(

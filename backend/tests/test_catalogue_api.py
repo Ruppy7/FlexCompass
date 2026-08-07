@@ -550,6 +550,66 @@ def test_corrupt_newest_complete_projects_degraded_older_fallback(
     }
 
 
+def test_malformed_storage_keeps_portal_and_dataset_routes_safe(
+    catalogue_client: TestClient,
+) -> None:
+    settings = catalogue_client.app.state.settings
+    newest_id, _ = _seed_complete_catalogue(
+        settings.catalogue_db_path,
+        settings.catalogue_snapshot_dir,
+        observed_at=NOW + timedelta(hours=2),
+        snapshot_name="malformed-storage.json",
+        datasets=(
+            _dataset(
+                "newest-only",
+                "Newest only",
+                observed_at=NOW + timedelta(hours=2),
+            ),
+        ),
+    )
+    with get_connection(settings.catalogue_db_path) as connection:
+        connection.execute(
+            """UPDATE catalogue_observations SET snapshot_path = ?
+               WHERE observation_id = ?""",
+            (sqlite3.Binary(b"not-a-text-path"), newest_id),
+        )
+        connection.execute(
+            """UPDATE catalogue_refresh_attempts SET attempted_at = ?
+               WHERE observation_id = ?""",
+            (sqlite3.Binary(b"not-a-timestamp"), newest_id),
+        )
+
+    portals = catalogue_client.get("/api/v1/catalogue/portals")
+    portal = catalogue_client.get("/api/v1/catalogue/portals/nged")
+    datasets = catalogue_client.get(
+        "/api/v1/catalogue/datasets", params={"portal_id": "nged"}
+    )
+    dataset = catalogue_client.get(
+        f"/api/v1/catalogue/datasets/{encode_dataset_ref('nged', 'middle')}"
+    )
+
+    assert [response.status_code for response in (portals, portal, datasets, dataset)] == [
+        200,
+        200,
+        200,
+        200,
+    ]
+    portal_payload = portal.json()
+    assert portal_payload["latest_complete_validation_state"] == "invalid"
+    assert portal_payload["current_attempt_status"] is None
+    assert portal_payload["current_attempt_at"] is None
+    assert portal_payload["current_attempt_warning_count"] == 0
+    assert portal_payload["review_due_at"] is None
+    assert portal_payload["review_status"] == "never_attempted"
+    assert portal_payload["snapshot_available"] is True
+    assert {item["source_dataset_id"] for item in datasets.json()["items"]} == {
+        "folder/dataset:id",
+        "middle",
+        "z-last",
+    }
+    assert dataset.json()["source_dataset_id"] == "middle"
+
+
 @pytest.mark.parametrize(
     "malformed_observed_at",
     [

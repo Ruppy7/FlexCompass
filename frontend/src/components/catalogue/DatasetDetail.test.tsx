@@ -120,7 +120,101 @@ it("renders safe metadata, children, observation identity, and Unknown nulls", a
   expect(screen.getByRole("heading", { name: "Portal observation history" })).toBeVisible();
   expect(screen.getAllByText("Unknown").length).toBeGreaterThan(0);
   expect(fetchCatalogueObservations).toHaveBeenCalledWith(
-    { portalId: "ssen", limit: 50, offset: 0 },
+    { portalId: "ssen", limit: 200, offset: 0 },
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+});
+
+it("requests bounded detail pages and discloses every truncated collection", async () => {
+  setSuccessfulChildren();
+  vi.mocked(fetchCatalogueDatasetResources).mockResolvedValue({
+    items: [
+      {
+        id: "resource-1",
+        portal_id: "ssen",
+        source_dataset_id: "dataset-1",
+        name: "CSV resource",
+        description: null,
+        url: null,
+        format: "CSV",
+        media_type: null,
+        size_bytes: null,
+        source_created_at: null,
+        source_updated_at: null,
+        observed_at: null,
+      },
+    ],
+    total: 245,
+    limit: 200,
+    offset: 0,
+  });
+  vi.mocked(fetchCatalogueDatasetEvidence).mockResolvedValue({
+    items: [{
+      id: "evidence-1",
+      portal_id: "ssen",
+      source_dataset_id: "dataset-1",
+      classification: "publication_pattern",
+      evidence: "Declared cadence",
+      confidence: "high",
+      source_url: null,
+      observed_at: null,
+    }],
+    total: 244,
+    limit: 200,
+    offset: 0,
+  });
+  vi.mocked(fetchCatalogueDatasetAssessments).mockResolvedValue({
+    items: [{
+      assessment_id: "assessment-1",
+      observation_id: "observation-1",
+      assessment_type: "maintenance_state",
+      assessment_value: "on_schedule",
+      confidence: "high",
+      assessed_at: "2026-08-03T12:00:00Z",
+    }],
+    total: 243,
+    limit: 200,
+    offset: 0,
+  });
+  vi.mocked(fetchCatalogueObservations).mockResolvedValue({
+    items: [{
+      observation_id: "observation-1",
+      portal_id: "ssen",
+      observed_at: "2026-08-03T12:00:00Z",
+      status: "complete",
+      adapter_version: null,
+      schema_version: 1,
+      content_hash: null,
+      expected_count: null,
+      dataset_count: 1,
+      resource_count: 1,
+      complete: true,
+    }],
+    total: 242,
+    limit: 200,
+    offset: 0,
+  });
+
+  render(<DatasetDetail datasetRef="ssen:dataset-1" portalId="ssen" />);
+
+  expect(await screen.findByText("Showing first 1 of 245 resources.")).toBeVisible();
+  expect(screen.getByText("Showing first 1 of 244 evidence items.")).toBeVisible();
+  expect(screen.getByText("Showing first 1 of 243 assessments.")).toBeVisible();
+  expect(screen.getByText("Showing first 1 of 242 observations.")).toBeVisible();
+  expect(fetchCatalogueDatasetResources).toHaveBeenCalledWith(
+    "ssen:dataset-1",
+    expect.objectContaining({ limit: 200, offset: 0 }),
+  );
+  expect(fetchCatalogueDatasetEvidence).toHaveBeenCalledWith(
+    "ssen:dataset-1",
+    expect.objectContaining({ limit: 200, offset: 0 }),
+  );
+  expect(fetchCatalogueDatasetAssessments).toHaveBeenCalledWith(
+    "ssen:dataset-1",
+    expect.objectContaining({ limit: 200, offset: 0 }),
+  );
+  expect(fetchCatalogueObservations).toHaveBeenCalledWith(
+    { portalId: "ssen", limit: 200, offset: 0 },
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
   );
 });
