@@ -15,6 +15,15 @@ GitHub action for FlexCompass must use `ruppy7`. Never use `rupesh-chand` for
 this repository. Before any Git write or remote action, verify the configured
 identity and remote owner; stop if they do not belong to `ruppy7`.
 
+If GitHub CLI is authenticated as the wrong stored account, the primary
+orchestrator must run `gh auth switch -u Ruppy7` and then verify that
+`gh api user --jq .login` returns exactly `Ruppy7` before continuing. This
+account switch is authorised for FlexCompass and does not require a user
+handoff. Do not remove either stored account or initiate login, OAuth, token,
+credential-recovery, browser, or MFA flows. If the switch fails because
+`ruppy7` is not stored or renewed authentication is required, stop and hand
+that security action back to the user.
+
 ## Data boundary
 
 - Use only public sources that any user can access under the source's terms.
