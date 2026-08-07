@@ -91,43 +91,50 @@ bidding eligibility, dispatch actions, or commercial performance.
 
 Anonymous catalogue access does not prove that every dataset resource is
 anonymous or redistributable. `CATALOGUE_PORTALS` in
-`backend/app/catalogue_models.py` is the sole active portal registry; its seven
-canonical IDs and API bases are the source of truth for the CLI. Generated
+`backend/app/catalogue_models.py` is the sole active portal registry: an
+immutable mapping and fixed tuple of exactly seven canonical IDs. Its public
+portal locations are the source of truth for the CLI and observatory. Generated
 snapshots, SQLite databases, caches, queues, and reports are ignored/local
 outputs and must not be committed.
 
 ## Catalogue intelligence workflow
 
-The active public-data workflow is the anonymous, read-only seven-portal
-catalogue CLI. All commands run from the `backend/` working directory using the
-project venv.
+The active public-data workflow uses the anonymous, read-only seven-portal
+catalogue CLI to create local observations and the GET-only API/UI to inspect
+safe projections. The UI never starts a sync. Run commands from the repository
+root using the project venv.
 
 ### Sync
 
 Fetch public metadata with anonymous read-only GET requests:
 
-```bash
+```powershell
+$env:PYTHONPATH = "backend"
 python -m app.catalogue_cli sync --portal all
 python -m app.catalogue_cli sync --portal nged
 ```
 
 Outputs (all git-ignored): SQLite registry at
-`../data/cache/catalogue/registry.sqlite3`, JSON snapshots at
-`../data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
-`../data/cache/catalogue/review-queue.json`. Snapshots are atomic and immutable.
-Failed portals do not alter the registry. Partial observations update the
-registry conservatively without erasing missing source facts. Complete
-observations clear withdrawn current facts and reconcile obsolete resources and
-classification evidence for the datasets they contain.
+`data/cache/catalogue/registry.sqlite3`, JSON snapshots at
+`data/snapshots/catalogues/<timestamp>/<portal>.json`, and review queue at
+`data/cache/catalogue/review-queue.json`. The registry and snapshot root may be
+overridden with `FLEXCOMPASS_CATALOGUE_DB_PATH` and
+`FLEXCOMPASS_CATALOGUE_SNAPSHOT_DIR`; these are local path settings and must not
+contain secrets. Snapshots are atomic and immutable.
+
+Every requested portal receives a durable current-attempt record. A failed
+attempt creates no observation and does not replace last-valid evidence. A
+partial observation and snapshot are retained, but they do not become the API's
+last-valid dataset source. Complete observations reconcile mutable registry
+facts; API dataset reads still come only from complete immutable snapshots that
+pass path, schema, identity, association, count, and content-hash validation.
 
 ### Diff
 
 Compare two local snapshots:
 
-```bash
-python -m app.catalogue_cli diff \
-  --before ../data/snapshots/catalogues/20260715T120000.000000Z/nged.json \
-  --after  ../data/snapshots/catalogues/20260716T120000.000000Z/nged.json
+```powershell
+python -m app.catalogue_cli diff --before data/snapshots/catalogues/20260715T120000.000000Z/nged.json --after data/snapshots/catalogues/20260716T120000.000000Z/nged.json
 ```
 
 Changes: `dataset_added`, `dataset_removed`, `metadata_changed`,
@@ -140,9 +147,53 @@ dataset-removal claim.
 
 Print unresolved evidence items:
 
-```bash
+```powershell
 python -m app.catalogue_cli review-queue --format json
 ```
+
+### Read-only catalogue API
+
+After local sync, the public catalogue contract contains exactly these eight
+versioned GET-only routes:
+
+- `/api/v1/catalogue/portals`
+- `/api/v1/catalogue/portals/{portal_id}`
+- `/api/v1/catalogue/datasets`
+- `/api/v1/catalogue/datasets/{dataset_ref}`
+- `/api/v1/catalogue/datasets/{dataset_ref}/resources`
+- `/api/v1/catalogue/datasets/{dataset_ref}/evidence`
+- `/api/v1/catalogue/datasets/{dataset_ref}/assessments`
+- `/api/v1/catalogue/observations`
+
+Collection limits default to 50 and are bounded from 1 to 200; offsets are
+non-negative. Dataset filters cover portal, text, lifecycle, publication
+pattern, access status, and maintenance state. Observation history filters cover
+portal and `complete`, `partial`, or `failed` status, although a failed refresh
+attempt has no observation row and appears through portal coverage state
+instead. Dataset references are opaque portal-scoped identifiers: use the value
+returned by the API unchanged and URI-encode it as one path segment.
+
+Portal state distinguishes the newest attempt, newest complete observation,
+newest complete snapshot validation, and last-valid complete snapshot. An
+invalid newest complete snapshot may degrade to an older valid one. When no
+valid complete snapshot exists, `snapshot_available` is false and no mutable
+row, legacy seed, or partial snapshot is substituted. The 168-hour due window
+and `current`, `overdue`, or `never_attempted` review status are FlexCompass
+operational policy, not publisher cadence or a live-freshness guarantee.
+
+The hidden retired `/api/portal/datasets` surface returns `410 Gone` for `GET`,
+`HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, and `OPTIONS`, is absent from OpenAPI,
+and never reads legacy rows.
+
+### Catalogue web workflow
+
+The web application opens on `Research Overview`. `Catalogue Observatory`
+contains `Coverage` and `Datasets`: coverage always names all seven configured
+portals and shows attempt, review, validation, last-valid, degraded, and
+availability states; datasets use server filters and pagination, safe detail,
+and portal observation history. `Synthetic Demo` remains a separate workflow
+and uses no current portal data. Unknown and failure states are visible as text,
+not colour alone.
 
 ## Classification dimensions
 
@@ -180,6 +231,13 @@ patterns, Basic/Bearer values, private-host URLs, credential-bearing URLs, and
 common signed-URL credentials/signatures/security tokens. Benign URL fragments
 are retained; credential-bearing fragment pairs are removed selectively.
 
+These canonical records and raw provenance are internal evidence. The API may
+project safe declared licence and attribution metadata, but does not expose
+`raw_record`, raw pages, request URLs, local snapshot/database paths,
+authentication setting names, raw or internal-safe errors, or reviewer identity.
+Public URLs are projected without query or fragment material. Declared licence
+metadata is not verification and does not relicense source data.
+
 ## Limitations
 
 Catalogue metadata is not analytical ingestion, eligibility assessment,
@@ -187,11 +245,13 @@ bidding/dispatch/asset-control advice, forecasting, or commercial advice.
 Counts and metadata are dated observations, not stable facts. Licence and
 attribution must be verified before redistributing source data.
 
-The web application exposes a research-status overview and an explicitly
-synthetic demonstration. It does not yet expose the catalogue registry or
-verified analytical portal records. Legacy generic portal ingestors and
-browser-triggered mutation routes are retired; no active public route starts
-ingestion or drift processing.
+The web application exposes safe catalogue metadata, not verified analytical
+portal records. Catalogue metadata is discovery/evidence only: it is not
+analytical ingestion, proof of live freshness or analytical readiness,
+eligibility assessment, bidding, dispatch, asset control, forecasting, or
+commercial advice. Legacy generic portal ingestors and browser-triggered
+mutation routes are retired; no active public route starts ingestion, sync, or
+drift processing.
 
 Live portal tests are opt-in via `FLEXCOMPASS_LIVE_PORTAL_TESTS=1`; seven
 parametrized cases are skipped by default with zero network calls. Enabled cases

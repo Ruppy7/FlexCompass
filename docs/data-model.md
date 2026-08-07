@@ -7,8 +7,10 @@ provides enough evidence.
 The active public-data workflows are the anonymous, read-only seven-portal
 catalogue CLI and the reviewed SSEN historical-HV sync and read-only query API.
 `CATALOGUE_PORTALS` in `backend/app/catalogue_models.py` remains the sole portal
-registry. The Next.js application exposes neither registry nor SSEN records; it
-presents research status and a separate, explicitly synthetic demonstration.
+registry: an immutable mapping paired with a fixed tuple of exactly seven portal
+IDs. The Next.js application presents the research overview by default, a
+read-only catalogue observatory, and a separate explicitly synthetic
+demonstration. It does not expose SSEN records or start either sync workflow.
 
 ## Core records
 
@@ -80,6 +82,10 @@ The catalogue layer adds observation-based records for public portal metadata:
 - `CatalogueObservation`: one portal-fetch observation with status, source
   content hash, dataset/resource totals, pagination completeness, warnings,
   and nullable request/response/retry facts.
+- `catalogue_refresh_attempts`: the durable SQL records for every requested
+  portal, with attempt time, `complete`, `partial`, or `failed` status, warning
+  count, an optional successful observation link, and a sanitised internal
+  failure reason. Failed attempts do not create catalogue observations.
 - `ClassificationEvidence`: one piece of evidence supporting a non-factual
   classification (lifecycle, pattern, access, maintenance) with confidence.
 
@@ -93,14 +99,79 @@ their original order remains intact in `raw_record` and raw-page provenance.
 Classifier assessments are persisted separately and do not affect immutable
 source snapshot identity.
 
-### Atomic local artifacts
+### Atomic local artifacts and durable refresh state
 
 Sync writes are atomic: a temporary file is written then renamed. If the
-snapshot already exists with identical content, no write occurs. Failed portals
-do not alter the current registry. Partial observations update conservatively
-without erasing missing source facts or removing unseen children. Complete
-observations are authoritative for datasets they contain: removed nullable/list
-facts become unknown and obsolete current resources/evidence are reconciled.
+snapshot already exists with identical content, no write occurs. Every requested
+portal receives a durable refresh-attempt row. A failure stores no observation
+and does not replace last-valid evidence. Partial observations and snapshots are
+retained and update mutable current rows conservatively without erasing missing
+source facts or removing unseen children, but they do not become the API's
+last-valid dataset source. Complete observations are authoritative for datasets
+they contain: removed nullable/list facts become unknown and obsolete current
+resources/evidence are reconciled.
+
+### Last-complete and last-valid reads
+
+The catalogue repository reads validated immutable snapshots, not mutable
+current rows or legacy seeds. It reports three separate facts:
+
+- the newest refresh attempt, including failed or partial status;
+- the newest complete observation and whether its snapshot is valid; and
+- the newest complete snapshot that passes path, schema, identity, count,
+  association, and content-hash validation.
+
+If the newest complete snapshot is invalid but an older complete snapshot is
+valid, the older snapshot remains the dataset evidence and the portal is marked
+`degraded`. `latest_complete_validation_state` distinguishes `valid`, `invalid`,
+and `unavailable`; `snapshot_available` states whether any valid complete
+snapshot can be read. If every complete snapshot is missing or invalid, the API
+returns no catalogue datasets for that portal. It never falls back to partial
+snapshots, mutable current rows, local legacy rows, or JSON seeds.
+
+The latest attempt also drives a 168-hour operational review window.
+`review_due_at` and `review_status` (`current`, `overdue`, or
+`never_attempted`) describe FlexCompass review operations only; they do not
+assert publisher cadence or live freshness.
+
+### Public catalogue contract
+
+The versioned catalogue router has exactly eight GET-only routes: portal list
+and detail; dataset list and detail; resource, evidence, and assessment lists
+for a dataset; and observation history. Collection responses retain `total`,
+`limit`, and `offset`; limits default to 50 and are bounded from 1 to 200.
+Dataset filtering is server-side for portal, text, lifecycle, publication
+pattern, access status, and maintenance state. Observation history can be
+filtered by portal and observation status.
+
+Public dataset identity is an opaque `dataset_ref` scoped to portal and source
+dataset ID. It is an unpadded URL-safe encoding of canonical internal identity,
+but clients must treat the returned value as opaque and URI-encode it as a path
+segment. Non-canonical or oversized references are rejected.
+
+API models are safe projections of the last-valid snapshot. Declared licence
+and attribution metadata may be projected, but this is not verification or
+relicensing. Canonical `raw_record` values, raw pages, snapshot and local paths,
+request endpoints and query material, authentication setting names, sanitised
+internal errors, and reviewer identity are excluded. Public URLs have query and
+fragment material removed.
+
+The hidden legacy `/api/portal/datasets` route returns `410 Gone` for `GET`,
+`HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, and `OPTIONS`, and is omitted from
+OpenAPI. It never reads mutable legacy rows.
+
+### Catalogue UI workflow
+
+`Research Overview` remains the default top-level workflow. `Catalogue
+Observatory` contains `Coverage` and `Datasets` views; `Synthetic Demo` remains
+separate and uses no current portal data. Coverage renders all seven configured
+portals and distinguishes current attempt, review due state, newest complete
+validation, last-valid time/counts, degraded state, and snapshot availability.
+Datasets retain server filters and pagination, and safe detail combines
+metadata, resources, evidence, assessments, and portal observation history.
+Failed attempts are shown in coverage because they do not create observations.
+Unknown, restricted, unreachable, failed, partial, archival, superseded, and
+snapshot states use visible text and not colour alone.
 
 ### Secret redaction
 
